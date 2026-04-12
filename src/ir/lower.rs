@@ -529,15 +529,58 @@ fn lower_stmt(
 SemanticStmt::Block { .. } => { unsupported!("Block") },
         SemanticStmt::WhileIn { .. } => { unsupported!("WhileIn") },
         SemanticStmt::While { cond, body, .. } => {
-    return match lower_while(cond, body, ctx, current, spec)? {
+    return match lower_while(cond, body, ctx, current, spec, loop_ctx)? {
         Some(new_active) => Ok(Some(new_active)),
         None => Ok(None),
     };
 },
         SemanticStmt::For { .. } => { unsupported!("For") },
-        SemanticStmt::Loop { .. } => { unsupported!("Loop") },
-        SemanticStmt::Break { .. } => { unsupported!("Break") },
-        SemanticStmt::Continue { .. } => { unsupported!("Continue") },
+        SemanticStmt::Loop { body, .. } => {
+    return match lower_loop(body, ctx, current, spec, loop_ctx)? {
+        Some(new_active) => Ok(Some(new_active)),
+        None => Ok(None),
+    };
+},
+        SemanticStmt::Break { .. } => {
+    let ctx_ref = loop_ctx.ok_or_else(|| LoweringError::UnsupportedSemanticConstruct {
+        construct: "break outside of loop".to_string(),
+    })?;
+    let mut exit_args = Vec::new();
+    for binding in &ctx_ref.ordered_bindings {
+        let val = current.bindings.get(binding).ok_or_else(|| {
+            LoweringError::InternalInvariantViolation {
+                detail: format!("break: binding {} missing from SSA environment", binding.0),
+            }
+        })?;
+        exit_args.push(val.value);
+    }
+    current.terminate(IrTerminator::Jump {
+        target: ctx_ref.exit_id,
+        args: exit_args,
+    })?;
+    ctx.seal_block(current)?;
+    return Ok(None);
+},
+        SemanticStmt::Continue { .. } => {
+    let ctx_ref = loop_ctx.ok_or_else(|| LoweringError::UnsupportedSemanticConstruct {
+        construct: "continue outside of loop".to_string(),
+    })?;
+    let mut header_args = Vec::new();
+    for binding in &ctx_ref.ordered_bindings {
+        let val = current.bindings.get(binding).ok_or_else(|| {
+            LoweringError::InternalInvariantViolation {
+                detail: format!("continue: binding {} missing from SSA environment", binding.0),
+            }
+        })?;
+        header_args.push(val.value);
+    }
+    current.terminate(IrTerminator::Jump {
+        target: ctx_ref.header_id,
+        args: header_args,
+    })?;
+    ctx.seal_block(current)?;
+    return Ok(None);
+},
         SemanticStmt::When { .. } => { unsupported!("When") },
         SemanticStmt::IfElse {
             condition,
@@ -553,6 +596,7 @@ SemanticStmt::Block { .. } => { unsupported!("Block") },
             ctx,
             current,
             spec,
+            loop_ctx,
         ),
         SemanticStmt::StructDef { .. } => { unsupported!("StructDef") },
         SemanticStmt::ImplBlock { .. } => { unsupported!("ImplBlock") },
@@ -568,6 +612,7 @@ fn lower_if_else(
     ctx: &mut LoweringCtx,
     current: ActiveBlock,
     spec: &FunctionLoweringSpec,
+    loop_ctx: Option<&LoopContext>,
 ) -> Result<Option<ActiveBlock>, LoweringError> {
     let incoming = current.bindings.clone();
     let fallthroughs = lower_if_chain(
@@ -579,6 +624,7 @@ fn lower_if_else(
         current,
         &incoming,
         spec,
+        loop_ctx,
     )?;
 
     match fallthroughs.len() {
@@ -597,6 +643,7 @@ fn lower_if_chain(
     mut decision_block: ActiveBlock,
     incoming: &BindingMap,
     spec: &FunctionLoweringSpec,
+    loop_ctx: Option<&LoopContext>,
 ) -> Result<Vec<ActiveBlock>, LoweringError> {
     let cond = lower_expr(condition, ctx, &mut decision_block)?;
     ensure_type_match("if condition", IrType::Bool, cond.ty.clone())?;
@@ -618,7 +665,7 @@ fn lower_if_chain(
         ctx.seal_block(decision_block)?;
 
         let mut fallthroughs = Vec::new();
-        if let Some(active) = lower_stmt_sequence(then_body.iter(), ctx, Some(then_active), spec, None)? {
+        if let Some(active) = lower_stmt_sequence(then_body.iter(), ctx, Some(then_active), spec, loop_ctx)? {
             fallthroughs.push(active);
         }
         fallthroughs.extend(lower_if_chain(
@@ -630,6 +677,7 @@ fn lower_if_chain(
             else_active,
             incoming,
             spec,
+            loop_ctx,
         )?);
         Ok(fallthroughs)
     } else {
@@ -646,11 +694,11 @@ fn lower_if_chain(
         ctx.seal_block(decision_block)?;
 
         let mut fallthroughs = Vec::new();
-        if let Some(active) = lower_stmt_sequence(then_body.iter(), ctx, Some(then_active), spec, None)? {
+        if let Some(active) = lower_stmt_sequence(then_body.iter(), ctx, Some(then_active), spec, loop_ctx)? {
             fallthroughs.push(active);
         }
         let else_result = if let Some(else_body) = else_body {
-            lower_stmt_sequence(else_body.iter(), ctx, Some(else_active), spec, None)?
+            lower_stmt_sequence(else_body.iter(), ctx, Some(else_active), spec, loop_ctx)?
         } else {
             Some(else_active)
         };
@@ -763,6 +811,7 @@ fn lower_while(
     ctx: &mut LoweringCtx,
     current: ActiveBlock,
     spec: &FunctionLoweringSpec,
+    _outer_loop_ctx: Option<&LoopContext>,
 ) -> Result<Option<ActiveBlock>, LoweringError> {
     let incoming = current.bindings.clone();
 
@@ -805,24 +854,154 @@ fn lower_while(
     let body_block = ctx.start_block(vec![], header_bindings.clone());
     let body_id = body_block.id();
 
-    let exit_block = ctx.start_block(vec![], header_bindings.clone());
+    let mut exit_params = Vec::new();
+    let mut exit_bindings = HashMap::new();
+    for binding in &ordered_bindings {
+        let val = incoming.get(binding).unwrap();
+        let param_value = ctx.fresh_value();
+        exit_params.push(BlockParam {
+            value: param_value,
+            ty: val.ty.clone(),
+        });
+        exit_bindings.insert(
+            *binding,
+            LoweredValue {
+                value: param_value,
+                ty: val.ty.clone(),
+            },
+        );
+    }
+    let exit_block = ctx.start_block(exit_params, exit_bindings);
     let exit_id = exit_block.id();
 
+    let mut else_args = Vec::new();
+    for binding in &ordered_bindings {
+        let val = header.bindings.get(binding).unwrap();
+        else_args.push(val.value);
+    }
     header.terminate(IrTerminator::Branch {
         cond: cond_val.value,
         then_block: body_id,
         then_args: vec![],
         else_block: exit_id,
-        else_args: vec![],
+        else_args,
     })?;
     ctx.seal_block(header)?;
+
+    let loop_context = LoopContext {
+        header_id,
+        exit_id,
+        ordered_bindings: ordered_bindings.clone(),
+    };
+    let body_result = lower_stmt_sequence(
+        body.iter(),
+        ctx,
+        Some(body_block),
+        spec,
+        Some(&loop_context),
+    )?;
+
+    if let Some(mut body_active) = body_result {
+        let mut backedge_args = Vec::new();
+        for binding in &ordered_bindings {
+            let val = body_active.bindings.get(binding).unwrap();
+            backedge_args.push(val.value);
+        }
+        body_active.terminate(IrTerminator::Jump {
+            target: header_id,
+            args: backedge_args,
+        })?;
+        ctx.seal_block(body_active)?;
+    }
+
+    Ok(Some(exit_block))
+}
+
+fn lower_loop(
+    body: &[SemanticStmt],
+    ctx: &mut LoweringCtx,
+    current: ActiveBlock,
+    spec: &FunctionLoweringSpec,
+    _outer_loop_ctx: Option<&LoopContext>,
+) -> Result<Option<ActiveBlock>, LoweringError> {
+    let incoming = current.bindings.clone();
+
+    let mut ordered_bindings: Vec<_> = incoming.keys().copied().collect();
+    ordered_bindings.sort_by_key(|b| b.0);
+
+    let mut header_params = Vec::new();
+    let mut header_bindings = HashMap::new();
+    let mut entry_args = Vec::new();
+
+    for binding in &ordered_bindings {
+        let val = incoming.get(binding).unwrap();
+        let param_value = ctx.fresh_value();
+        header_params.push(BlockParam {
+            value: param_value,
+            ty: val.ty.clone(),
+        });
+        header_bindings.insert(
+            *binding,
+            LoweredValue {
+                value: param_value,
+                ty: val.ty.clone(),
+            },
+        );
+        entry_args.push(val.value);
+    }
+
+    let header = ctx.start_block(header_params, header_bindings.clone());
+    let header_id = header.id();
+
+    let mut current = current;
+    current.terminate(IrTerminator::Jump {
+        target: header_id,
+        args: entry_args,
+    })?;
+    ctx.seal_block(current)?;
+
+    let body_block = ctx.start_block(vec![], header_bindings.clone());
+
+    let mut exit_params = Vec::new();
+    let mut exit_bindings = HashMap::new();
+    for binding in &ordered_bindings {
+        let val = incoming.get(binding).unwrap();
+        let param_value = ctx.fresh_value();
+        exit_params.push(BlockParam {
+            value: param_value,
+            ty: val.ty.clone(),
+        });
+        exit_bindings.insert(
+            *binding,
+            LoweredValue {
+                value: param_value,
+                ty: val.ty.clone(),
+            },
+        );
+    }
+    let exit_block = ctx.start_block(exit_params, exit_bindings);
+    let exit_id = exit_block.id();
+
+    // Header unconditionally jumps into body — no condition for infinite loop
+    let mut header_mut = header;
+    header_mut.terminate(IrTerminator::Jump {
+        target: body_block.id(),
+        args: vec![],
+    })?;
+    ctx.seal_block(header_mut)?;
+
+    let loop_context = LoopContext {
+        header_id,
+        exit_id,
+        ordered_bindings: ordered_bindings.clone(),
+    };
 
     let body_result = lower_stmt_sequence(
         body.iter(),
         ctx,
         Some(body_block),
         spec,
-        None,
+        Some(&loop_context),
     )?;
 
     if let Some(mut body_active) = body_result {
@@ -961,6 +1140,9 @@ fn lower_expr(
         SemanticExprKind::MethodCall { .. } => { unsupported!("MethodCall") },
         SemanticExprKind::StructInstance { .. } => { unsupported!("StructInstance") },
         SemanticExprKind::When { .. } => { unsupported!("WhenExpr") },
+        SemanticExprKind::ResultOk { .. } => { unsupported!("ResultOk") },
+        SemanticExprKind::ResultErr { .. } => { unsupported!("ResultErr") },
+        SemanticExprKind::Try { .. } => { unsupported!("Try") },
     }
 }
 
@@ -1115,6 +1297,7 @@ fn lower_type(ty: &SemanticType) -> Result<IrType, LoweringError> {
         SemanticType::TypeParam(_) => { unsupported_type!("TypeParam") },
         SemanticType::Struct(_) => { unsupported_type!("Struct") },
         SemanticType::Array(_, _) => { unsupported_type!("Array") },
+        SemanticType::Result(_) => { unsupported_type!("Result") },
         SemanticType::Void => { unsupported_type!("Void") },
     }
 }
@@ -1230,6 +1413,7 @@ mod tests {
             body,
             ret_expr,
             pos: 0,
+            is_test: false,
         })
     }
 
@@ -2100,7 +2284,12 @@ mod tests {
     #[test]
     fn rejects_unsupported_statement() {
         let program = SemanticProgram {
-            stmts: vec![SemanticStmt::Loop {
+            stmts: vec![SemanticStmt::For {
+                binding: BindingId(0),
+                var: "i".to_string(),
+                start: int_expr(0, SemanticType::I64),
+                end: int_expr(10, SemanticType::I64),
+                inclusive: false,
                 body: vec![],
                 pos: 0,
             }],
@@ -2110,7 +2299,7 @@ mod tests {
         assert_eq!(
             lower_program(&program).expect_err("lowering should fail"),
             LoweringError::UnsupportedSemanticConstruct {
-                construct: "Loop".to_string()
+                construct: "For".to_string()
             }
         );
     }
@@ -2122,7 +2311,12 @@ mod tests {
                 "bad",
                 vec![],
                 None,
-                vec![SemanticStmt::Loop {
+                vec![SemanticStmt::For {
+                    binding: BindingId(0),
+                    var: "i".to_string(),
+                    start: int_expr(0, SemanticType::I64),
+                    end: int_expr(10, SemanticType::I64),
+                    inclusive: false,
                     body: vec![],
                     pos: 0,
                 }],
@@ -2134,7 +2328,7 @@ mod tests {
         assert_eq!(
             lower_program(&program).expect_err("lowering should fail"),
             LoweringError::UnsupportedSemanticConstruct {
-                construct: "Loop".to_string()
+                construct: "For".to_string()
             }
         );
     }
@@ -2685,7 +2879,12 @@ mod tests {
         let program = SemanticProgram {
             stmts: vec![if_stmt(
                 bool_expr(true),
-                vec![SemanticStmt::Loop {
+                vec![SemanticStmt::For {
+                    binding: BindingId(0),
+                    var: "i".to_string(),
+                    start: int_expr(0, SemanticType::I64),
+                    end: int_expr(10, SemanticType::I64),
+                    inclusive: false,
                     body: vec![],
                     pos: 0,
                 }],
@@ -2698,7 +2897,7 @@ mod tests {
         assert_eq!(
             lower_program(&program).expect_err("lowering should fail"),
             LoweringError::UnsupportedSemanticConstruct {
-                construct: "Loop".to_string()
+                construct: "For".to_string()
             }
         );
     }
