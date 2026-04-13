@@ -20,7 +20,6 @@ use chumsky::input::{Input, Stream};
 use chumsky::prelude::SimpleSpan;
 use chumsky::Parser;
 use colored::Colorize;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::env;
 use std::fs;

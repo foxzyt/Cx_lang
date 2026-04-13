@@ -1285,6 +1285,59 @@ Expr::Unary(op, inner, pos) => {
                     },
                 })
             }
+            Expr::ResultOk(inner, _pos) => {
+                let inner_analyzed = self.analyze_expr(inner)?;
+                let result_ty = SemanticType::Result(Box::new(inner_analyzed.ty.clone()));
+                Ok(SemanticExpr {
+                    ty: result_ty,
+                    kind: SemanticExprKind::ResultOk {
+                        expr: Box::new(inner_analyzed),
+                    },
+                })
+            }
+            Expr::ResultErr(inner, pos) => {
+                let inner_analyzed = self.analyze_expr(inner)?;
+                // Err() must wrap a string
+                if inner_analyzed.ty != SemanticType::Str {
+                    return Err(sem_err!(*pos, "Err() argument must be a string, got {:?}", inner_analyzed.ty));
+                }
+                // We don't know the T in Result<T> from the Err site alone,
+                // so use a generic Result<Unknown> that the return-type check will unify.
+                let result_ty = SemanticType::Result(Box::new(SemanticType::Unknown));
+                Ok(SemanticExpr {
+                    ty: result_ty,
+                    kind: SemanticExprKind::ResultErr {
+                        expr: Box::new(inner_analyzed),
+                    },
+                })
+            }
+            Expr::Try(inner, pos) => {
+                let inner_analyzed = self.analyze_expr(inner)?;
+                // The inner expression must be Result<T>
+                let unwrapped_ty = match &inner_analyzed.ty {
+                    SemanticType::Result(inner_ty) => (**inner_ty).clone(),
+                    other => {
+                        return Err(sem_err!(*pos, "? operator requires a Result<T> value, got {:?}", other));
+                    }
+                };
+                // The enclosing function must return Result<U>
+                if !self.in_function {
+                    return Err(sem_err!(*pos, "? operator can only be used inside a function"));
+                }
+                match &self.current_ret_ty {
+                    Some(SemanticType::Result(_)) => {}
+                    _ => {
+                        return Err(sem_err!(*pos, "? operator can only be used in a function that returns Result<T>"));
+                    }
+                }
+                Ok(SemanticExpr {
+                    ty: unwrapped_ty,
+                    kind: SemanticExprKind::Try {
+                        expr: Box::new(inner_analyzed),
+                        pos: *pos,
+                    },
+                })
+            }
         }
     }
 
@@ -1651,6 +1704,7 @@ fn semantic_type_from_decl(ty: Type, type_params: &[String]) -> SemanticType {
         Type::Handle(inner) => SemanticType::Handle(Box::new(semantic_type_from_decl(*inner, type_params))),
         Type::Array(size, elem_ty) => SemanticType::Array(size, Box::new(semantic_type_from_decl(*elem_ty, type_params))),
         Type::TypeParam(s) => SemanticType::TypeParam(s),
+        Type::Result(inner) => SemanticType::Result(Box::new(semantic_type_from_decl(*inner, type_params))),
         Type::Struct(name) => {
             if type_params.contains(&name) {
                 SemanticType::TypeParam(name)
@@ -1671,6 +1725,9 @@ fn substitute_type_params(ty: SemanticType, map: &std::collections::HashMap<Stri
         }
         SemanticType::Handle(inner) => {
             SemanticType::Handle(Box::new(substitute_type_params(*inner, map)))
+        }
+        SemanticType::Result(inner) => {
+            SemanticType::Result(Box::new(substitute_type_params(*inner, map)))
         }
         other => other,
     }
@@ -1756,6 +1813,7 @@ fn types_compatible(expected: &SemanticType, got: &SemanticType) -> bool {
         (SemanticType::Array(size1, elem1), SemanticType::Array(size2, elem2)) if size1 == size2 => {
             types_compatible(elem1, elem2)
         }
+        (SemanticType::Result(a), SemanticType::Result(b)) => types_compatible(a, b),
         (SemanticType::Numeric, other) | (other, SemanticType::Numeric) => is_numeric(other),
         _ => is_numeric(expected) && is_numeric(got),
     }
@@ -1809,60 +1867,6 @@ fn stmt_contains_return(stmt: &Stmt) -> bool {
         Stmt::When { .. } => false,
         Stmt::FuncDef { .. } => false,
         _ => false,
-    }
-}
-
-pub fn analyze_program(program: &Program) -> Result<SemanticProgram, Vec<SemanticError>> {
-    let mut analyzer = Analyzer::new();
-    let mut errors = Vec::new();
-    let mut semantic_stmts = Vec::with_capacity(program.stmts.len());
-
-    for stmt in &program.stmts {
-        if let Stmt::StructDef { name, type_params, fields, .. } = stmt {
-            analyzer.structs.insert(name.clone(), fields.clone());
-            analyzer.struct_type_params.insert(name.clone(), type_params.clone());
-        }
-    }
-
-    for stmt in &program.stmts {
-        if let Stmt::FuncDef {
-            name,
-            type_params,
-            params,
-            ret_ty,
-            ..
-        } = stmt
-        {
-            let placeholders = params
-                .iter()
-                .map(semantic_param_placeholder)
-                .collect::<Vec<_>>();
-            let func_id = analyzer.fresh_function();
-            analyzer.funcs.insert(
-                name.clone(),
-                FunctionInfo {
-                    id: func_id,
-                    params: placeholders,
-                    ret_ty: ret_ty.clone().map(|t| semantic_type_from_decl(t, type_params)),
-                    type_params: type_params.clone(),
-                },
-            );
-        }
-    }
-    for stmt in &program.stmts {
-        match analyzer.analyze_stmt(stmt) {
-            Ok(stmt) => semantic_stmts.push(stmt),
-            Err(err) => errors.push(err),
-        }
-    }
-
-    if errors.is_empty() {
-        Ok(SemanticProgram {
-            stmts: semantic_stmts,
-            enums: analyzer.enum_defs,
-        })
-    } else {
-        Err(errors)
     }
 }
 

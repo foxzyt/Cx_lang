@@ -98,15 +98,16 @@ pub(crate) fn runtime_error_message(err: &RuntimeError) -> (String, usize) {
             right,
         } => (
             format!(
-                "operator '{:?}' cannot be applied to '{:?}' and '{:?}' — types are incompatible",
-                op, left, right
+                "operator '{:?}' cannot be applied to these operands — types are incompatible",
+                op
             ),
             *pos,
         ),
         RuntimeError::TypeMismatch { pos, expected, got } => (
             format!(
-                "type mismatch — expected '{:?}' but got '{:?}'",
-                expected, got
+                "type mismatch — expected '{}' but got '{}'",
+                format!("{:?}", expected).to_lowercase(),
+                format!("{:?}", got).to_lowercase()
             ),
             *pos,
         ),
@@ -164,7 +165,7 @@ pub(crate) fn runtime_error_message(err: &RuntimeError) -> (String, usize) {
             *pos,
         ),
         RuntimeError::StaleHandle { pos } => (
-            "stale handle access â€” handle was already dropped".to_string(),
+            "stale handle access -- handle was already dropped".to_string(),
             *pos,
         ),
         RuntimeError::BreakSignal => ("break signal".to_string(), 0),
@@ -437,6 +438,18 @@ Expr::Call(name, args, _) => {
         Expr::When(match_expr, arms, _) => {
             eprintln!("{}WhenExpr({} arms)", pad, arms.len());
             print_expr(match_expr, depth + 1);
+        }
+        Expr::ResultOk(inner, _) => {
+            eprintln!("{}Ok(...)", pad);
+            print_expr(inner, depth + 1);
+        }
+        Expr::ResultErr(inner, _) => {
+            eprintln!("{}Err(...)", pad);
+            print_expr(inner, depth + 1);
+        }
+        Expr::Try(inner, _) => {
+            eprintln!("{}Try(?)", pad);
+            print_expr(inner, depth + 1);
         }
     }
 }

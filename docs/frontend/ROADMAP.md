@@ -1,5 +1,5 @@
 # Cx Language Roadmap
-v4.6 — 2026-03-24
+v4.7 — 2026-04-13
 
 ---
 
@@ -136,8 +136,8 @@ These are not features. These are conditions. A long gate list that never closes
 - [x] Value-producing `when` — full pipeline landed 2026-03-22, t59 passing
 - [x] `when` block-body arms — verified 2026-03-22, t58 passing
 - [x] Multi-file imports working — resolver implemented 2026-03-25, t74 passing
-- [ ] Basic test runner — `assert(cond)`, `assert_eq(a, b)`, test blocks
-- [ ] Minimal error model — `Result<T>`, `Ok`, `Err`, `?` operator syntax locked and implemented
+- [x] Basic test runner — `assert(cond)`, `assert_eq(a, b)`, `--test` mode, `#[test]` macro. Landed 2026-04-04, t77-t80 passing
+- [x] Minimal error model — `Result<T>`, `Ok`, `Err`, `?` operator. Landed 2026-04-04, t81-t88 passing
 - [x] print promoted to function — landed 2026-03-23, print/printn are real function calls, keywords removed from lexer
 - [x] UTF-8 decision locked — UTF-8 strict everywhere. str is valid UTF-8, invalid bytes are runtime error, char is Unicode scalar value. 2026-03-29
 - [x] String interpolation — landed 2026-03-23, `{varname}` expanded at print time
@@ -145,7 +145,7 @@ These are not features. These are conditions. A long gate list that never closes
 - [ ] Semicolon rule enforced consistently — optional everywhere, no context-dependent exceptions
 - [ ] Parser, semantic layer, and interpreter agree on all supported constructs
 - [ ] No known soundness holes in memory boundary model
-- [ ] All examples in `examples/` pass
+- [x] All examples in `examples/` pass — 8 examples, `bash examples/run_all.sh` reports 8/8 PASS
 - [ ] Diagnostics readable for common mistakes
 - [ ] Roadmap and spec match actual language behavior
 
@@ -586,3 +586,17 @@ These need active design work before any implementation can begin.
 - Dead code cleanup — Print/PrintInline, Range, Placeholder, wait_for_step removed
 - Output verification added to matrix runner via .expected_output sidecars
 - Version bumped to v4.5
+
+## Key Changes from v4.6
+
+- Basic test runner landed — assert, assert_eq, --test mode, #[test] macro (hard blocker done)
+- Minimal error model landed — Result<T>, Ok, Err, ? operator (hard blocker done)
+- All examples in examples/ pass — 8 examples, run_all.sh reports 8/8
+- Wrapping arithmetic enforced — saturating replaced with wrapping, MIN/-1 guarded
+- Semicolon rule partially enforced — optional on declarations/assignments, required on expr stmts
+- UTF-8 decision locked — strict everywhere
+- Diagnostics polished — smart quote fix, cleaner error messages
+- Dead analyze_program function removed, unused HashMap import removed
+- Examples runner cross-platform fix — cargo detection for Git Bash on Windows
+- Test matrix at 90 tests, 90/90 green
+- Version bumped to v4.7
