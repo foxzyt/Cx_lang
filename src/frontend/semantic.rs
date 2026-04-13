@@ -702,7 +702,7 @@ Stmt::ExprStmt { expr, _pos } => Ok(SemanticStmt::ExprStmt {
             Stmt::While { cond, body, pos } => {
                 let semantic_cond = self.analyze_expr(cond)?;
                 if matches!(semantic_cond.ty, SemanticType::Unknown) {
-                    return Err(sem_err!(*pos, "Unknown value cannot be used as a loop condition â€” control-critical context"));
+                    return Err(sem_err!(*pos, "Unknown value cannot be used as a loop condition -- control-critical context"));
                 }
                 let semantic_body = body
                     .iter()
@@ -874,14 +874,14 @@ Stmt::ExprStmt { expr, _pos } => Ok(SemanticStmt::ExprStmt {
             }
             if let Some(expected) = &self.current_ret_ty {
                 if !types_compatible(expected, &expr.ty) {
-                    return Err(sem_err!(pos, "return type mismatch: expected {:?}, got {:?}", classify_type(expected), classify_type(&expr.ty)));
+                    return Err(sem_err!(pos, "return type mismatch: expected {}, got {}", type_name(expected), type_name(&expr.ty)));
                 }
                 expr = insert_cast_if_needed(expr, expected);
             }
             Some(expr)
         } else {
             if ret_ty.is_some() && !contains_return_stmt(body) {
-                return Err(sem_err!(pos, "missing return value, expected {:?}", classify_type(&semantic_type_from_decl(ret_ty.clone().unwrap(), type_params))));
+                return Err(sem_err!(pos, "missing return value, expected {}", type_name(&semantic_type_from_decl(ret_ty.clone().unwrap(), type_params))));
             }
             None
         };
@@ -920,13 +920,13 @@ Stmt::ExprStmt { expr, _pos } => Ok(SemanticStmt::ExprStmt {
                     return Err(sem_err!(pos, "cannot return a StrRef — it does not outlive its origin scope"));
                 }
                 if !types_compatible(&expected, &expr.ty) {
-                    return Err(sem_err!(pos, "return type mismatch: expected {:?}, got {:?}", classify_type(&expected), classify_type(&expr.ty)));
+                    return Err(sem_err!(pos, "return type mismatch: expected {}, got {}", type_name(&expected), type_name(&expr.ty)));
                 }
                 Some(insert_cast_if_needed(expr, &expected))
             }
             (None, None) => None,
             (None, Some(expected)) => {
-                return Err(sem_err!(pos, "missing return value, expected {:?}", classify_type(&expected)));
+                return Err(sem_err!(pos, "missing return value, expected {}", type_name(&expected)));
             }
             (Some(expr), None) => {
                 self.analyze_expr(expr)?;
@@ -1299,7 +1299,7 @@ Expr::Unary(op, inner, pos) => {
                 let inner_analyzed = self.analyze_expr(inner)?;
                 // Err() must wrap a string
                 if inner_analyzed.ty != SemanticType::Str {
-                    return Err(sem_err!(*pos, "Err() argument must be a string, got {:?}", inner_analyzed.ty));
+                    return Err(sem_err!(*pos, "Err() argument must be a string, got {}", type_name(&inner_analyzed.ty)));
                 }
                 // We don't know the T in Result<T> from the Err site alone,
                 // so use a generic Result<Unknown> that the return-type check will unify.
@@ -1317,7 +1317,7 @@ Expr::Unary(op, inner, pos) => {
                 let unwrapped_ty = match &inner_analyzed.ty {
                     SemanticType::Result(inner_ty) => (**inner_ty).clone(),
                     other => {
-                        return Err(sem_err!(*pos, "? operator requires a Result<T> value, got {:?}", other));
+                        return Err(sem_err!(*pos, "? operator requires a Result<T> value, got {}", type_name(other)));
                     }
                 };
                 // The enclosing function must return Result<U>
@@ -1407,7 +1407,7 @@ Expr::Unary(op, inner, pos) => {
                             let analyzed = self.analyze_expr(expr)?;
                             if let Some(existing) = type_param_map.get(tname) {
                                 if !types_compatible(existing, &analyzed.ty) {
-                                    return Err(sem_err!(pos, "type parameter '{}' is bound to {:?} but argument {} has {:?}", tname, classify_type(existing), index + 1, classify_type(&analyzed.ty)));
+                                    return Err(sem_err!(pos, "type parameter '{}' is bound to {} but argument {} has {}", tname, type_name(existing), index + 1, type_name(&analyzed.ty)));
                                 }
                             } else {
                                 type_param_map.insert(tname.clone(), analyzed.ty.clone());
@@ -1435,7 +1435,7 @@ Expr::Unary(op, inner, pos) => {
                     let expr = self.analyze_expr(expr)?;
                     let expr = if let Some(expected) = expected {
                         if !types_compatible(&expected, &expr.ty) {
-                            return Err(sem_err!(pos, "argument {} to '{}': expected {:?}, got {:?}", index + 1, name, classify_type(&expected), classify_type(&expr.ty)));
+                            return Err(sem_err!(pos, "argument {} to '{}': expected {}, got {}", index + 1, name, type_name(&expected), type_name(&expr.ty)));
                         }
                         insert_cast_if_needed(expr, &expected)
                     } else {
@@ -1519,7 +1519,7 @@ Expr::Unary(op, inner, pos) => {
                     });
                 }
                 if !is_numeric(&lhs.ty) || !is_numeric(&rhs.ty) {
-                    return Err(sem_err!(op_pos, "arithmetic requires numeric operands, got {:?} and {:?}", classify_type(&lhs.ty), classify_type(&rhs.ty)));
+                    return Err(sem_err!(op_pos, "arithmetic requires numeric operands, got {} and {}", type_name(&lhs.ty), type_name(&rhs.ty)));
                 }
 
                 let result_ty = common_numeric_type(&lhs.ty, &rhs.ty);
@@ -1584,7 +1584,7 @@ Expr::Unary(op, inner, pos) => {
                     });
                 }
 
-                Err(sem_err!(op_pos, "cannot compare {:?} {:?} {:?}", classify_type(&lhs.ty), op, classify_type(&rhs.ty)))
+                Err(sem_err!(op_pos, "cannot compare {} {:?} {}", type_name(&lhs.ty), op, type_name(&rhs.ty)))
             }
             Op::Lt | Op::Gt | Op::LtEq | Op::GtEq => {
                 if lhs.ty == SemanticType::Unknown || rhs.ty == SemanticType::Unknown {
@@ -1628,7 +1628,7 @@ Expr::Unary(op, inner, pos) => {
                         },
                     })
                 } else {
-                    Err(sem_err!(op_pos, "logical operation requires bool operands, got {:?} and {:?}", classify_type(&lhs.ty), classify_type(&rhs.ty)))
+                    Err(sem_err!(op_pos, "logical operation requires bool operands, got {} and {}", type_name(&lhs.ty), type_name(&rhs.ty)))
                 }
             }
         }
@@ -1636,7 +1636,7 @@ Expr::Unary(op, inner, pos) => {
 }
 
 fn type_mismatch_error(expected: &SemanticType, got: &SemanticType, pos: usize) -> SemanticError {
-    sem_err!(pos, "type mismatch: expected {:?}, got {:?}", classify_type(expected), classify_type(got))
+    sem_err!(pos, "type mismatch: expected {}, got {}", type_name(expected), type_name(got))
 }
 
 fn semantic_param_placeholder(param: &ParamKind) -> SemanticParam {
@@ -1765,6 +1765,31 @@ fn semantic_value_from_ast(value: &AstValue, enums: &HashMap<String, EnumInfo>) 
         }
         AstValue::StructInstance(_, _, _) => SemanticValue::Unknown,
         AstValue::Unknown => SemanticValue::Unknown,
+    }
+}
+
+pub(crate) fn type_name(ty: &SemanticType) -> String {
+    match ty {
+        SemanticType::I8 => "t8".to_string(),
+        SemanticType::I16 => "t16".to_string(),
+        SemanticType::I32 => "t32".to_string(),
+        SemanticType::I64 => "t64".to_string(),
+        SemanticType::I128 => "t128".to_string(),
+        SemanticType::F64 => "f64".to_string(),
+        SemanticType::Bool => "bool".to_string(),
+        SemanticType::Str => "str".to_string(),
+        SemanticType::StrRef => "strref".to_string(),
+        SemanticType::Char => "char".to_string(),
+        SemanticType::Container => "container".to_string(),
+        SemanticType::Numeric => "numeric literal".to_string(),
+        SemanticType::Unknown => "unknown".to_string(),
+        SemanticType::Void => "void".to_string(),
+        SemanticType::Enum(name) => format!("enum {}", name),
+        SemanticType::Struct(name) => name.clone(),
+        SemanticType::TypeParam(name) => name.clone(),
+        SemanticType::Handle(inner) => format!("Handle<{}>", type_name(inner)),
+        SemanticType::Array(size, elem) => format!("[{}: {}]", size, type_name(elem)),
+        SemanticType::Result(inner) => format!("Result<{}>", type_name(inner)),
     }
 }
 

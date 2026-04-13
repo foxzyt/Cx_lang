@@ -2,7 +2,7 @@ use crate::{
     frontend::{
         ast::*,
         lexer::{ParseError, Token},
-        types::RuntimeError,
+        types::{RuntimeError, Value},
     },
     runtime::runtime::ScopeEvent,
 };
@@ -85,6 +85,25 @@ pub(crate) fn print_custom(src: &str, msg: &str, pos: usize) {
 
 // ── Runtime errors ────────────────────────────────────────────────
 
+fn value_kind(v: &Value) -> &'static str {
+    match v {
+        Value::Num(_) => "number",
+        Value::Float(_) => "float",
+        Value::Bool(_) => "bool",
+        Value::TBool(_) => "tbool",
+        Value::Char(_) => "char",
+        Value::Str(_, _) => "string",
+        Value::EnumVariant(_, _) => "enum variant",
+        Value::Unknown(_) => "unknown",
+        Value::Array(_) => "array",
+        Value::Handle(_) => "handle",
+        Value::Container(_) => "container",
+        Value::Struct(_, _) => "struct",
+        Value::ResultOk(_) => "Ok",
+        Value::ResultErr(_) => "Err",
+    }
+}
+
 pub(crate) fn runtime_error_message(err: &RuntimeError) -> (String, usize) {
     match err {
         RuntimeError::DivByZero { pos } => (
@@ -98,8 +117,8 @@ pub(crate) fn runtime_error_message(err: &RuntimeError) -> (String, usize) {
             right,
         } => (
             format!(
-                "operator '{:?}' cannot be applied to these operands — types are incompatible",
-                op
+                "operator '{:?}' cannot be applied to {} and {} — incompatible types",
+                op, value_kind(left), value_kind(right)
             ),
             *pos,
         ),
@@ -120,8 +139,8 @@ pub(crate) fn runtime_error_message(err: &RuntimeError) -> (String, usize) {
         ),
         RuntimeError::UndefinedVar { pos, name } => (
             format!(
-                "variable '{}' has not been declared — declare it with 'let {}' or '{}: TYPE = value' before use",
-                name, name, name
+                "variable '{}' has not been declared — declare it with '{}: TYPE = value' before use",
+                name, name
             ),
             *pos,
         ),
@@ -165,17 +184,17 @@ pub(crate) fn runtime_error_message(err: &RuntimeError) -> (String, usize) {
             *pos,
         ),
         RuntimeError::StaleHandle { pos } => (
-            "stale handle access -- handle was already dropped".to_string(),
+            "stale handle access - handle was already dropped".to_string(),
             *pos,
         ),
-        RuntimeError::BreakSignal => ("break signal".to_string(), 0),
-        RuntimeError::ContinueSignal => ("continue signal".to_string(), 0),
+        RuntimeError::BreakSignal => ("unhandled 'break' outside of a loop -- this may be a compiler bug".to_string(), 0),
+        RuntimeError::ContinueSignal => ("unhandled 'continue' outside of a loop -- this may be a compiler bug".to_string(), 0),
         RuntimeError::ReadOnlyLoopVar { pos, name } => (
             format!("loop variable '{}' is read-only", name),
             *pos,
         ),
         RuntimeError::EarlyReturn(_) => (
-            "return statement used outside of a function body".to_string(),
+            "unhandled control flow signal -- this is likely a compiler bug, please report".to_string(),
             0,
         ),
         RuntimeError::AssertionFailed { pos, msg } => (
