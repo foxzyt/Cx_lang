@@ -71,8 +71,33 @@ impl PhaseTimer {
     }
 }
 
-// Simple driver that tokenizes, parses, and executes a .cx file.
+// The interpreter runs on a dedicated thread with a 64 MB stack to handle
+// deep recursion. The interpreter uses native Rust recursion for Cx-level
+// function calls (call_semantic_func -> run_semantic_stmt -> eval_semantic_expr),
+// which burns multiple KB of stack per call frame. The default thread stack
+// (1 MB on Windows) is too small for even fib(8). Reducing per-frame stack
+// consumption is a post-0.1 optimization tracked in the audit report.
 fn main() {
+    let result = std::thread::Builder::new()
+        .name("cx-interpreter".to_string())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(run)
+        .expect("failed to spawn interpreter thread")
+        .join();
+
+    if let Err(e) = result {
+        if let Some(msg) = e.downcast_ref::<String>() {
+            eprintln!("interpreter panicked: {}", msg);
+        } else if let Some(msg) = e.downcast_ref::<&str>() {
+            eprintln!("interpreter panicked: {}", msg);
+        } else {
+            eprintln!("interpreter panicked (unknown error)");
+        }
+        std::process::exit(2);
+    }
+}
+
+fn run() {
     let args: Vec<String> = env::args().skip(1).collect();
     let flags = DebugFlags::from_args(&args);
     let test_mode = args.contains(&"--test".to_string());

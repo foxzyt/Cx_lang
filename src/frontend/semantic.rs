@@ -398,11 +398,28 @@ impl Analyzer {
                         if !info.initialized {
                             return Err(sem_err!(*pos_eq, "use of uninitialized variable '{}'", container));
                         }
+                        let instance_ty = info.inferred.clone()
+                            .or_else(|| info.declared.as_ref().map(|t| semantic_type_from_decl(t.clone(), &[])))
+                            .unwrap_or(SemanticType::Unknown);
+                        let field_ty = if let SemanticType::Struct(struct_name) = &instance_ty {
+                            self.structs.get(struct_name)
+                                .and_then(|fields| fields.iter().find(|(fname, _)| fname == field))
+                                .map(|(_, ftype)| semantic_type_from_decl(ftype.clone(), &self.current_type_params))
+                                .unwrap_or(SemanticType::Unknown)
+                        } else {
+                            SemanticType::Unknown
+                        };
+                        if field_ty != SemanticType::Unknown {
+                            if !types_compatible(&field_ty, &semantic_expr.ty) {
+                                return Err(type_mismatch_error(&field_ty, &semantic_expr.ty, *pos_eq));
+                            }
+                            semantic_expr = insert_cast_if_needed(semantic_expr, &field_ty);
+                        }
                         SemanticLValue::DotAccess {
                             binding: Some(info.binding),
                             container: container.clone(),
                             field: field.clone(),
-                            ty: SemanticType::Numeric,
+                            ty: field_ty,
                         }
                     }
                     _ => {
@@ -765,7 +782,19 @@ Stmt::ExprStmt { expr, _pos } => Ok(SemanticStmt::ExprStmt {
                     }
                     AssignTarget::Field(container, field) => {
                         let binding = self.lookup_var(container).map(|info| info.binding);
-                        SemanticLValue::DotAccess { binding, container: container.clone(), field: field.clone(), ty: SemanticType::Unknown }
+                        let instance_ty = self.lookup_var(container)
+                            .and_then(|info| info.inferred.clone()
+                                .or_else(|| info.declared.as_ref().map(|t| semantic_type_from_decl(t.clone(), &[]))))
+                            .unwrap_or(SemanticType::Unknown);
+                        let field_ty = if let SemanticType::Struct(struct_name) = &instance_ty {
+                            self.structs.get(struct_name)
+                                .and_then(|fields| fields.iter().find(|(fname, _)| fname == field))
+                                .map(|(_, ftype)| semantic_type_from_decl(ftype.clone(), &self.current_type_params))
+                                .unwrap_or(SemanticType::Unknown)
+                        } else {
+                            SemanticType::Unknown
+                        };
+                        SemanticLValue::DotAccess { binding, container: container.clone(), field: field.clone(), ty: field_ty }
                     }
                 };
                 Ok(SemanticStmt::CompoundAssign {

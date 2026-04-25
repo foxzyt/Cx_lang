@@ -752,25 +752,31 @@ SemanticStmt::Decl { name, ty, .. } => {
             SemanticStmt::Assign { target, expr, .. } => {
                 let val = self.eval_semantic_expr(expr)?;
                 match target {
-                    SemanticLValue::Binding { name, .. } => self.set_var(name.clone(), val, 0),
-                    SemanticLValue::DotAccess { container, field, .. } => {
-                        self.set_container_field(container, field, val, 0)
+                    SemanticLValue::Binding { name, ty, .. } => {
+                        let truncated = apply_numeric_cast(val, ty);
+                        self.set_var(name.clone(), truncated, 0)
+                    }
+                    SemanticLValue::DotAccess { container, field, ty, .. } => {
+                        let truncated = apply_numeric_cast(val, ty);
+                        self.set_container_field(container, field, truncated, 0)
                     }
                 }
             }
             SemanticStmt::CompoundAssign { target, op, operand, .. } => {
                 match target {
-                    SemanticLValue::Binding { name, .. } => {
+                    SemanticLValue::Binding { name, ty, .. } => {
                         let current = self.get_var(name, 0)?;
                         let rhs = self.eval_semantic_expr(operand)?;
                         let result = self.apply_op(current, op.clone(), 0, rhs)?;
-                        self.set_var(name.clone(), result, 0)
+                        let truncated = apply_numeric_cast(result, ty);
+                        self.set_var(name.clone(), truncated, 0)
                     }
-                    SemanticLValue::DotAccess { container, field, .. } => {
+                    SemanticLValue::DotAccess { container, field, ty, .. } => {
                         let current = self.get_field(container, field, 0)?;
                         let rhs = self.eval_semantic_expr(operand)?;
                         let result = self.apply_op(current, op.clone(), 0, rhs)?;
-                        self.set_container_field(container, field, result, 0)
+                        let truncated = apply_numeric_cast(result, ty);
+                        self.set_container_field(container, field, truncated, 0)
                     }
                 }
             }

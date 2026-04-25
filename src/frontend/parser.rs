@@ -35,36 +35,43 @@ fn type_parser<'a, I>() -> impl Parser<'a, I, Type, ParserError<'a>> + Clone
 where
     I: ValueInput<'a, Token = Token, Span = Span>,
 {
-    let scalar = select! {
-        Token::TypeT8     => Type::T8,
-        Token::TypeT16    => Type::T16,
-        Token::TypeT32    => Type::T32,
-        Token::TypeT64    => Type::T64,
-        Token::TypeT128   => Type::T128,
-        Token::TypeF64    => Type::F64,
-        Token::TypeBool   => Type::Bool,
-        Token::TypeStr    => Type::Str,
-        Token::TypeStrRef => Type::StrRef,
-        Token::TypeChar   => Type::Char,
-    };
+    recursive(|ty| {
+        let scalar = select! {
+            Token::TypeT8     => Type::T8,
+            Token::TypeT16    => Type::T16,
+            Token::TypeT32    => Type::T32,
+            Token::TypeT64    => Type::T64,
+            Token::TypeT128   => Type::T128,
+            Token::TypeF64    => Type::F64,
+            Token::TypeBool   => Type::Bool,
+            Token::TypeStr    => Type::Str,
+            Token::TypeStrRef => Type::StrRef,
+            Token::TypeChar   => Type::Char,
+        };
 
-    let named_type = select! { Token::Identifier(s) => Type::Struct(s) };
-    let elem_ty = scalar.clone().or(named_type.clone());
+        let named_type = select! { Token::Identifier(s) => Type::Struct(s) };
 
-    let array = just(Token::PunctBracketOpen)
-        .ignore_then(select! { Token::LiteralInt(n) => n as usize })
-        .then_ignore(just(Token::PunctColon))
-        .then(elem_ty)
-        .then_ignore(just(Token::PunctBracketClose))
-        .map(|(size, elem_ty)| Type::Array(size, Box::new(elem_ty)));
+        let array = just(Token::PunctBracketOpen)
+            .ignore_then(select! { Token::LiteralInt(n) => n as usize })
+            .then_ignore(just(Token::PunctColon))
+            .then(ty.clone())
+            .then_ignore(just(Token::PunctBracketClose))
+            .map(|(size, elem)| Type::Array(size, Box::new(elem)));
 
-    let result_type = just(Token::KeywordResult)
-        .ignore_then(just(Token::OpLessThan))
-        .ignore_then(scalar.clone().or(named_type.clone()))
-        .then_ignore(just(Token::OpGreaterThan))
-        .map(|inner| Type::Result(Box::new(inner)));
+        let result_type = just(Token::KeywordResult)
+            .ignore_then(just(Token::OpLessThan))
+            .ignore_then(ty.clone())
+            .then_ignore(just(Token::OpGreaterThan))
+            .map(|inner| Type::Result(Box::new(inner)));
 
-    result_type.or(array).or(scalar).or(named_type)
+        let handle_type = just(Token::KeywordHandle)
+            .ignore_then(just(Token::OpLessThan))
+            .ignore_then(ty.clone())
+            .then_ignore(just(Token::OpGreaterThan))
+            .map(|inner| Type::Handle(Box::new(inner)));
+
+        result_type.or(handle_type).or(array).or(scalar).or(named_type)
+    })
 }
 
 fn expr_parser<'a, I>() -> impl Parser<'a, I, Expr, ParserError<'a>> + Clone

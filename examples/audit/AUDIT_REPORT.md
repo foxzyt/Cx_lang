@@ -1,15 +1,16 @@
 # Parser/Semantic/Interpreter Agreement Audit — Part 1
 
 Date: 2026-04-13
-Matrix baseline: 105/105 green (after Half A: 110/110)
+Matrix baseline: 105/105 green (after Half A: 110/110, after Part 2 fixes: 116/116)
 
-## Summary
+## Summary (after Part 2 fixes)
 - Tests run: 12
-- Pass: 7
-- Parse failures: 1
-- Semantic failures: 2
+- Pass: 10 (was 7, +3 from fixes)
+- Parse failures: 0 (was 1 — audit_02 fixed by recursive type_parser)
+- Semantic failures: 2 (by design — untyped assignment)
 - Runtime failures: 0
-- Wrong output: 1
+- Wrong output: 0 (was 1 — audit_09 fixed by field-type truncation)
+- Panics: 0 (was 1 — audit_11 fixed by 64 MB stack thread)
 - Panics: 1
 
 ## Per-test results
@@ -22,11 +23,11 @@ Matrix baseline: 105/105 green (after Half A: 110/110)
 **Notes:** Impl on generic struct works. Adapted test to print from inside method (returns void) since returning T from impl method on unparameterized Pair would need more type plumbing.
 
 ### audit_02_nested_result
-**Status:** PARSE_FAIL
+**Status:** PASS (fixed in audit-part-2 sprint)
 **Expected:** Ok(Ok(5))
-**Actual:** `PARSE ERROR (line 1): ExpectedFound { expected: [something else], found: Some(KeywordResult) }`
-**Layer:** parser
-**Notes:** `Result<Result<t32>>` fails to parse. The type parser's `result_type` combinator uses `scalar.clone().or(named_type.clone())` for the inner type, but `Result` is a keyword token not matched by either. The inner type parser needs to accept `result_type` recursively.
+**Actual:** Ok(Ok(5))
+**Layer:** N/A
+**Notes:** Fixed by refactoring type_parser to use recursive(). Now supports Result<Result<T>>, Handle<T> in type position, [N: Result<T>], etc.
 
 ### audit_03_try_in_when_arm
 **Status:** SEMANTIC_FAIL
@@ -71,11 +72,11 @@ Matrix baseline: 105/105 green (after Half A: 110/110)
 **Notes:** Nested function calls with typed args work cleanly.
 
 ### audit_09_struct_field_overflow
-**Status:** WRONG_OUTPUT
+**Status:** PASS (fixed in audit-part-2 sprint)
 **Expected:** 4 (wrapping at t8)
-**Actual:** 260
-**Layer:** runtime
-**Notes:** `c.value += 10` where `value: t8` produces 260, not 4. The overflow-at-declared-width sprint handles Binary expressions via `apply_numeric_cast(result, &expr.ty)`, but compound assignment on struct fields goes through a different code path (`CompoundAssign` in `run_semantic_stmt`) that does NOT apply width truncation. The struct field retains its declared type `t8` but the arithmetic result is not truncated before storage.
+**Actual:** 4
+**Layer:** N/A
+**Notes:** Fixed by: (1) semantic pass now looks up actual field type from struct definition for DotAccess LValues, (2) runtime CompoundAssign and Assign arms now apply apply_numeric_cast using the LValue's ty field.
 
 ### audit_10_if_let_chain
 **Status:** PASS
@@ -85,11 +86,11 @@ Matrix baseline: 105/105 green (after Half A: 110/110)
 **Notes:** Multi-branch if/else if/else with string returns works correctly.
 
 ### audit_11_recursive_fib
-**Status:** PANIC
+**Status:** PASS (fixed in audit-part-2 sprint)
 **Expected:** 55
-**Actual:** `thread 'main' has overflowed its stack`
-**Layer:** runtime
-**Notes:** `fib(10)` with tree recursion overflows the Rust call stack. The interpreter uses native Rust recursion for function calls (`call_semantic_func` → `run_semantic_stmt` → `eval_semantic_expr` → `call_semantic_func`), so deep recursion hits the Rust stack limit. `fib(10)` generates ~177 recursive calls. This is a known architectural limitation of tree-walking interpreters. Tail-call optimization or an explicit call stack would fix it, but both are major architectural changes.
+**Actual:** 55
+**Layer:** N/A
+**Notes:** Fixed by running the interpreter on a dedicated thread with a 64 MB stack. The per-frame stack consumption is still high (post-0.1 optimization), but 64 MB provides generous headroom for any reasonable recursive Cx code. fib(15) now produces 610 correctly (t113 matrix test).
 
 ### audit_12_generic_struct_in_generic_func
 **Status:** PASS
@@ -101,11 +102,11 @@ Matrix baseline: 105/105 green (after Half A: 110/110)
 ## Triage
 
 ### Must-fix for 0.1 (hard blockers)
-- **audit_09**: Compound assignment on struct fields does not apply width truncation. `c.value += 10` where `value: t8` should wrap but produces full i128 result. This is a gap in the overflow enforcement sprint — the CompoundAssign runtime path was not updated.
+- ~~**audit_09**~~: Fixed in audit-part-2 sprint. Semantic pass now tracks field types, runtime truncates via apply_numeric_cast.
+- ~~**audit_11**~~: Fixed in audit-part-2 sprint. Interpreter runs on 64 MB stack thread.
 
 ### Should-fix for 0.1 (quality)
-- **audit_02**: `Result<Result<T>>` fails to parse. The type parser needs recursive Result support. Low priority since nested Result is an edge case, but it's a parser completeness gap.
-- **audit_11**: Recursive fib(10) overflows the stack. Should document the recursion depth limit and/or increase Rust's stack size for the interpreter. Not architecturally fixable without a call stack rewrite.
+- ~~**audit_02**~~: Fixed in audit-part-2 sprint. type_parser refactored to recursive(). Handle<T> also now parseable as a type.
 
 ### Document as known limitation for 0.1
 - **audit_03/05**: Untyped assignment (`val = expr`) requires prior declaration. This is by-design, not a bug. Document in the spec that all variables must be declared with a type before assignment.
