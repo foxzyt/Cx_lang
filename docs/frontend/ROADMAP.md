@@ -251,8 +251,7 @@ These are not features. These are conditions. A long gate list that never closes
 - **Backend ABI / Data Layout** — Phase 8 complete on submain as of 2026-03-28. Scalar layout (Round 1, 2026-03-27), TBool (1-byte three-state), struct layout (declaration order, natural alignment, padding), array layout (fixed-size, contiguous, stride-based), enum layout (tag-only u8), and calling convention (single return, C ABI) all locked in `cx_abi_v0.1.md` with Rust-level confidence tests. Remaining open: string layout, copy parameter convention (deferred post-0.1).
 - **Generic structs follow-up** — Phase 1+2 landed. Remaining: type args in variable declarations (`p: Pair<t32>`), generic field type checking enforcement.
 - **Multi-file imports** — `#![imports]` block parsing and semantic validation landed 2026-03-24. Full resolution pipeline (resolver, semantic merge, runtime dispatch) merged to main via PR #27 on 2026-03-28, t74/t64 passing.
-- **Backend IR Phase 10 — Control flow lowering** — While loop lowering landed on submain 2026-03-28 (header/body/exit CFG, loop-carried SSA via block params, backedge, 3 tests). `loop`/`break`/`continue` lowering landed on submain 2026-04-12 with `LoopContext` threading. `for` loop lowering landed on submain 2026-04-13 (ascending only, inclusive/exclusive, break/continue support, increment block, 4 tests). Conditional return inside while-loop verified lowering correctly 2026-04-13.
-- **Parser/semantic/interpreter agreement audit** — Part 1 landed on submain 2026-04-13: 12 discovery cases under `examples/audit/`, triaged into must-fix (audit_09 struct-field compound-assign overflow), should-fix (audit_02 `Result<Result<T>>` parser completeness), known-limitations (untyped assignment requires prior declaration; tree-recursive depth hits Rust stack), and defer-post-0.1. Audit cases live in `examples/audit/`, not in the regression matrix.
+- **Backend IR Phase 10 — Control flow lowering** — While loop lowering landed on submain 2026-03-28: header/body/exit CFG, loop-carried SSA via block params, backedge, 3 tests. Infinite `loop`, `break`, and `continue` lowering landed on submain 2026-04-12: `LoopContext` threaded through `lower_stmt`/`lower_if_else`/`lower_if_chain`, exit block gains block params for break args, while's `else_args` now carry real loop-carried values. `for` loop lowering is the remaining Phase 10 gap — `SemanticStmt::For` is still `unsupported!` and is now the target of the retargeted "rejects_unsupported" tests.
 
 ---
 
@@ -555,6 +554,13 @@ These need active design work before any implementation can begin.
 - All hard blockers from v4.2 now resolved (imports, print, UTF-8 all done)
 - Test matrix at 78 tests, 78/78 green
 - Version bumped to v4.2
+
+## Working Notes (post-v4.8, unversioned)
+
+- 2026-04-12 (submain, not yet on main): Phase 10 expanded — infinite `loop`, `break`, `continue` now lower. `LoopContext` (header_id, exit_id, ordered_bindings) is threaded through statement and if-chain lowering so structured jumps resolve to the enclosing loop. `for` remains `unsupported!` and is the next Phase 10 target.
+- 2026-04-12 (submain, not yet on main): `docs/AGENT_OPERATING_DOCTRINE.md` v1.0 added — task-packet workflow for dev lead + agent coordination. Process document, not a language change.
+- Lowering now has `unsupported!` placeholder arms for `ResultOk`, `ResultErr`, `Try`, and `SemanticType::Result`. Semantic-layer shapes exist; IR implementation does not. Hard-blocker "Minimal error model" remains unchecked.
+- Submain sits 7 commits ahead of main as of 2026-04-12; 16th consecutive day unmerged.
 
 ## Key Changes from v4.7
 
