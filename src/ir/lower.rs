@@ -701,7 +701,9 @@ SemanticStmt::Block { .. } => { unsupported!("Block") },
             spec,
             loop_ctx,
         ),
-        SemanticStmt::StructDef { .. } => { unsupported!("StructDef") },
+        // Struct definitions are pre-processed into the struct_table before
+        // lowering begins; there is no IR to emit for the definition itself.
+        SemanticStmt::StructDef { .. } => Ok(Some(current)),
         SemanticStmt::ImplBlock { .. } => { unsupported!("ImplBlock") },
         SemanticStmt::ConstDecl { .. } => { unsupported!("ConstDecl") },
     }
@@ -1462,7 +1464,80 @@ fn lower_expr(
         SemanticExprKind::ArrayLit { .. } => { unsupported!("ArrayLit") },
         SemanticExprKind::Index { .. } => { unsupported!("Index") },
         SemanticExprKind::MethodCall { .. } => { unsupported!("MethodCall") },
-        SemanticExprKind::StructInstance { .. } => { unsupported!("StructInstance") },
+        // Struct literal lowering strategy
+        //
+        // A struct literal `S { f1: e1, f2: e2, ... }` is lowered to a sequence
+        // of memory operations that produce a stack-allocated struct value:
+        //
+        // 1. Alloca: reserve stack space for the whole struct using the layout
+        //    computed by build_struct_table (total_size, alignment).
+        //
+        // 2. For each field in canonical (definition) order:
+        //    a. Lower the field expression to a scalar IR value.
+        //    b. If the field's byte offset within the struct is non-zero, emit a
+        //       PtrOffset instruction to advance the base pointer by that many bytes.
+        //    c. Emit Store to write the field value at the (possibly offset) pointer.
+        //
+        // 3. Return the base Alloca pointer as IrType::Ptr — the binding that holds
+        //    a struct variable holds a pointer to its stack storage.
+        //
+        // Field ordering in the literal need not match definition order; we look up
+        // each canonical field name in the literal's field list by name.
+        SemanticExprKind::StructInstance { type_name, fields } => {
+            let layout_info = ctx.struct_table.get(type_name).cloned().ok_or_else(|| {
+                LoweringError::UnresolvedSemanticArtifact {
+                    artifact: format!("struct type '{}'", type_name),
+                }
+            })?;
+
+            if layout_info.layout.total_size == 0 {
+                return Err(LoweringError::UnsupportedSemanticConstruct {
+                    construct: "StructInstance with zero-size layout".to_string(),
+                });
+            }
+
+            let ptr = ctx.fresh_value();
+            active.emit(IrInst::Alloca {
+                dst: ptr,
+                size: layout_info.layout.total_size,
+                align: layout_info.layout.alignment,
+            })?;
+
+            for (field_idx, (canonical_name, _field_ty)) in layout_info.fields.iter().enumerate() {
+                let field_offset = layout_info.layout.field_offsets[field_idx];
+
+                let field_expr = fields
+                    .iter()
+                    .find(|(name, _)| name == canonical_name)
+                    .ok_or_else(|| LoweringError::InternalInvariantViolation {
+                        detail: format!(
+                            "struct '{}' field '{}' missing in literal",
+                            type_name, canonical_name
+                        ),
+                    })?;
+
+                let lowered_field = lower_expr(&field_expr.1, ctx, active)?;
+
+                let field_ptr = if field_offset == 0 {
+                    ptr
+                } else {
+                    let fp = ctx.fresh_value();
+                    active.emit(IrInst::PtrOffset {
+                        dst: fp,
+                        base: ptr,
+                        offset: field_offset,
+                    })?;
+                    fp
+                };
+
+                active.emit(IrInst::Store {
+                    ptr: field_ptr,
+                    value: lowered_field.value,
+                })?;
+            }
+
+            Ok(LoweredValue { value: ptr, ty: IrType::Ptr })
+        },
         SemanticExprKind::When { .. } => { unsupported!("WhenExpr") },
         SemanticExprKind::ResultOk { .. } => { unsupported!("ResultOk") },
         SemanticExprKind::ResultErr { .. } => { unsupported!("ResultErr") },
