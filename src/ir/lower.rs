@@ -526,6 +526,16 @@ fn lower_stmt(
                     })?;
                     Ok(Some(current))
                 }
+                SemanticLValue::Index { target, index, .. } => {
+                    let (elem_ptr, elem_ir_ty) =
+                        resolve_array_element_ptr(&*target, &*index, ctx, &mut current)?;
+                    ensure_type_match("array element assign", elem_ir_ty, lowered.ty)?;
+                    current.emit(IrInst::Store {
+                        ptr: elem_ptr,
+                        value: lowered.value,
+                    })?;
+                    Ok(Some(current))
+                }
             }
         }
         SemanticStmt::TypedAssign {
@@ -669,6 +679,46 @@ fn lower_stmt(
             // Write back to the field.
             current.emit(IrInst::Store {
                 ptr: field_ptr,
+                value: result_dst,
+            })?;
+            Ok(Some(current))
+        }
+        SemanticLValue::Index { target, index, .. } => {
+            let (elem_ptr, elem_ir_ty) =
+                resolve_array_element_ptr(&*target, &*index, ctx, &mut current)?;
+            // Read the current element value.
+            let current_dst = ctx.fresh_value();
+            current.emit(IrInst::Load {
+                dst: current_dst,
+                ty: elem_ir_ty.clone(),
+                ptr: elem_ptr,
+            })?;
+            // Lower the operand.
+            let rhs = lower_expr(operand, ctx, &mut current)?;
+            // Compute the binary result.
+            let bin_op = match op {
+                Op::Plus => BinaryOp::Add,
+                Op::Minus => BinaryOp::Sub,
+                Op::Mul => BinaryOp::Mul,
+                Op::Div => BinaryOp::Div,
+                Op::Mod => BinaryOp::Rem,
+                _ => {
+                    return Err(LoweringError::UnsupportedSemanticConstruct {
+                        construct: format!("compound assign operator {:?}", op),
+                    });
+                }
+            };
+            let result_dst = ctx.fresh_value();
+            current.emit(IrInst::Binary {
+                dst: result_dst,
+                op: bin_op,
+                ty: elem_ir_ty.clone(),
+                lhs: current_dst,
+                rhs: rhs.value,
+            })?;
+            // Write back to the element.
+            current.emit(IrInst::Store {
+                ptr: elem_ptr,
                 value: result_dst,
             })?;
             Ok(Some(current))
@@ -1855,6 +1905,108 @@ fn resolve_field_ptr(
     };
 
     Ok((field_ptr, field_ir_ty))
+}
+
+// Array element write lowering strategy
+//
+// An array element write `arr:[i] = value` where `arr: Array(N, ElemTy)` is
+// lowered to:
+//
+//   1. Lower `arr` to a base Ptr (the Alloca produced when the array was
+//      created).
+//
+//   2. Lower `i` to an integer SSA value; cast to I64 if needed.
+//
+//   3. Emit ConstInt(stride) then Binary(Mul, I64, i_i64, stride) to compute
+//      the byte offset at runtime.
+//
+//   4. Emit PtrAdd(base, byte_offset) to advance the pointer.
+//
+//   5. Caller emits Store(elem_ptr, value) to write the element.
+//
+// `resolve_array_element_ptr` encapsulates steps 1–4 and returns the element
+// pointer ValueId together with the element's IR type.  The caller is
+// responsible for emitting the Store (for simple writes) or the Load + Binary
+// + Store sequence (for compound-assign writes).
+
+/// Resolve the address of an array element, emitting the index arithmetic.
+///
+/// Returns `(elem_ptr, elem_ir_ty)` where `elem_ptr` is the ValueId of the
+/// pointer to the element and `elem_ir_ty` is its IR type.  The caller is
+/// responsible for emitting Load/Store as appropriate.
+fn resolve_array_element_ptr(
+    target: &SemanticExpr,
+    index: &SemanticExpr,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<(ValueId, IrType), LoweringError> {
+    // 1. Derive element IR type from the array target's declared type.
+    let (count, elem_sem_ty) = match &target.ty {
+        SemanticType::Array(count, elem_ty) => (*count, elem_ty.as_ref()),
+        _ => {
+            return Err(LoweringError::InternalInvariantViolation {
+                detail: format!(
+                    "array element write: target has non-Array type: {:?}",
+                    target.ty
+                ),
+            })
+        }
+    };
+
+    let elem_ir_ty = lower_type(elem_sem_ty)?;
+    let layout = compute_array_layout(&elem_ir_ty, count);
+
+    // 2. Lower the array target to a base pointer.
+    let base = lower_expr(target, ctx, active)?;
+    if base.ty != IrType::Ptr {
+        return Err(LoweringError::InternalInvariantViolation {
+            detail: format!(
+                "array element write: target must lower to Ptr, got {:?}",
+                base.ty
+            ),
+        });
+    }
+
+    // 3. Lower the index expression; cast to I64 if it isn't already.
+    let idx = lower_expr(index, ctx, active)?;
+    let idx_i64 = if idx.ty == IrType::I64 {
+        idx.value
+    } else {
+        let cast_dst = ctx.fresh_value();
+        active.emit(IrInst::Cast {
+            dst: cast_dst,
+            from: idx.ty.clone(),
+            to: IrType::I64,
+            value: idx.value,
+        })?;
+        cast_dst
+    };
+
+    // 4. Compute byte_offset = idx_i64 * stride.
+    let stride_val = ctx.fresh_value();
+    active.emit(IrInst::ConstInt {
+        dst: stride_val,
+        ty: IrType::I64,
+        value: layout.stride as i128,
+    })?;
+    let byte_offset = ctx.fresh_value();
+    active.emit(IrInst::Binary {
+        dst: byte_offset,
+        op: BinaryOp::Mul,
+        ty: IrType::I64,
+        lhs: idx_i64,
+        rhs: stride_val,
+    })?;
+
+    // 5. elem_ptr = base + byte_offset  (runtime pointer arithmetic).
+    let elem_ptr = ctx.fresh_value();
+    active.emit(IrInst::PtrAdd {
+        dst: elem_ptr,
+        base: base.value,
+        offset: byte_offset,
+    })?;
+
+    Ok((elem_ptr, elem_ir_ty))
 }
 
 fn lower_dot_access(
@@ -4721,6 +4873,168 @@ mod tests {
                     int_expr(0, SemanticType::I64),
                     SemanticType::I64,
                 ),
+            )],
+            enums: vec![],
+        };
+        assert!(lower_program(&program).is_err());
+    }
+
+    // ── array element write lowering tests ───────────────────────────────────
+
+    // Helper: build a SemanticLValue::Index for writing to an array element.
+    fn index_lvalue(
+        arr_binding: BindingId,
+        arr_name: &str,
+        arr_ty: SemanticType,
+        index: SemanticExpr,
+        elem_ty: SemanticType,
+    ) -> SemanticLValue {
+        SemanticLValue::Index {
+            target: Box::new(binding_ref(arr_binding, arr_name, arr_ty)),
+            index: Box::new(index),
+            elem_ty,
+        }
+    }
+
+    // A simple array element write `arr:[1] = 99` must emit:
+    // ConstInt (stride), Binary (Mul for byte_offset), PtrAdd, Store.
+    // No Load should appear (this is a plain write, not read-modify-write).
+    #[test]
+    fn lowers_array_element_write_emits_ptr_add_and_store() {
+        // fn write_elem(arr: [3: i64]) { arr:[1] = 99 }
+        let arr_binding = BindingId(0);
+        let arr_ty = SemanticType::Array(3, Box::new(SemanticType::I64));
+        let program = SemanticProgram {
+            stmts: vec![semantic_function(
+                "write_elem",
+                vec![typed_param(arr_binding, "arr", arr_ty.clone())],
+                None,
+                vec![SemanticStmt::Assign {
+                    target: index_lvalue(
+                        arr_binding,
+                        "arr",
+                        arr_ty,
+                        int_expr(1, SemanticType::I64),
+                        SemanticType::I64,
+                    ),
+                    expr: int_expr(99, SemanticType::I64),
+                    pos_eq: 0,
+                }],
+                None,
+            )],
+            enums: vec![],
+        };
+
+        let module = lower_and_validate(&program);
+        let func = module.functions.iter().find(|f| f.name == "write_elem").unwrap();
+        let insts: Vec<&IrInst> = func.blocks.iter().flat_map(|b| b.insts.iter()).collect();
+
+        // Must have a PtrAdd (runtime pointer arithmetic for the index).
+        assert!(
+            insts.iter().any(|i| matches!(i, IrInst::PtrAdd { .. })),
+            "expected PtrAdd for array element write"
+        );
+
+        // Must have a Store for i64 (writing the element).
+        assert!(
+            insts.iter().any(|i| matches!(i, IrInst::Store { .. })),
+            "expected Store for array element write"
+        );
+
+        // Must have a Binary Mul for byte_offset computation.
+        assert!(
+            insts
+                .iter()
+                .any(|i| matches!(i, IrInst::Binary { op: BinaryOp::Mul, ty: IrType::I64, .. })),
+            "expected Binary(Mul, I64) for byte offset computation"
+        );
+
+        // Must NOT have a Load (no read-modify-write for plain assignment).
+        assert!(
+            !insts.iter().any(|i| matches!(i, IrInst::Load { .. })),
+            "unexpected Load in plain array element write"
+        );
+    }
+
+    // A compound-assign array element write `arr:[0] += 5` must emit:
+    // PtrAdd, Load (read current), Binary (Mul + Add), Store (write back).
+    #[test]
+    fn lowers_array_element_compound_assign_emits_load_binary_store() {
+        // fn compound_write(arr: [2: i64]) { arr:[0] += 5 }
+        let arr_binding = BindingId(0);
+        let arr_ty = SemanticType::Array(2, Box::new(SemanticType::I64));
+        let program = SemanticProgram {
+            stmts: vec![semantic_function(
+                "compound_write",
+                vec![typed_param(arr_binding, "arr", arr_ty.clone())],
+                None,
+                vec![SemanticStmt::CompoundAssign {
+                    target: index_lvalue(
+                        arr_binding,
+                        "arr",
+                        arr_ty,
+                        int_expr(0, SemanticType::I64),
+                        SemanticType::I64,
+                    ),
+                    op: crate::frontend::ast::Op::Plus,
+                    operand: int_expr(5, SemanticType::I64),
+                    pos: 0,
+                }],
+                None,
+            )],
+            enums: vec![],
+        };
+
+        let module = lower_and_validate(&program);
+        let func = module.functions.iter().find(|f| f.name == "compound_write").unwrap();
+        let insts: Vec<&IrInst> = func.blocks.iter().flat_map(|b| b.insts.iter()).collect();
+
+        // Must have a PtrAdd for element address computation.
+        assert!(
+            insts.iter().any(|i| matches!(i, IrInst::PtrAdd { .. })),
+            "expected PtrAdd for array element compound assign"
+        );
+
+        // Must have a Load to read the current element value.
+        assert!(
+            insts.iter().any(|i| matches!(i, IrInst::Load { ty: IrType::I64, .. })),
+            "expected Load i64 to read current element value"
+        );
+
+        // Must have a Binary Add for the compound operation.
+        assert!(
+            insts
+                .iter()
+                .any(|i| matches!(i, IrInst::Binary { op: BinaryOp::Add, ty: IrType::I64, .. })),
+            "expected Binary(Add, I64) for compound assign"
+        );
+
+        // Must have a Store to write back the result.
+        assert!(
+            insts.iter().any(|i| matches!(i, IrInst::Store { .. })),
+            "expected Store to write back element value"
+        );
+    }
+
+    // Array element write rejects a non-Array target type.
+    #[test]
+    fn rejects_array_element_write_on_non_array_target() {
+        // Assign to SemanticLValue::Index where target is not an array type.
+        let program = SemanticProgram {
+            stmts: vec![semantic_function(
+                "bad_write",
+                vec![],
+                None,
+                vec![SemanticStmt::Assign {
+                    target: SemanticLValue::Index {
+                        target: Box::new(int_expr(42, SemanticType::I64)),
+                        index: Box::new(int_expr(0, SemanticType::I64)),
+                        elem_ty: SemanticType::I64,
+                    },
+                    expr: int_expr(99, SemanticType::I64),
+                    pos_eq: 0,
+                }],
+                None,
             )],
             enums: vec![],
         };
