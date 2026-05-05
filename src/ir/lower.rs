@@ -1501,7 +1501,11 @@ fn lower_expr(
         SemanticExprKind::HandleNew { .. } => { unsupported!("HandleNew") },
         SemanticExprKind::HandleVal { .. } => { unsupported!("HandleVal") },
         SemanticExprKind::HandleDrop { .. } => { unsupported!("HandleDrop") },
-        SemanticExprKind::Range { .. } => { unsupported!("Range") },
+        SemanticExprKind::Range { .. } => {
+            return Err(LoweringError::UnsupportedSemanticConstruct {
+                construct: "range expression used as a value — ranges are only supported in for-loop bounds, not as standalone expressions".to_string(),
+            });
+        },
         // Unary expression lowering strategy
         //
         // The IR has no dedicated unary-negate or unary-not instructions.  Both
