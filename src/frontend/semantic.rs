@@ -401,8 +401,13 @@ impl Analyzer {
                         let instance_ty = info.inferred.clone()
                             .or_else(|| info.declared.as_ref().map(|t| semantic_type_from_decl(t.clone(), &[])))
                             .unwrap_or(SemanticType::Unknown);
-                        let field_ty = if let SemanticType::Struct(struct_name) = &instance_ty {
-                            self.structs.get(struct_name)
+                        let struct_name = if let SemanticType::Struct(sn) = &instance_ty {
+                            sn.clone()
+                        } else {
+                            String::new()
+                        };
+                        let field_ty = if !struct_name.is_empty() {
+                            self.structs.get(&struct_name)
                                 .and_then(|fields| fields.iter().find(|(fname, _)| fname == field))
                                 .map(|(_, ftype)| semantic_type_from_decl(ftype.clone(), &self.current_type_params))
                                 .unwrap_or(SemanticType::Unknown)
@@ -423,6 +428,27 @@ impl Analyzer {
                             container: container.clone(),
                             field: field.clone(),
                             ty: field_ty,
+                            struct_name,
+                        }
+                    }
+                    Expr::Index(target_expr, index_expr, _) => {
+                        let sem_target = self.analyze_expr(target_expr)?;
+                        let elem_ty = match &sem_target.ty {
+                            SemanticType::Array(_, elem_ty) => *elem_ty.clone(),
+                            SemanticType::Unknown => SemanticType::Unknown,
+                            _ => return Err(sem_err!(*pos_eq, "index assignment target must be an array")),
+                        };
+                        if elem_ty != SemanticType::Unknown {
+                            if !types_compatible(&elem_ty, &semantic_expr.ty) {
+                                return Err(type_mismatch_error(&elem_ty, &semantic_expr.ty, *pos_eq));
+                            }
+                            semantic_expr = insert_cast_if_needed(semantic_expr, &elem_ty);
+                        }
+                        let sem_index = self.analyze_expr(index_expr)?;
+                        SemanticLValue::Index {
+                            target: Box::new(sem_target),
+                            index: Box::new(sem_index),
+                            elem_ty,
                         }
                     }
                     _ => {
@@ -789,15 +815,20 @@ Stmt::ExprStmt { expr, _pos } => Ok(SemanticStmt::ExprStmt {
                             .and_then(|info| info.inferred.clone()
                                 .or_else(|| info.declared.as_ref().map(|t| semantic_type_from_decl(t.clone(), &[]))))
                             .unwrap_or(SemanticType::Unknown);
-                        let field_ty = if let SemanticType::Struct(struct_name) = &instance_ty {
-                            self.structs.get(struct_name)
+                        let struct_name = if let SemanticType::Struct(sn) = &instance_ty {
+                            sn.clone()
+                        } else {
+                            String::new()
+                        };
+                        let field_ty = if !struct_name.is_empty() {
+                            self.structs.get(&struct_name)
                                 .and_then(|fields| fields.iter().find(|(fname, _)| fname == field))
                                 .map(|(_, ftype)| semantic_type_from_decl(ftype.clone(), &self.current_type_params))
                                 .unwrap_or(SemanticType::Unknown)
                         } else {
                             SemanticType::Unknown
                         };
-                        SemanticLValue::DotAccess { binding, container: container.clone(), field: field.clone(), ty: field_ty }
+                        SemanticLValue::DotAccess { binding, container: container.clone(), field: field.clone(), ty: field_ty, struct_name }
                     }
                 };
                 Ok(SemanticStmt::CompoundAssign {
@@ -1087,13 +1118,18 @@ Stmt::ExprStmt { expr, _pos } => Ok(SemanticStmt::ExprStmt {
                 let instance_ty = info.inferred.clone()
                     .or_else(|| info.declared.as_ref().map(|t| semantic_type_from_decl(t.clone(), &[])))
                     .unwrap_or(SemanticType::Unknown);
-                let field_ty = if let SemanticType::Struct(struct_name) = &instance_ty {
-                    self.structs.get(struct_name)
+                let resolved_struct_name = if let SemanticType::Struct(sn) = &instance_ty {
+                    sn.clone()
+                } else {
+                    String::new()
+                };
+                let field_ty = if resolved_struct_name.is_empty() {
+                    SemanticType::Unknown
+                } else {
+                    self.structs.get(&resolved_struct_name)
                         .and_then(|fields| fields.iter().find(|(fname, _)| fname == field))
                         .map(|(_, ftype)| semantic_type_from_decl(ftype.clone(), &self.current_type_params))
                         .unwrap_or(SemanticType::Unknown)
-                } else {
-                    SemanticType::Unknown
                 };
                 Ok(SemanticExpr {
                     ty: field_ty,
@@ -1101,6 +1137,7 @@ Stmt::ExprStmt { expr, _pos } => Ok(SemanticStmt::ExprStmt {
                         binding: Some(info.binding),
                         container: container.clone(),
                         field: field.clone(),
+                        struct_name: resolved_struct_name,
                     },
                 })
             }

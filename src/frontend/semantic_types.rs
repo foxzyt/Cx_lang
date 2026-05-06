@@ -70,6 +70,10 @@ pub enum SemanticExprKind {
         binding: Option<BindingId>,
         container: String,
         field: String,
+        /// Name of the struct type that owns this field.
+        /// Populated by the semantic analyser when the container has a known
+        /// `Struct(name)` type; empty string when the type is Unknown.
+        struct_name: String,
     },
     HandleNew {
         value: Box<SemanticExpr>,
@@ -172,6 +176,20 @@ pub enum SemanticLValue {
         container: String,
         field: String,
         ty: SemanticType,
+        /// Name of the struct type that owns this field.
+        /// Populated by the semantic analyser when the container has a known
+        /// `Struct(name)` type; empty string when the type is Unknown.
+        struct_name: String,
+    },
+    /// Array element write: `arr:[i] = value`.
+    ///
+    /// `target` is the analysed array expression (typically a VarRef);
+    /// `index` is the analysed index expression; `elem_ty` is the element
+    /// type derived from the array's declared type.
+    Index {
+        target: Box<SemanticExpr>,
+        index: Box<SemanticExpr>,
+        elem_ty: SemanticType,
     },
 }
 

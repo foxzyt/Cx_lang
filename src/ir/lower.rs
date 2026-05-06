@@ -11,8 +11,8 @@ use crate::frontend::semantic_types::{
 use crate::ir::builder::IrBuilder;
 use crate::ir::instr::{BinaryOp, CompareOp, IrInst, IrTerminator};
 use crate::ir::types::{
-    compute_struct_layout, BlockId, BlockParam, IrBlock, IrFunction, IrModule, IrParam, IrType,
-    StructLayout, ValueId,
+    compute_array_layout, compute_struct_layout, BlockId, BlockParam, IrBlock, IrFunction, IrModule,
+    IrParam, IrType, StructLayout, ValueId,
 };
 
 macro_rules! unsupported {
@@ -301,6 +301,11 @@ fn lower_program_inner(program: &SemanticProgram, trace: bool) -> Result<IrModul
                 }
                 module.functions.push(lower_semantic_function(function, &signature_table, &struct_table, trace)?);
             }
+            // Struct definitions are pre-processed into the struct_table before
+            // code lowering begins (see build_struct_table).  They carry no
+            // executable semantics and produce no IR, so skip them here rather
+            // than routing them into the synthetic-main statement sequence.
+            SemanticStmt::StructDef { .. } => {}
             other => top_level_stmts.push(other),
         }
     }
@@ -509,10 +514,27 @@ fn lower_stmt(
                         .insert(*binding, LoweredValue { value: dst, ty: target_ty });
                     Ok(Some(current))
                 }
-                SemanticLValue::DotAccess { .. } => {
-                    Err(LoweringError::UnsupportedSemanticConstruct {
-                        construct: "Assign::DotAccess".to_string(),
-                    })
+                SemanticLValue::DotAccess { binding, container, field, ty, struct_name } => {
+                    let lowered = lower_expr(expr, ctx, &mut current)?;
+                    let (field_ptr, field_ir_ty) = resolve_field_ptr(
+                        binding, container, field, struct_name, ty, ctx, &mut current,
+                    )?;
+                    ensure_type_match("struct field assign", field_ir_ty, lowered.ty)?;
+                    current.emit(IrInst::Store {
+                        ptr: field_ptr,
+                        value: lowered.value,
+                    })?;
+                    Ok(Some(current))
+                }
+                SemanticLValue::Index { target, index, .. } => {
+                    let (elem_ptr, elem_ir_ty) =
+                        resolve_array_element_ptr(&*target, &*index, ctx, &mut current)?;
+                    ensure_type_match("array element assign", elem_ir_ty, lowered.ty)?;
+                    current.emit(IrInst::Store {
+                        ptr: elem_ptr,
+                        value: lowered.value,
+                    })?;
+                    Ok(Some(current))
                 }
             }
         }
@@ -534,6 +556,18 @@ fn lower_stmt(
             Ok(Some(current))
         }
         SemanticStmt::ExprStmt { expr, .. } => {
+            // Void function calls cannot go through lower_expr because that function
+            // must return a LoweredValue, and void calls produce no value.
+            // Detect and lower void calls here before falling through to lower_expr.
+            if let SemanticExprKind::Call { callee, function: _, args } = &expr.kind {
+                let sig_info = ctx.signature_table.get(callee.as_str())
+                    .map(|s| (s.return_ty.clone(), s.param_types.clone()));
+                if let Some((None, param_types)) = sig_info {
+                    let callee = callee.clone();
+                    lower_void_call(&callee, args, &param_types, ctx, &mut current)?;
+                    return Ok(Some(current));
+                }
+            }
             let _ = lower_expr(expr, ctx, &mut current)?;
             Ok(Some(current))
         }
@@ -608,10 +642,86 @@ fn lower_stmt(
             current.bindings.insert(*binding, LoweredValue { value: bind_dst, ty: target_ty });
             Ok(Some(current))
         }
-        SemanticLValue::DotAccess { .. } => {
-            Err(LoweringError::UnsupportedSemanticConstruct {
-                construct: "CompoundAssign::DotAccess".to_string(),
-            })
+        SemanticLValue::DotAccess { binding, container, field, ty, struct_name } => {
+            let (field_ptr, field_ir_ty) = resolve_field_ptr(
+                binding, container, field, struct_name, ty, ctx, &mut current,
+            )?;
+            // Read the current field value.
+            let current_dst = ctx.fresh_value();
+            current.emit(IrInst::Load {
+                dst: current_dst,
+                ty: field_ir_ty.clone(),
+                ptr: field_ptr,
+            })?;
+            // Lower the operand.
+            let rhs = lower_expr(operand, ctx, &mut current)?;
+            // Compute the binary result.
+            let bin_op = match op {
+                Op::Plus => BinaryOp::Add,
+                Op::Minus => BinaryOp::Sub,
+                Op::Mul => BinaryOp::Mul,
+                Op::Div => BinaryOp::Div,
+                Op::Mod => BinaryOp::Rem,
+                _ => {
+                    return Err(LoweringError::UnsupportedSemanticConstruct {
+                        construct: format!("compound assign operator {:?}", op),
+                    });
+                }
+            };
+            let result_dst = ctx.fresh_value();
+            current.emit(IrInst::Binary {
+                dst: result_dst,
+                op: bin_op,
+                ty: field_ir_ty.clone(),
+                lhs: current_dst,
+                rhs: rhs.value,
+            })?;
+            // Write back to the field.
+            current.emit(IrInst::Store {
+                ptr: field_ptr,
+                value: result_dst,
+            })?;
+            Ok(Some(current))
+        }
+        SemanticLValue::Index { target, index, .. } => {
+            let (elem_ptr, elem_ir_ty) =
+                resolve_array_element_ptr(&*target, &*index, ctx, &mut current)?;
+            // Read the current element value.
+            let current_dst = ctx.fresh_value();
+            current.emit(IrInst::Load {
+                dst: current_dst,
+                ty: elem_ir_ty.clone(),
+                ptr: elem_ptr,
+            })?;
+            // Lower the operand.
+            let rhs = lower_expr(operand, ctx, &mut current)?;
+            // Compute the binary result.
+            let bin_op = match op {
+                Op::Plus => BinaryOp::Add,
+                Op::Minus => BinaryOp::Sub,
+                Op::Mul => BinaryOp::Mul,
+                Op::Div => BinaryOp::Div,
+                Op::Mod => BinaryOp::Rem,
+                _ => {
+                    return Err(LoweringError::UnsupportedSemanticConstruct {
+                        construct: format!("compound assign operator {:?}", op),
+                    });
+                }
+            };
+            let result_dst = ctx.fresh_value();
+            current.emit(IrInst::Binary {
+                dst: result_dst,
+                op: bin_op,
+                ty: elem_ir_ty.clone(),
+                lhs: current_dst,
+                rhs: rhs.value,
+            })?;
+            // Write back to the element.
+            current.emit(IrInst::Store {
+                ptr: elem_ptr,
+                value: result_dst,
+            })?;
+            Ok(Some(current))
         }
     }
 },
@@ -696,7 +806,9 @@ SemanticStmt::Block { .. } => { unsupported!("Block") },
             spec,
             loop_ctx,
         ),
-        SemanticStmt::StructDef { .. } => { unsupported!("StructDef") },
+        // Struct definitions are pre-processed into the struct_table before
+        // lowering begins; there is no IR to emit for the definition itself.
+        SemanticStmt::StructDef { .. } => Ok(Some(current)),
         SemanticStmt::ImplBlock { .. } => { unsupported!("ImplBlock") },
         SemanticStmt::ConstDecl { .. } => { unsupported!("ConstDecl") },
     }
@@ -1365,7 +1477,10 @@ fn lower_expr(
 
             let return_ty = return_ty.ok_or_else(|| {
                 LoweringError::UnsupportedSemanticConstruct {
-                    construct: "void function call — IrType::Void pending".to_string(),
+                    construct: format!(
+                        "void function '{}' used in value position — void calls are only valid as statements",
+                        callee
+                    ),
                 }
             })?;
 
@@ -1411,11 +1526,17 @@ fn lower_expr(
                 ty: return_ty,
             })
         },
-        SemanticExprKind::DotAccess { .. } => { unsupported!("DotAccess") },
+        SemanticExprKind::DotAccess { binding, container, field, struct_name } => {
+            lower_dot_access(binding, container, field, struct_name, &expr.ty, ctx, active)
+        }
         SemanticExprKind::HandleNew { .. } => { unsupported!("HandleNew") },
         SemanticExprKind::HandleVal { .. } => { unsupported!("HandleVal") },
         SemanticExprKind::HandleDrop { .. } => { unsupported!("HandleDrop") },
-        SemanticExprKind::Range { .. } => { unsupported!("Range") },
+        SemanticExprKind::Range { .. } => {
+            return Err(LoweringError::UnsupportedSemanticConstruct {
+                construct: "range expression used as a value — ranges are only supported in for-loop bounds, not as standalone expressions".to_string(),
+            });
+        },
         // Unary expression lowering strategy
         //
         // The IR has no dedicated unary-negate or unary-not instructions.  Both
@@ -1483,10 +1604,91 @@ fn lower_expr(
         }
     }
 },
-        SemanticExprKind::ArrayLit { .. } => { unsupported!("ArrayLit") },
-        SemanticExprKind::Index { .. } => { unsupported!("Index") },
-        SemanticExprKind::MethodCall { .. } => { unsupported!("MethodCall") },
-        SemanticExprKind::StructInstance { .. } => { unsupported!("StructInstance") },
+        SemanticExprKind::ArrayLit { elements } => {
+            lower_array_lit(elements, &expr.ty, ctx, active)
+        }
+        SemanticExprKind::Index { target, index, .. } => {
+            lower_index(target, index, &expr.ty, ctx, active)
+        }
+        SemanticExprKind::MethodCall { instance, method, .. } => {
+            Err(LoweringError::UnsupportedSemanticConstruct {
+                construct: format!("MethodCall '{}.{}'", instance, method),
+            })
+        }
+        // Struct literal lowering strategy
+        //
+        // A struct literal `S { f1: e1, f2: e2, ... }` is lowered to a sequence
+        // of memory operations that produce a stack-allocated struct value:
+        //
+        // 1. Alloca: reserve stack space for the whole struct using the layout
+        //    computed by build_struct_table (total_size, alignment).
+        //
+        // 2. For each field in canonical (definition) order:
+        //    a. Lower the field expression to a scalar IR value.
+        //    b. If the field's byte offset within the struct is non-zero, emit a
+        //       PtrOffset instruction to advance the base pointer by that many bytes.
+        //    c. Emit Store to write the field value at the (possibly offset) pointer.
+        //
+        // 3. Return the base Alloca pointer as IrType::Ptr — the binding that holds
+        //    a struct variable holds a pointer to its stack storage.
+        //
+        // Field ordering in the literal need not match definition order; we look up
+        // each canonical field name in the literal's field list by name.
+        SemanticExprKind::StructInstance { type_name, fields } => {
+            let layout_info = ctx.struct_table.get(type_name).cloned().ok_or_else(|| {
+                LoweringError::UnresolvedSemanticArtifact {
+                    artifact: format!("struct type '{}'", type_name),
+                }
+            })?;
+
+            if layout_info.layout.total_size == 0 {
+                return Err(LoweringError::UnsupportedSemanticConstruct {
+                    construct: "StructInstance with zero-size layout".to_string(),
+                });
+            }
+
+            let ptr = ctx.fresh_value();
+            active.emit(IrInst::Alloca {
+                dst: ptr,
+                size: layout_info.layout.total_size,
+                align: layout_info.layout.alignment,
+            })?;
+
+            for (field_idx, (canonical_name, _field_ty)) in layout_info.fields.iter().enumerate() {
+                let field_offset = layout_info.layout.field_offsets[field_idx];
+
+                let field_expr = fields
+                    .iter()
+                    .find(|(name, _)| name == canonical_name)
+                    .ok_or_else(|| LoweringError::InternalInvariantViolation {
+                        detail: format!(
+                            "struct '{}' field '{}' missing in literal",
+                            type_name, canonical_name
+                        ),
+                    })?;
+
+                let lowered_field = lower_expr(&field_expr.1, ctx, active)?;
+
+                let field_ptr = if field_offset == 0 {
+                    ptr
+                } else {
+                    let fp = ctx.fresh_value();
+                    active.emit(IrInst::PtrOffset {
+                        dst: fp,
+                        base: ptr,
+                        offset: field_offset,
+                    })?;
+                    fp
+                };
+
+                active.emit(IrInst::Store {
+                    ptr: field_ptr,
+                    value: lowered_field.value,
+                })?;
+            }
+
+            Ok(LoweredValue { value: ptr, ty: IrType::Ptr })
+        },
         SemanticExprKind::When { .. } => { unsupported!("WhenExpr") },
         SemanticExprKind::ResultOk { .. } => { unsupported!("ResultOk") },
         SemanticExprKind::ResultErr { .. } => { unsupported!("ResultErr") },
@@ -1625,6 +1827,455 @@ fn lower_binary(
     }
 }
 
+// Struct field access lowering strategy
+//
+// Both reads (DotAccess expressions) and writes (DotAccess l-values in Assign /
+// CompoundAssign) share the same pointer-resolution logic:
+//
+//   1. Resolve the container binding to its SSA value (a Ptr produced by a
+//      prior Alloca when the struct was created).
+//
+//   2. Look up the struct layout from the pre-built struct_table.  The struct
+//      type name is carried directly in `struct_name` (populated by the
+//      semantic analyser); no run-time type lookup is needed.
+//
+//   3. Compute the field's byte offset from the layout.  If the offset is
+//      greater than zero, emit IrInst::PtrOffset to advance the base pointer
+//      to the field's address.  If the offset is zero the base pointer itself
+//      already addresses the first field.
+//
+// `resolve_field_ptr` encapsulates steps 1–3 and returns the field pointer
+// ValueId together with the field's IR type.  Callers then emit either a
+// Load (for reads) or a Store (for writes).
+//
+// Field reads produce at most two instructions (PtrOffset + Load).
+// Field writes produce at most two instructions (PtrOffset + Store).
+// CompoundAssign field writes produce at most four (PtrOffset + Load + Binary + Store).
+
+/// Resolve the address of a struct field, emitting `PtrOffset` when needed.
+///
+/// Returns `(field_ptr, field_ir_ty)` where `field_ptr` is the ValueId of the
+/// pointer to the field and `field_ir_ty` is its IR type.  The caller is
+/// responsible for emitting the Load or Store that actually accesses the field.
+fn resolve_field_ptr(
+    binding: &Option<BindingId>,
+    container: &str,
+    field: &str,
+    struct_name: &str,
+    field_sem_ty: &SemanticType,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<(ValueId, IrType), LoweringError> {
+    // 1. Resolve the container binding to get the struct pointer.
+    let binding_id = binding.ok_or_else(|| LoweringError::InternalInvariantViolation {
+        detail: format!(
+            "field access on '{container}.{field}' has no binding; \
+             the semantic analyser must supply one for all lowerable field accesses"
+        ),
+    })?;
+
+    let base = active.bindings.get(&binding_id).cloned().ok_or_else(|| {
+        LoweringError::InternalInvariantViolation {
+            detail: format!(
+                "binding for '{container}' (id {}) not found in scope for field access '{container}.{field}'",
+                binding_id.0
+            ),
+        }
+    })?;
+
+    if base.ty != IrType::Ptr {
+        return Err(LoweringError::InternalInvariantViolation {
+            detail: format!(
+                "field access on '{container}': expected Ptr-typed binding, got {:?}",
+                base.ty
+            ),
+        });
+    }
+
+    // 2. Look up the struct layout.
+    if struct_name.is_empty() {
+        return Err(LoweringError::UnresolvedSemanticArtifact {
+            artifact: format!(
+                "struct type for '{container}' is unknown; \
+                 field access '{container}.{field}' cannot be lowered"
+            ),
+        });
+    }
+    let info = ctx.struct_table.get(struct_name).cloned().ok_or_else(|| {
+        LoweringError::UnresolvedSemanticArtifact {
+            artifact: format!("struct '{struct_name}' in field access '{container}.{field}'"),
+        }
+    })?;
+
+    // 3. Find the field index, offset, and IR type.
+    let field_idx = info
+        .fields
+        .iter()
+        .position(|(name, _)| name == field)
+        .ok_or_else(|| LoweringError::UnresolvedSemanticArtifact {
+            artifact: format!("field '{field}' on struct '{struct_name}'"),
+        })?;
+
+    let field_ir_ty = info.fields[field_idx].1.clone();
+    let field_offset = info.layout.field_offsets[field_idx];
+
+    // Verify that the semantic field type agrees with what the struct table says.
+    let expected_ir_ty = lower_type(field_sem_ty)?;
+    if expected_ir_ty != field_ir_ty {
+        return Err(LoweringError::InternalInvariantViolation {
+            detail: format!(
+                "field access '{container}.{field}': IR type mismatch — \
+                 semantic layer says {expected_ir_ty:?}, struct layout says {field_ir_ty:?}"
+            ),
+        });
+    }
+
+    // 4. Advance the pointer to the field's address (skip if offset is 0).
+    let field_ptr = if field_offset > 0 {
+        let fp = ctx.fresh_value();
+        active.emit(IrInst::PtrOffset {
+            dst: fp,
+            base: base.value,
+            offset: field_offset,
+        })?;
+        fp
+    } else {
+        base.value
+    };
+
+    Ok((field_ptr, field_ir_ty))
+}
+
+// Array element write lowering strategy
+//
+// An array element write `arr:[i] = value` where `arr: Array(N, ElemTy)` is
+// lowered to:
+//
+//   1. Lower `arr` to a base Ptr (the Alloca produced when the array was
+//      created).
+//
+//   2. Lower `i` to an integer SSA value; cast to I64 if needed.
+//
+//   3. Emit ConstInt(stride) then Binary(Mul, I64, i_i64, stride) to compute
+//      the byte offset at runtime.
+//
+//   4. Emit PtrAdd(base, byte_offset) to advance the pointer.
+//
+//   5. Caller emits Store(elem_ptr, value) to write the element.
+//
+// `resolve_array_element_ptr` encapsulates steps 1–4 and returns the element
+// pointer ValueId together with the element's IR type.  The caller is
+// responsible for emitting the Store (for simple writes) or the Load + Binary
+// + Store sequence (for compound-assign writes).
+
+/// Resolve the address of an array element, emitting the index arithmetic.
+///
+/// Returns `(elem_ptr, elem_ir_ty)` where `elem_ptr` is the ValueId of the
+/// pointer to the element and `elem_ir_ty` is its IR type.  The caller is
+/// responsible for emitting Load/Store as appropriate.
+fn resolve_array_element_ptr(
+    target: &SemanticExpr,
+    index: &SemanticExpr,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<(ValueId, IrType), LoweringError> {
+    // 1. Derive element IR type from the array target's declared type.
+    let (count, elem_sem_ty) = match &target.ty {
+        SemanticType::Array(count, elem_ty) => (*count, elem_ty.as_ref()),
+        _ => {
+            return Err(LoweringError::InternalInvariantViolation {
+                detail: format!(
+                    "array element write: target has non-Array type: {:?}",
+                    target.ty
+                ),
+            })
+        }
+    };
+
+    let elem_ir_ty = lower_type(elem_sem_ty)?;
+    let layout = compute_array_layout(&elem_ir_ty, count);
+
+    // 2. Lower the array target to a base pointer.
+    let base = lower_expr(target, ctx, active)?;
+    if base.ty != IrType::Ptr {
+        return Err(LoweringError::InternalInvariantViolation {
+            detail: format!(
+                "array element write: target must lower to Ptr, got {:?}",
+                base.ty
+            ),
+        });
+    }
+
+    // 3. Lower the index expression; cast to I64 if it isn't already.
+    let idx = lower_expr(index, ctx, active)?;
+    let idx_i64 = if idx.ty == IrType::I64 {
+        idx.value
+    } else {
+        let cast_dst = ctx.fresh_value();
+        active.emit(IrInst::Cast {
+            dst: cast_dst,
+            from: idx.ty.clone(),
+            to: IrType::I64,
+            value: idx.value,
+        })?;
+        cast_dst
+    };
+
+    // 4. Compute byte_offset = idx_i64 * stride.
+    let stride_val = ctx.fresh_value();
+    active.emit(IrInst::ConstInt {
+        dst: stride_val,
+        ty: IrType::I64,
+        value: layout.stride as i128,
+    })?;
+    let byte_offset = ctx.fresh_value();
+    active.emit(IrInst::Binary {
+        dst: byte_offset,
+        op: BinaryOp::Mul,
+        ty: IrType::I64,
+        lhs: idx_i64,
+        rhs: stride_val,
+    })?;
+
+    // 5. elem_ptr = base + byte_offset  (runtime pointer arithmetic).
+    let elem_ptr = ctx.fresh_value();
+    active.emit(IrInst::PtrAdd {
+        dst: elem_ptr,
+        base: base.value,
+        offset: byte_offset,
+    })?;
+
+    Ok((elem_ptr, elem_ir_ty))
+}
+
+fn lower_dot_access(
+    binding: &Option<BindingId>,
+    container: &str,
+    field: &str,
+    struct_name: &str,
+    field_sem_ty: &SemanticType,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<LoweredValue, LoweringError> {
+    let (field_ptr, field_ir_ty) =
+        resolve_field_ptr(binding, container, field, struct_name, field_sem_ty, ctx, active)?;
+
+    let dst = ctx.fresh_value();
+    active.emit(IrInst::Load {
+        dst,
+        ty: field_ir_ty.clone(),
+        ptr: field_ptr,
+    })?;
+
+    Ok(LoweredValue {
+        value: dst,
+        ty: field_ir_ty,
+    })
+}
+
+// Array literal lowering strategy
+//
+// An array literal `[e0, e1, e2, ...]` of type `Array(N, ElemTy)` is lowered
+// to a stack-allocated block in the same style as struct literals:
+//
+//   1. Alloca: reserve N * stride bytes at element alignment.
+//
+//   2. For each element at position i (in source order, which is also storage
+//      order):
+//      a. Lower the element expression to a scalar IR value.
+//      b. Compute the byte offset: i * stride.
+//      c. If offset > 0, emit PtrOffset to advance the base pointer.
+//      d. Emit Store to write the element value.
+//
+//   3. Return the base Alloca pointer as IrType::Ptr.
+//
+// All offsets are compile-time constants (element index is literal position),
+// so PtrOffset suffices here — PtrAdd is only needed for runtime index access.
+fn lower_array_lit(
+    elements: &[SemanticExpr],
+    array_ty: &SemanticType,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<LoweredValue, LoweringError> {
+    let (count, elem_sem_ty) = match array_ty {
+        SemanticType::Array(count, elem_ty) => (*count, elem_ty.as_ref()),
+        _ => {
+            return Err(LoweringError::InternalInvariantViolation {
+                detail: format!("ArrayLit expression has non-Array type: {:?}", array_ty),
+            })
+        }
+    };
+
+    if count == 0 {
+        return Err(LoweringError::UnsupportedSemanticConstruct {
+            construct: "ArrayLit with zero-length array".to_string(),
+        });
+    }
+
+    if elements.len() != count {
+        return Err(LoweringError::InternalInvariantViolation {
+            detail: format!(
+                "ArrayLit: declared length {} but {} elements provided",
+                count,
+                elements.len()
+            ),
+        });
+    }
+
+    let elem_ir_ty = lower_type(elem_sem_ty)?;
+    let layout = compute_array_layout(&elem_ir_ty, count);
+
+    // 1. Alloca: reserve stack space for the entire array.
+    let ptr = ctx.fresh_value();
+    active.emit(IrInst::Alloca {
+        dst: ptr,
+        size: layout.total_size,
+        align: layout.alignment,
+    })?;
+
+    // 2. Store each element at its stride-aligned byte offset.
+    for (i, elem_expr) in elements.iter().enumerate() {
+        let lowered_elem = lower_expr(elem_expr, ctx, active)?;
+        let byte_offset = i * layout.stride;
+
+        let elem_ptr = if byte_offset == 0 {
+            ptr
+        } else {
+            let fp = ctx.fresh_value();
+            active.emit(IrInst::PtrOffset {
+                dst: fp,
+                base: ptr,
+                offset: byte_offset,
+            })?;
+            fp
+        };
+
+        active.emit(IrInst::Store {
+            ptr: elem_ptr,
+            value: lowered_elem.value,
+        })?;
+    }
+
+    Ok(LoweredValue {
+        value: ptr,
+        ty: IrType::Ptr,
+    })
+}
+
+// Array element read lowering strategy
+//
+// An index expression `arr[i]` where `arr: Array(N, ElemTy)` is lowered to:
+//
+//   1. Lower `arr` to a base Ptr (the Alloca produced when the array was created).
+//
+//   2. Lower `i` to an integer SSA value; cast to I64 if needed.
+//
+//   3. Emit ConstInt(stride) then Binary(Mul, I64, i_i64, stride) to compute
+//      the byte offset at runtime.
+//
+//   4. Emit PtrAdd(base, byte_offset) to advance the pointer.
+//
+//   5. Emit Load(ElemIrTy, elem_ptr) to read the element value.
+//
+// PtrAdd (not PtrOffset) is used here because the index is a runtime value.
+// The runtime-constant stride is folded into the multiply operand; a later
+// constant-folding pass may eliminate the ConstInt + Binary pair when the
+// index expression is itself a literal.
+fn lower_index(
+    target: &SemanticExpr,
+    index: &SemanticExpr,
+    elem_sem_ty: &SemanticType,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<LoweredValue, LoweringError> {
+    // Derive element IR type and layout from the array target's type.
+    let (count, declared_elem_sem_ty) = match &target.ty {
+        SemanticType::Array(count, elem_ty) => (*count, elem_ty.as_ref()),
+        _ => {
+            return Err(LoweringError::InternalInvariantViolation {
+                detail: format!(
+                    "Index target has non-Array type: {:?}",
+                    target.ty
+                ),
+            })
+        }
+    };
+
+    let elem_ir_ty = lower_type(declared_elem_sem_ty)?;
+    let layout = compute_array_layout(&elem_ir_ty, count);
+
+    // Verify the outer expression type is consistent with the element type.
+    let outer_ir_ty = lower_type(elem_sem_ty)?;
+    if outer_ir_ty != elem_ir_ty {
+        return Err(LoweringError::InternalInvariantViolation {
+            detail: format!(
+                "Index expression type {:?} does not match array element type {:?}",
+                outer_ir_ty, elem_ir_ty
+            ),
+        });
+    }
+
+    // 1. Lower the array target to get the base pointer.
+    let base = lower_expr(target, ctx, active)?;
+    if base.ty != IrType::Ptr {
+        return Err(LoweringError::InternalInvariantViolation {
+            detail: format!("Index target must lower to Ptr, got {:?}", base.ty),
+        });
+    }
+
+    // 2. Lower the index expression; cast to I64 if it isn't already.
+    let idx = lower_expr(index, ctx, active)?;
+    let idx_i64 = if idx.ty == IrType::I64 {
+        idx.value
+    } else {
+        let cast_dst = ctx.fresh_value();
+        active.emit(IrInst::Cast {
+            dst: cast_dst,
+            from: idx.ty.clone(),
+            to: IrType::I64,
+            value: idx.value,
+        })?;
+        cast_dst
+    };
+
+    // 3. Compute byte_offset = idx_i64 * stride.
+    let stride_val = ctx.fresh_value();
+    active.emit(IrInst::ConstInt {
+        dst: stride_val,
+        ty: IrType::I64,
+        value: layout.stride as i128,
+    })?;
+    let byte_offset = ctx.fresh_value();
+    active.emit(IrInst::Binary {
+        dst: byte_offset,
+        op: BinaryOp::Mul,
+        ty: IrType::I64,
+        lhs: idx_i64,
+        rhs: stride_val,
+    })?;
+
+    // 4. elem_ptr = base + byte_offset  (runtime pointer arithmetic).
+    let elem_ptr = ctx.fresh_value();
+    active.emit(IrInst::PtrAdd {
+        dst: elem_ptr,
+        base: base.value,
+        offset: byte_offset,
+    })?;
+
+    // 5. Load the element value.
+    let dst = ctx.fresh_value();
+    active.emit(IrInst::Load {
+        dst,
+        ty: elem_ir_ty.clone(),
+        ptr: elem_ptr,
+    })?;
+
+    Ok(LoweredValue {
+        value: dst,
+        ty: elem_ir_ty,
+    })
+}
+
 fn lower_type(ty: &SemanticType) -> Result<IrType, LoweringError> {
     match ty {
         SemanticType::I8 => Ok(IrType::I8),
@@ -1644,7 +2295,7 @@ fn lower_type(ty: &SemanticType) -> Result<IrType, LoweringError> {
         SemanticType::Enum(_) => { unsupported_type!("Enum") },
         SemanticType::TypeParam(_) => { unsupported_type!("TypeParam") },
         SemanticType::Struct(_) => Ok(IrType::Ptr),
-        SemanticType::Array(_, _) => { unsupported_type!("Array") },
+        SemanticType::Array(_, _) => Ok(IrType::Ptr),
         SemanticType::Result(_) => { unsupported_type!("Result") },
         SemanticType::Void => { unsupported_type!("Void") },
     }
@@ -1660,6 +2311,58 @@ fn ensure_type_match(context: &str, expected: IrType, got: IrType) -> Result<(),
             ),
         })
     }
+}
+
+/// Lower a void function call as a standalone statement.
+///
+/// Void calls cannot go through `lower_expr` because that function must return
+/// a `LoweredValue` and void calls produce no value.  This helper lowers the
+/// arguments, performs the usual arity and type checks, and emits
+/// `IrInst::Call { dst: None, return_ty: None }` directly into `active`.
+fn lower_void_call(
+    callee: &str,
+    args: &[SemanticCallArg],
+    param_types: &[IrType],
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<(), LoweringError> {
+    if args.len() != param_types.len() {
+        return Err(LoweringError::InternalInvariantViolation {
+            detail: format!(
+                "call to '{}': expected {} arguments, got {}",
+                callee,
+                param_types.len(),
+                args.len()
+            ),
+        });
+    }
+
+    let mut lowered_args = Vec::new();
+    for (i, arg) in args.iter().enumerate() {
+        match arg {
+            SemanticCallArg::Expr(expr) => {
+                let lowered = lower_expr(expr, ctx, active)?;
+                ensure_type_match(
+                    &format!("argument {} of call to '{}'", i, callee),
+                    param_types[i].clone(),
+                    lowered.ty,
+                )?;
+                lowered_args.push(lowered.value);
+            }
+            _ => {
+                return Err(LoweringError::UnsupportedSemanticConstruct {
+                    construct: format!("non-Expr call argument in call to '{}'", callee),
+                });
+            }
+        }
+    }
+
+    active.emit(IrInst::Call {
+        dst: None,
+        callee: callee.to_string(),
+        args: lowered_args,
+        return_ty: None,
+    })
 }
 
 #[cfg(test)]
@@ -2532,19 +3235,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_void_call() {
+    fn lowers_void_call_in_expr_stmt() {
+        // A void function called as a statement must produce
+        // IrInst::Call { dst: None, return_ty: None } and pass validation.
         let program = SemanticProgram {
             stmts: vec![
                 semantic_function(
                     "do_nothing",
                     vec![],
-                    None,
+                    None, // void return
                     vec![],
                     None,
                 ),
                 SemanticStmt::ExprStmt {
                     expr: SemanticExpr {
-                        ty: SemanticType::I64,
+                        ty: SemanticType::Void,
                         kind: SemanticExprKind::Call {
                             callee: "do_nothing".to_string(),
                             function: FunctionId(0),
@@ -2557,12 +3262,86 @@ mod tests {
             enums: vec![],
         };
 
-        assert_eq!(
-            lower_program(&program).expect_err("lowering should fail"),
-            LoweringError::UnsupportedSemanticConstruct {
-                construct: "void function call — IrType::Void pending".to_string(),
+        let module = lower_and_validate(&program);
+        let main_fn = module.functions.iter().find(|f| f.name == "main").unwrap();
+        let call_insts: Vec<_> = main_fn
+            .blocks
+            .iter()
+            .flat_map(|b| b.insts.iter())
+            .filter(|inst| matches!(inst, IrInst::Call { .. }))
+            .collect();
+        assert_eq!(call_insts.len(), 1);
+        match &call_insts[0] {
+            IrInst::Call { dst, callee, args, return_ty } => {
+                assert!(dst.is_none(), "void call must have no destination");
+                assert_eq!(callee, "do_nothing");
+                assert!(args.is_empty());
+                assert!(return_ty.is_none(), "void call must have no return type");
             }
-        );
+            _ => panic!("expected Call instruction"),
+        }
+    }
+
+    #[test]
+    fn lowers_void_call_with_args() {
+        // A void function that accepts arguments: args must be lowered and
+        // matched against the parameter types, then emitted with dst: None.
+        let binding = BindingId(1);
+        let program = SemanticProgram {
+            stmts: vec![
+                semantic_function(
+                    "sink",
+                    vec![typed_param(BindingId(0), "x", SemanticType::I64)],
+                    None, // void return
+                    vec![],
+                    None,
+                ),
+                // x: t64 = 5
+                SemanticStmt::TypedAssign {
+                    binding,
+                    name: "x".to_string(),
+                    ty: SemanticType::I64,
+                    expr: int_expr(5, SemanticType::I64),
+                    pos_type: 0,
+                },
+                // sink(x)
+                SemanticStmt::ExprStmt {
+                    expr: SemanticExpr {
+                        ty: SemanticType::Void,
+                        kind: SemanticExprKind::Call {
+                            callee: "sink".to_string(),
+                            function: FunctionId(0),
+                            args: vec![SemanticCallArg::Expr(binding_ref(
+                                binding,
+                                "x",
+                                SemanticType::I64,
+                            ))],
+                        },
+                    },
+                    pos: 0,
+                },
+            ],
+            enums: vec![],
+        };
+
+        let module = lower_and_validate(&program);
+        let main_fn = module.functions.iter().find(|f| f.name == "main").unwrap();
+        let call_insts: Vec<_> = main_fn
+            .blocks
+            .iter()
+            .flat_map(|b| b.insts.iter())
+            .filter(|inst| matches!(inst, IrInst::Call { .. }))
+            .collect();
+        assert_eq!(call_insts.len(), 1);
+        match &call_insts[0] {
+            IrInst::Call { dst, callee, args, return_ty } => {
+                assert!(dst.is_none(), "void call must have no destination");
+                assert_eq!(callee, "sink");
+                assert_eq!(args.len(), 1);
+                assert!(return_ty.is_none(), "void call must have no return type");
+            }
+            _ => panic!("expected Call instruction"),
+        }
     }
 
     #[test]
@@ -3767,7 +4546,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_compound_assign_dot_access() {
+    fn rejects_compound_assign_dot_access_with_no_binding() {
+        // binding: None means the semantic analyser failed to resolve the container —
+        // lowering must reject this even though DotAccess is now otherwise supported.
         let program = SemanticProgram {
             stmts: vec![SemanticStmt::CompoundAssign {
                 target: SemanticLValue::DotAccess {
@@ -3775,6 +4556,7 @@ mod tests {
                     container: "obj".to_string(),
                     field: "x".to_string(),
                     ty: SemanticType::I64,
+                    struct_name: "Point".to_string(),
                 },
                 op: Op::Plus,
                 operand: int_expr(1, SemanticType::I64),
@@ -3839,6 +4621,658 @@ mod tests {
             LoweringError::UnresolvedSemanticArtifact {
                 artifact: "compound assign binding BindingId(98)".to_string()
             }
+        );
+    }
+
+    // ── struct field read tests ───────────────────────────────────────────────
+
+    fn point_struct_def() -> SemanticStmt {
+        SemanticStmt::StructDef {
+            name: "Point".to_string(),
+            type_params: vec![],
+            fields: vec![
+                ("x".to_string(), SemanticType::I64),
+                ("y".to_string(), SemanticType::I64),
+            ],
+            pos: 0,
+        }
+    }
+
+    fn dot_access_expr(
+        binding: BindingId,
+        container: &str,
+        field: &str,
+        struct_name: &str,
+        field_ty: SemanticType,
+    ) -> SemanticExpr {
+        SemanticExpr {
+            ty: field_ty,
+            kind: SemanticExprKind::DotAccess {
+                binding: Some(binding),
+                container: container.to_string(),
+                field: field.to_string(),
+                struct_name: struct_name.to_string(),
+            },
+        }
+    }
+
+    // Reading the first field (`x` at offset 0) should emit a single Load —
+    // no PtrOffset is needed because the base pointer already addresses the field.
+    #[test]
+    fn lowers_dot_access_first_field_emits_load_only() {
+        // fn read_x(p: Point) -> i64 { p.x }
+        let program = SemanticProgram {
+            stmts: vec![
+                point_struct_def(),
+                semantic_function(
+                    "read_x",
+                    vec![typed_param(
+                        BindingId(0),
+                        "p",
+                        SemanticType::Struct("Point".to_string()),
+                    )],
+                    Some(SemanticType::I64),
+                    vec![],
+                    Some(dot_access_expr(
+                        BindingId(0),
+                        "p",
+                        "x",
+                        "Point",
+                        SemanticType::I64,
+                    )),
+                ),
+            ],
+            enums: vec![],
+        };
+
+        let module = lower_and_validate(&program);
+        let func = module.functions.iter().find(|f| f.name == "read_x").unwrap();
+        let insts: Vec<&IrInst> = func.blocks.iter().flat_map(|b| b.insts.iter()).collect();
+
+        // Must have a Load for i64
+        let has_load = insts.iter().any(|i| matches!(i, IrInst::Load { ty: IrType::I64, .. }));
+        assert!(has_load, "expected Load i64 for first-field DotAccess");
+
+        // Must NOT have a PtrOffset — first field is at offset 0
+        let has_ptr_offset = insts.iter().any(|i| matches!(i, IrInst::PtrOffset { .. }));
+        assert!(!has_ptr_offset, "unexpected PtrOffset for first field (offset 0)");
+    }
+
+    // Reading the second field (`y` at offset 8) must emit PtrOffset(8) then Load.
+    // Point { x: i64, y: i64 } — y is at byte offset 8 after alignment padding.
+    #[test]
+    fn lowers_dot_access_second_field_emits_ptr_offset_then_load() {
+        // fn read_y(p: Point) -> i64 { p.y }
+        let program = SemanticProgram {
+            stmts: vec![
+                point_struct_def(),
+                semantic_function(
+                    "read_y",
+                    vec![typed_param(
+                        BindingId(0),
+                        "p",
+                        SemanticType::Struct("Point".to_string()),
+                    )],
+                    Some(SemanticType::I64),
+                    vec![],
+                    Some(dot_access_expr(
+                        BindingId(0),
+                        "p",
+                        "y",
+                        "Point",
+                        SemanticType::I64,
+                    )),
+                ),
+            ],
+            enums: vec![],
+        };
+
+        let module = lower_and_validate(&program);
+        let func = module.functions.iter().find(|f| f.name == "read_y").unwrap();
+        let insts: Vec<&IrInst> = func.blocks.iter().flat_map(|b| b.insts.iter()).collect();
+
+        // Must have PtrOffset with offset 8
+        let has_ptr_offset = insts
+            .iter()
+            .any(|i| matches!(i, IrInst::PtrOffset { offset: 8, .. }));
+        assert!(
+            has_ptr_offset,
+            "expected PtrOffset(8) for second field of Point"
+        );
+
+        // Must have a Load for i64
+        let has_load = insts.iter().any(|i| matches!(i, IrInst::Load { ty: IrType::I64, .. }));
+        assert!(has_load, "expected Load i64 after PtrOffset for second field");
+    }
+
+    // Reading a f64 field verifies correct IR type propagation.
+    #[test]
+    fn lowers_dot_access_f64_field_produces_f64_load() {
+        // struct Vec2 { dx: f64, dy: f64 }
+        // fn get_dx(v: Vec2) -> f64 { v.dx }
+        let program = SemanticProgram {
+            stmts: vec![
+                SemanticStmt::StructDef {
+                    name: "Vec2".to_string(),
+                    type_params: vec![],
+                    fields: vec![
+                        ("dx".to_string(), SemanticType::F64),
+                        ("dy".to_string(), SemanticType::F64),
+                    ],
+                    pos: 0,
+                },
+                semantic_function(
+                    "get_dx",
+                    vec![typed_param(
+                        BindingId(0),
+                        "v",
+                        SemanticType::Struct("Vec2".to_string()),
+                    )],
+                    Some(SemanticType::F64),
+                    vec![],
+                    Some(dot_access_expr(
+                        BindingId(0),
+                        "v",
+                        "dx",
+                        "Vec2",
+                        SemanticType::F64,
+                    )),
+                ),
+            ],
+            enums: vec![],
+        };
+
+        let module = lower_and_validate(&program);
+        let func = module.functions.iter().find(|f| f.name == "get_dx").unwrap();
+        let has_f64_load = func
+            .blocks
+            .iter()
+            .flat_map(|b| b.insts.iter())
+            .any(|i| matches!(i, IrInst::Load { ty: IrType::F64, .. }));
+        assert!(has_f64_load, "expected Load f64 for f64 DotAccess");
+    }
+
+    // Reject DotAccess when the binding is missing (None) — lowering cannot
+    // resolve the base pointer without a BindingId.
+    #[test]
+    fn rejects_dot_access_with_no_binding() {
+        let program = SemanticProgram {
+            stmts: vec![
+                point_struct_def(),
+                SemanticStmt::ExprStmt {
+                    expr: SemanticExpr {
+                        ty: SemanticType::I64,
+                        kind: SemanticExprKind::DotAccess {
+                            binding: None,
+                            container: "p".to_string(),
+                            field: "x".to_string(),
+                            struct_name: "Point".to_string(),
+                        },
+                    },
+                    pos: 0,
+                },
+            ],
+            enums: vec![],
+        };
+        assert!(lower_program(&program).is_err());
+    }
+
+    // Reject DotAccess when struct_name is empty (unknown container type).
+    #[test]
+    fn rejects_dot_access_with_unknown_struct_name() {
+        let program = SemanticProgram {
+            stmts: vec![SemanticStmt::ExprStmt {
+                expr: SemanticExpr {
+                    ty: SemanticType::I64,
+                    kind: SemanticExprKind::DotAccess {
+                        binding: Some(BindingId(0)),
+                        container: "x".to_string(),
+                        field: "val".to_string(),
+                        struct_name: String::new(),
+                    },
+                },
+                pos: 0,
+            }],
+            enums: vec![],
+        };
+        assert!(lower_program(&program).is_err());
+    }
+
+    // Reject DotAccess when the named struct does not exist in the program.
+    #[test]
+    fn rejects_dot_access_with_missing_struct_def() {
+        let program = SemanticProgram {
+            stmts: vec![SemanticStmt::ExprStmt {
+                expr: SemanticExpr {
+                    ty: SemanticType::I64,
+                    kind: SemanticExprKind::DotAccess {
+                        binding: Some(BindingId(0)),
+                        container: "p".to_string(),
+                        field: "x".to_string(),
+                        struct_name: "Ghost".to_string(),
+                    },
+                },
+                pos: 0,
+            }],
+            enums: vec![],
+        };
+        assert!(lower_program(&program).is_err());
+    }
+
+    // ── array literal and index lowering tests ────────────────────────────────
+
+    // Helper: build an ArrayLit SemanticExpr with N integer elements.
+    fn array_lit_i64(elements: Vec<i128>) -> SemanticExpr {
+        let count = elements.len();
+        SemanticExpr {
+            ty: SemanticType::Array(count, Box::new(SemanticType::I64)),
+            kind: SemanticExprKind::ArrayLit {
+                elements: elements
+                    .into_iter()
+                    .map(|v| int_expr(v, SemanticType::I64))
+                    .collect(),
+            },
+        }
+    }
+
+    // Helper: build an Index SemanticExpr.
+    fn index_expr(
+        target: SemanticExpr,
+        index: SemanticExpr,
+        elem_ty: SemanticType,
+    ) -> SemanticExpr {
+        SemanticExpr {
+            ty: elem_ty,
+            kind: SemanticExprKind::Index {
+                target: Box::new(target),
+                index: Box::new(index),
+                pos: 0,
+            },
+        }
+    }
+
+    // ArrayLit lowering: a three-element i64 array must emit exactly one Alloca
+    // (for the whole array), two PtrOffset instructions (elements 1 and 2 —
+    // element 0 is at offset 0 so no PtrOffset), and three Stores.
+    #[test]
+    fn lowers_array_lit_emits_alloca_ptr_offset_store() {
+        let arr = array_lit_i64(vec![10, 20, 30]);
+        let program = SemanticProgram {
+            stmts: vec![typed_assign(
+                BindingId(0),
+                "arr",
+                SemanticType::Array(3, Box::new(SemanticType::I64)),
+                arr,
+            )],
+            enums: vec![],
+        };
+
+        let module = lower_and_validate(&program);
+        let insts: Vec<&IrInst> = module.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|b| b.insts.iter())
+            .collect();
+
+        // One Alloca for the array storage (3 * 8 = 24 bytes, align 8).
+        let alloca_count = insts
+            .iter()
+            .filter(|i| matches!(i, IrInst::Alloca { size: 24, align: 8, .. }))
+            .count();
+        assert_eq!(alloca_count, 1, "expected exactly one Alloca(24, 8)");
+
+        // Three Store instructions — one per element.
+        let store_count = insts.iter().filter(|i| matches!(i, IrInst::Store { .. })).count();
+        assert_eq!(store_count, 3, "expected three Store instructions");
+
+        // PtrOffset for elements at non-zero offsets: offsets 8 and 16.
+        let has_ptr_offset_8 = insts
+            .iter()
+            .any(|i| matches!(i, IrInst::PtrOffset { offset: 8, .. }));
+        let has_ptr_offset_16 = insts
+            .iter()
+            .any(|i| matches!(i, IrInst::PtrOffset { offset: 16, .. }));
+        assert!(has_ptr_offset_8, "expected PtrOffset(8) for second element");
+        assert!(has_ptr_offset_16, "expected PtrOffset(16) for third element");
+
+        // No PtrOffset for element 0 (offset 0).
+        let has_ptr_offset_0 = insts
+            .iter()
+            .any(|i| matches!(i, IrInst::PtrOffset { offset: 0, .. }));
+        assert!(!has_ptr_offset_0, "unexpected PtrOffset(0) for first element");
+    }
+
+    // lower_type must map SemanticType::Array(_) to IrType::Ptr.
+    #[test]
+    fn lower_type_array_maps_to_ptr() {
+        let result = lower_type(&SemanticType::Array(4, Box::new(SemanticType::I64)));
+        assert_eq!(result, Ok(IrType::Ptr));
+    }
+
+    // Index lowering on an i64 array with an i64 literal index must emit:
+    // ConstInt (stride), Binary (Mul for byte_offset), PtrAdd, Load.
+    #[test]
+    fn lowers_index_emits_ptr_add_and_load() {
+        // fn read_elem(arr: [3: i64]) -> i64 { arr[1] }
+        let arr_binding = BindingId(0);
+        let program = SemanticProgram {
+            stmts: vec![semantic_function(
+                "read_elem",
+                vec![typed_param(
+                    arr_binding,
+                    "arr",
+                    SemanticType::Array(3, Box::new(SemanticType::I64)),
+                )],
+                Some(SemanticType::I64),
+                vec![],
+                Some(index_expr(
+                    binding_ref(
+                        arr_binding,
+                        "arr",
+                        SemanticType::Array(3, Box::new(SemanticType::I64)),
+                    ),
+                    int_expr(1, SemanticType::I64),
+                    SemanticType::I64,
+                )),
+            )],
+            enums: vec![],
+        };
+
+        let module = lower_and_validate(&program);
+        let func = module.functions.iter().find(|f| f.name == "read_elem").unwrap();
+        let insts: Vec<&IrInst> = func.blocks.iter().flat_map(|b| b.insts.iter()).collect();
+
+        // Must have a PtrAdd (runtime pointer arithmetic for the index).
+        let has_ptr_add = insts.iter().any(|i| matches!(i, IrInst::PtrAdd { .. }));
+        assert!(has_ptr_add, "expected PtrAdd for indexed element access");
+
+        // Must have a Load for i64 (reading the element).
+        let has_load = insts.iter().any(|i| matches!(i, IrInst::Load { ty: IrType::I64, .. }));
+        assert!(has_load, "expected Load i64 for indexed element");
+
+        // Must have a Binary Mul for byte_offset computation.
+        let has_mul = insts
+            .iter()
+            .any(|i| matches!(i, IrInst::Binary { op: BinaryOp::Mul, ty: IrType::I64, .. }));
+        assert!(has_mul, "expected Binary(Mul, I64) for byte offset computation");
+
+        // Must NOT have a PtrOffset (Index uses PtrAdd, not the static variant).
+        let has_ptr_offset = insts.iter().any(|i| matches!(i, IrInst::PtrOffset { .. }));
+        assert!(!has_ptr_offset, "unexpected PtrOffset in Index lowering");
+    }
+
+    // Index lowering on a single-element array (stride = element size, index 0)
+    // must still emit PtrAdd — stride computation is always emitted.
+    #[test]
+    fn lowers_index_zero_on_single_element_array() {
+        let arr_binding = BindingId(0);
+        let program = SemanticProgram {
+            stmts: vec![semantic_function(
+                "read_only",
+                vec![typed_param(
+                    arr_binding,
+                    "arr",
+                    SemanticType::Array(1, Box::new(SemanticType::I32)),
+                )],
+                Some(SemanticType::I32),
+                vec![],
+                Some(index_expr(
+                    binding_ref(
+                        arr_binding,
+                        "arr",
+                        SemanticType::Array(1, Box::new(SemanticType::I32)),
+                    ),
+                    int_expr(0, SemanticType::I64),
+                    SemanticType::I32,
+                )),
+            )],
+            enums: vec![],
+        };
+
+        let module = lower_and_validate(&program);
+        let func = module.functions.iter().find(|f| f.name == "read_only").unwrap();
+        let insts: Vec<&IrInst> = func.blocks.iter().flat_map(|b| b.insts.iter()).collect();
+
+        assert!(
+            insts.iter().any(|i| matches!(i, IrInst::PtrAdd { .. })),
+            "expected PtrAdd even for index 0"
+        );
+        assert!(
+            insts.iter().any(|i| matches!(i, IrInst::Load { ty: IrType::I32, .. })),
+            "expected Load i32 for i32 array element"
+        );
+    }
+
+    // ArrayLit rejects a zero-length array.
+    #[test]
+    fn rejects_array_lit_zero_length() {
+        let program = SemanticProgram {
+            stmts: vec![typed_assign(
+                BindingId(0),
+                "arr",
+                SemanticType::Array(0, Box::new(SemanticType::I64)),
+                SemanticExpr {
+                    ty: SemanticType::Array(0, Box::new(SemanticType::I64)),
+                    kind: SemanticExprKind::ArrayLit { elements: vec![] },
+                },
+            )],
+            enums: vec![],
+        };
+        assert!(lower_program(&program).is_err());
+    }
+
+    // Index lowering rejects a non-Array target type.
+    #[test]
+    fn rejects_index_on_non_array_target() {
+        let program = SemanticProgram {
+            stmts: vec![typed_assign(
+                BindingId(0),
+                "v",
+                SemanticType::I64,
+                index_expr(
+                    int_expr(42, SemanticType::I64),
+                    int_expr(0, SemanticType::I64),
+                    SemanticType::I64,
+                ),
+            )],
+            enums: vec![],
+        };
+        assert!(lower_program(&program).is_err());
+    }
+
+    // ── array element write lowering tests ───────────────────────────────────
+
+    // Helper: build a SemanticLValue::Index for writing to an array element.
+    fn index_lvalue(
+        arr_binding: BindingId,
+        arr_name: &str,
+        arr_ty: SemanticType,
+        index: SemanticExpr,
+        elem_ty: SemanticType,
+    ) -> SemanticLValue {
+        SemanticLValue::Index {
+            target: Box::new(binding_ref(arr_binding, arr_name, arr_ty)),
+            index: Box::new(index),
+            elem_ty,
+        }
+    }
+
+    // A simple array element write `arr:[1] = 99` must emit:
+    // ConstInt (stride), Binary (Mul for byte_offset), PtrAdd, Store.
+    // No Load should appear (this is a plain write, not read-modify-write).
+    #[test]
+    fn lowers_array_element_write_emits_ptr_add_and_store() {
+        // fn write_elem(arr: [3: i64]) { arr:[1] = 99 }
+        let arr_binding = BindingId(0);
+        let arr_ty = SemanticType::Array(3, Box::new(SemanticType::I64));
+        let program = SemanticProgram {
+            stmts: vec![semantic_function(
+                "write_elem",
+                vec![typed_param(arr_binding, "arr", arr_ty.clone())],
+                None,
+                vec![SemanticStmt::Assign {
+                    target: index_lvalue(
+                        arr_binding,
+                        "arr",
+                        arr_ty,
+                        int_expr(1, SemanticType::I64),
+                        SemanticType::I64,
+                    ),
+                    expr: int_expr(99, SemanticType::I64),
+                    pos_eq: 0,
+                }],
+                None,
+            )],
+            enums: vec![],
+        };
+
+        let module = lower_and_validate(&program);
+        let func = module.functions.iter().find(|f| f.name == "write_elem").unwrap();
+        let insts: Vec<&IrInst> = func.blocks.iter().flat_map(|b| b.insts.iter()).collect();
+
+        // Must have a PtrAdd (runtime pointer arithmetic for the index).
+        assert!(
+            insts.iter().any(|i| matches!(i, IrInst::PtrAdd { .. })),
+            "expected PtrAdd for array element write"
+        );
+
+        // Must have a Store for i64 (writing the element).
+        assert!(
+            insts.iter().any(|i| matches!(i, IrInst::Store { .. })),
+            "expected Store for array element write"
+        );
+
+        // Must have a Binary Mul for byte_offset computation.
+        assert!(
+            insts
+                .iter()
+                .any(|i| matches!(i, IrInst::Binary { op: BinaryOp::Mul, ty: IrType::I64, .. })),
+            "expected Binary(Mul, I64) for byte offset computation"
+        );
+
+        // Must NOT have a Load (no read-modify-write for plain assignment).
+        assert!(
+            !insts.iter().any(|i| matches!(i, IrInst::Load { .. })),
+            "unexpected Load in plain array element write"
+        );
+    }
+
+    // A compound-assign array element write `arr:[0] += 5` must emit:
+    // PtrAdd, Load (read current), Binary (Mul + Add), Store (write back).
+    #[test]
+    fn lowers_array_element_compound_assign_emits_load_binary_store() {
+        // fn compound_write(arr: [2: i64]) { arr:[0] += 5 }
+        let arr_binding = BindingId(0);
+        let arr_ty = SemanticType::Array(2, Box::new(SemanticType::I64));
+        let program = SemanticProgram {
+            stmts: vec![semantic_function(
+                "compound_write",
+                vec![typed_param(arr_binding, "arr", arr_ty.clone())],
+                None,
+                vec![SemanticStmt::CompoundAssign {
+                    target: index_lvalue(
+                        arr_binding,
+                        "arr",
+                        arr_ty,
+                        int_expr(0, SemanticType::I64),
+                        SemanticType::I64,
+                    ),
+                    op: crate::frontend::ast::Op::Plus,
+                    operand: int_expr(5, SemanticType::I64),
+                    pos: 0,
+                }],
+                None,
+            )],
+            enums: vec![],
+        };
+
+        let module = lower_and_validate(&program);
+        let func = module.functions.iter().find(|f| f.name == "compound_write").unwrap();
+        let insts: Vec<&IrInst> = func.blocks.iter().flat_map(|b| b.insts.iter()).collect();
+
+        // Must have a PtrAdd for element address computation.
+        assert!(
+            insts.iter().any(|i| matches!(i, IrInst::PtrAdd { .. })),
+            "expected PtrAdd for array element compound assign"
+        );
+
+        // Must have a Load to read the current element value.
+        assert!(
+            insts.iter().any(|i| matches!(i, IrInst::Load { ty: IrType::I64, .. })),
+            "expected Load i64 to read current element value"
+        );
+
+        // Must have a Binary Add for the compound operation.
+        assert!(
+            insts
+                .iter()
+                .any(|i| matches!(i, IrInst::Binary { op: BinaryOp::Add, ty: IrType::I64, .. })),
+            "expected Binary(Add, I64) for compound assign"
+        );
+
+        // Must have a Store to write back the result.
+        assert!(
+            insts.iter().any(|i| matches!(i, IrInst::Store { .. })),
+            "expected Store to write back element value"
+        );
+    }
+
+    // Array element write rejects a non-Array target type.
+    #[test]
+    fn rejects_array_element_write_on_non_array_target() {
+        // Assign to SemanticLValue::Index where target is not an array type.
+        let program = SemanticProgram {
+            stmts: vec![semantic_function(
+                "bad_write",
+                vec![],
+                None,
+                vec![SemanticStmt::Assign {
+                    target: SemanticLValue::Index {
+                        target: Box::new(int_expr(42, SemanticType::I64)),
+                        index: Box::new(int_expr(0, SemanticType::I64)),
+                        elem_ty: SemanticType::I64,
+                    },
+                    expr: int_expr(99, SemanticType::I64),
+                    pos_eq: 0,
+                }],
+                None,
+            )],
+            enums: vec![],
+        };
+        assert!(lower_program(&program).is_err());
+    }
+
+    // MethodCall produces a named structured error that includes both the
+    // instance name and the method name, rather than the generic "MethodCall"
+    // placeholder produced by the unsupported! macro.
+    #[test]
+    fn method_call_produces_named_structured_error() {
+        let program = SemanticProgram {
+            stmts: vec![typed_assign(
+                BindingId(0),
+                "v",
+                SemanticType::I64,
+                SemanticExpr {
+                    ty: SemanticType::I64,
+                    kind: SemanticExprKind::MethodCall {
+                        instance: "obj".to_string(),
+                        method: "foo".to_string(),
+                        args: vec![],
+                        pos: 0,
+                    },
+                },
+            )],
+            enums: vec![],
+        };
+        let err = lower_program(&program).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                LoweringError::UnsupportedSemanticConstruct { construct }
+                if construct.contains("obj") && construct.contains("foo")
+            ),
+            "expected named error mentioning instance and method, got: {:?}",
+            err
         );
     }
 }
