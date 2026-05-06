@@ -568,10 +568,67 @@ fn compile_ir_function(
             IrTerminator::Return { value: None } => {
                 builder.ins().return_(&[]);
             }
-            other => {
-                return Err(JitExecutionError::UnsupportedConstruct {
-                    construct: format!("{:?}", other),
-                });
+            IrTerminator::Jump { target, args } => {
+                let target_cl = *block_map.get(target).ok_or_else(|| {
+                    JitExecutionError::CodegenFailure {
+                        detail: format!("Jump targets undefined block {:?}", target),
+                    }
+                })?;
+                let cl_args: Vec<cranelift_codegen::ir::Value> = args
+                    .iter()
+                    .map(|vid| {
+                        val_map.get(vid).copied().ok_or_else(|| {
+                            JitExecutionError::CodegenFailure {
+                                detail: format!("undefined value {:?} used as Jump arg", vid),
+                            }
+                        })
+                    })
+                    .collect::<Result<_, _>>()?;
+                builder.ins().jump(target_cl, &cl_args);
+            }
+            IrTerminator::Branch { cond, then_block, then_args, else_block, else_args } => {
+                let cond_val = *val_map.get(cond).ok_or_else(|| {
+                    JitExecutionError::CodegenFailure {
+                        detail: format!("undefined condition value {:?} in Branch", cond),
+                    }
+                })?;
+                let then_cl = *block_map.get(then_block).ok_or_else(|| {
+                    JitExecutionError::CodegenFailure {
+                        detail: format!("Branch then-block {:?} not found", then_block),
+                    }
+                })?;
+                let else_cl = *block_map.get(else_block).ok_or_else(|| {
+                    JitExecutionError::CodegenFailure {
+                        detail: format!("Branch else-block {:?} not found", else_block),
+                    }
+                })?;
+                let then_cl_args: Vec<cranelift_codegen::ir::Value> = then_args
+                    .iter()
+                    .map(|vid| {
+                        val_map.get(vid).copied().ok_or_else(|| {
+                            JitExecutionError::CodegenFailure {
+                                detail: format!(
+                                    "undefined value {:?} used as Branch then-arg",
+                                    vid
+                                ),
+                            }
+                        })
+                    })
+                    .collect::<Result<_, _>>()?;
+                let else_cl_args: Vec<cranelift_codegen::ir::Value> = else_args
+                    .iter()
+                    .map(|vid| {
+                        val_map.get(vid).copied().ok_or_else(|| {
+                            JitExecutionError::CodegenFailure {
+                                detail: format!(
+                                    "undefined value {:?} used as Branch else-arg",
+                                    vid
+                                ),
+                            }
+                        })
+                    })
+                    .collect::<Result<_, _>>()?;
+                builder.ins().brif(cond_val, then_cl, &then_cl_args, else_cl, &else_cl_args);
             }
         }
     }
