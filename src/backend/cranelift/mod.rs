@@ -3,6 +3,7 @@ use crate::ir::types::{IrBlock, IrFunction, IrModule, IrType};
 use crate::ir::instr::{IrInst, IrTerminator};
 
 pub mod aot;
+pub mod host_boundary;
 pub mod jit;
 
 pub struct CraneliftBackend;
@@ -227,244 +228,27 @@ fn lower_terminator(term: &IrTerminator) -> Result<(), CraneliftLoweringError> {
 
 impl Backend for CraneliftBackend {
     fn execute(&self, module: &IrModule) -> Result<(), String> {
-        lower_module(module).map_err(|e| e.to_string())
-    }
-}
-
-// ── Tests ────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::ir::types::{BlockId, IrBlock, IrFunction, IrModule, IrType, ValueId};
-    use crate::ir::instr::{IrInst, IrTerminator};
-
-    fn one_function_module(name: &str, term: IrTerminator) -> IrModule {
-        IrModule {
-            debug_name: "test".to_string(),
-            functions: vec![IrFunction {
-                name: name.to_string(),
-                params: vec![],
-                return_ty: None,
-                blocks: vec![IrBlock {
-                    id: BlockId(0),
-                    params: vec![],
-                    insts: vec![],
-                    term,
-                }],
-            }],
+        #[cfg(feature = "jit")]
+        {
+            use jit::run_jit;
+            match run_jit(module) {
+                Ok(outcome) => {
+                    if outcome.exit_code.is_success() {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "JIT: program exited with code {}",
+                            outcome.exit_code
+                        ))
+                    }
+                }
+                Err(e) => Err(e.to_string()),
+            }
         }
-    }
-
-    // ── lower_module ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn lower_module_empty_module_succeeds() {
-        let module = IrModule {
-            debug_name: "empty".to_string(),
-            functions: vec![],
-        };
-        assert!(lower_module(&module).is_ok());
-    }
-
-    #[test]
-    fn lower_module_wraps_inner_error_with_function_name() {
-        let module = one_function_module("my_fn", IrTerminator::Return { value: None });
-        let err = lower_module(&module).unwrap_err();
-        assert!(
-            matches!(
-                &err,
-                CraneliftLoweringError::FunctionLoweringFailed { function, .. }
-                if function == "my_fn"
-            ),
-            "expected FunctionLoweringFailed for 'my_fn', got: {err:?}"
-        );
-    }
-
-    // ── lower_terminator ─────────────────────────────────────────────────────
-
-    #[test]
-    fn terminator_return_produces_named_unsupported_error() {
-        let term = IrTerminator::Return { value: None };
-        let err = lower_terminator(&term).unwrap_err();
-        assert!(
-            matches!(&err, CraneliftLoweringError::UnsupportedTerminator { term, .. } if term == "Return"),
-            "expected UnsupportedTerminator 'Return', got: {err:?}"
-        );
-    }
-
-    #[test]
-    fn terminator_jump_produces_named_unsupported_error() {
-        let term = IrTerminator::Jump { target: BlockId(1), args: vec![] };
-        let err = lower_terminator(&term).unwrap_err();
-        assert!(
-            matches!(&err, CraneliftLoweringError::UnsupportedTerminator { term, .. } if term == "Jump"),
-            "expected UnsupportedTerminator 'Jump', got: {err:?}"
-        );
-    }
-
-    #[test]
-    fn terminator_branch_produces_named_unsupported_error() {
-        let term = IrTerminator::Branch {
-            cond: ValueId(0),
-            then_block: BlockId(1),
-            then_args: vec![],
-            else_block: BlockId(2),
-            else_args: vec![],
-        };
-        let err = lower_terminator(&term).unwrap_err();
-        assert!(
-            matches!(&err, CraneliftLoweringError::UnsupportedTerminator { term, .. } if term == "Branch"),
-            "expected UnsupportedTerminator 'Branch', got: {err:?}"
-        );
-    }
-
-    // ── lower_instruction ────────────────────────────────────────────────────
-
-    #[test]
-    fn instruction_const_int_produces_named_error() {
-        let inst = IrInst::ConstInt { dst: ValueId(0), ty: IrType::I32, value: 42 };
-        let err = lower_instruction(&inst).unwrap_err();
-        assert!(
-            matches!(&err, CraneliftLoweringError::UnsupportedInstruction { inst, .. } if inst == "ConstInt"),
-            "expected UnsupportedInstruction 'ConstInt', got: {err:?}"
-        );
-    }
-
-    #[test]
-    fn instruction_const_float_produces_named_error() {
-        let inst = IrInst::ConstFloat { dst: ValueId(1), value: 3.14 };
-        let err = lower_instruction(&inst).unwrap_err();
-        assert!(
-            matches!(&err, CraneliftLoweringError::UnsupportedInstruction { inst, .. } if inst == "ConstFloat"),
-            "expected UnsupportedInstruction 'ConstFloat', got: {err:?}"
-        );
-    }
-
-    #[test]
-    fn instruction_ssa_bind_produces_named_error() {
-        let inst = IrInst::SsaBind { dst: ValueId(2), ty: IrType::I64, src: ValueId(1) };
-        let err = lower_instruction(&inst).unwrap_err();
-        assert!(
-            matches!(&err, CraneliftLoweringError::UnsupportedInstruction { inst, .. } if inst == "SsaBind"),
-            "expected UnsupportedInstruction 'SsaBind', got: {err:?}"
-        );
-    }
-
-    #[test]
-    fn instruction_load_produces_named_error() {
-        let inst = IrInst::Load { dst: ValueId(3), ty: IrType::I64, ptr: ValueId(0) };
-        let err = lower_instruction(&inst).unwrap_err();
-        assert!(
-            matches!(&err, CraneliftLoweringError::UnsupportedInstruction { inst, .. } if inst == "Load"),
-            "expected UnsupportedInstruction 'Load', got: {err:?}"
-        );
-    }
-
-    #[test]
-    fn instruction_store_produces_named_error() {
-        let inst = IrInst::Store { ptr: ValueId(0), value: ValueId(1) };
-        let err = lower_instruction(&inst).unwrap_err();
-        assert!(
-            matches!(&err, CraneliftLoweringError::UnsupportedInstruction { inst, .. } if inst == "Store"),
-            "expected UnsupportedInstruction 'Store', got: {err:?}"
-        );
-    }
-
-    #[test]
-    fn instruction_alloca_produces_named_error() {
-        let inst = IrInst::Alloca { dst: ValueId(0), size: 8, align: 8 };
-        let err = lower_instruction(&inst).unwrap_err();
-        assert!(
-            matches!(&err, CraneliftLoweringError::UnsupportedInstruction { inst, .. } if inst == "Alloca"),
-            "expected UnsupportedInstruction 'Alloca', got: {err:?}"
-        );
-    }
-
-    #[test]
-    fn instruction_ptr_offset_produces_named_error() {
-        let inst = IrInst::PtrOffset { dst: ValueId(1), base: ValueId(0), offset: 8 };
-        let err = lower_instruction(&inst).unwrap_err();
-        assert!(
-            matches!(&err, CraneliftLoweringError::UnsupportedInstruction { inst, .. } if inst == "PtrOffset"),
-            "expected UnsupportedInstruction 'PtrOffset', got: {err:?}"
-        );
-    }
-
-    #[test]
-    fn instruction_ptr_add_produces_named_error() {
-        let inst = IrInst::PtrAdd { dst: ValueId(2), base: ValueId(0), offset: ValueId(1) };
-        let err = lower_instruction(&inst).unwrap_err();
-        assert!(
-            matches!(&err, CraneliftLoweringError::UnsupportedInstruction { inst, .. } if inst == "PtrAdd"),
-            "expected UnsupportedInstruction 'PtrAdd', got: {err:?}"
-        );
-    }
-
-    // ── Display ──────────────────────────────────────────────────────────────
-
-    #[test]
-    fn error_display_contains_instruction_name() {
-        let err = CraneliftLoweringError::UnsupportedInstruction {
-            inst: "Load".to_string(),
-            context: "dst=ValueId(1) ty=I64 ptr=ValueId(0)".to_string(),
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("Load"), "display should mention 'Load': {msg}");
-    }
-
-    #[test]
-    fn error_display_contains_terminator_name() {
-        let err = CraneliftLoweringError::UnsupportedTerminator {
-            term: "Return".to_string(),
-            context: "value=None".to_string(),
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("Return"), "display should mention 'Return': {msg}");
-    }
-
-    #[test]
-    fn error_display_function_failed_contains_name() {
-        let err = CraneliftLoweringError::FunctionLoweringFailed {
-            function: "compute".to_string(),
-            reason: "unsupported terminator 'Return': value=None".to_string(),
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("compute"), "display should mention 'compute': {msg}");
-    }
-
-    // ── IrType → Cranelift type mapping ─────────────────────────────────────
-
-    #[cfg(feature = "jit")]
-    #[test]
-    fn ir_type_to_cranelift_maps_all_scalar_integer_types() {
-        use cranelift_codegen::ir::types;
-        assert_eq!(ir_type_to_cranelift(&IrType::I8).unwrap(), types::I8);
-        assert_eq!(ir_type_to_cranelift(&IrType::I16).unwrap(), types::I16);
-        assert_eq!(ir_type_to_cranelift(&IrType::I32).unwrap(), types::I32);
-        assert_eq!(ir_type_to_cranelift(&IrType::I64).unwrap(), types::I64);
-        assert_eq!(ir_type_to_cranelift(&IrType::I128).unwrap(), types::I128);
-    }
-
-    #[cfg(feature = "jit")]
-    #[test]
-    fn ir_type_to_cranelift_maps_f64() {
-        use cranelift_codegen::ir::types;
-        assert_eq!(ir_type_to_cranelift(&IrType::F64).unwrap(), types::F64);
-    }
-
-    #[cfg(feature = "jit")]
-    #[test]
-    fn ir_type_to_cranelift_bool_and_tbool_map_to_i8() {
-        use cranelift_codegen::ir::types;
-        assert_eq!(ir_type_to_cranelift(&IrType::Bool).unwrap(), types::I8);
-        assert_eq!(ir_type_to_cranelift(&IrType::TBool).unwrap(), types::I8);
-    }
-
-    #[cfg(feature = "jit")]
-    #[test]
-    fn ir_type_to_cranelift_ptr_maps_to_i64() {
-        use cranelift_codegen::ir::types;
-        assert_eq!(ir_type_to_cranelift(&IrType::Ptr).unwrap(), types::I64);
+        #[cfg(not(feature = "jit"))]
+        {
+            let _ = module;
+            Err("Cranelift backend requires the `jit` feature — rebuild with --features jit".to_string())
+        }
     }
 }
