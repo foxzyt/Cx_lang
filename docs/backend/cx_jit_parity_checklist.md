@@ -97,13 +97,13 @@ expected program behavior and must be investigated and fixed.
 
 Captured from:
 
-```
+```bash
 cargo build --features jit && cargo test --features jit jit_parity_by_feature --nocapture
 ```
 
 Run on branch `stokowski/CX-69` (submain as of CX-69 merge window, 2026-05-09).
 
-```
+```text
 Feature                PASS   SKIP  PARITY_FAIL
 ------------------------------------------------
 Arithmetic                1     11            0
@@ -160,13 +160,13 @@ SKIP counts are informational only — they do not cause the test to fail.
 
 Run the gate with:
 
-```
+```bash
 cargo build --features jit && cargo test --features jit jit_parity_by_feature --nocapture
 ```
 
 Or as part of the full suite:
 
-```
+```bash
 cargo build --features jit && cargo test --features jit
 ```
 

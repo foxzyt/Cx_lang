@@ -40,7 +40,8 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 // ── Feature classification ────────────────────────────────────────────────────
 
@@ -231,6 +232,10 @@ pub fn feature_of(fixture_name: &str) -> FeatureCategory {
 /// `backend::cranelift::host_boundary`.
 const JIT_SKIP_EXIT_CODE: i32 = 127;
 
+/// Maximum time to wait for a single JIT subprocess before killing it.
+#[cfg(feature = "jit")]
+const JIT_TIMEOUT: Duration = Duration::from_secs(30);
+
 // ── Fixture types ─────────────────────────────────────────────────────────────
 
 /// What the interpreter is expected to do when given this fixture.
@@ -415,11 +420,16 @@ pub fn cx_binary_path() -> PathBuf {
 /// Requires the binary to have been built with `--features jit`.
 #[cfg(feature = "jit")]
 pub fn run_jit_subprocess(binary: &Path, fixture: &TestFixture) -> InterpOutcome {
-    let output = Command::new(binary)
+    use std::io::Read;
+    use wait_timeout::ChildExt;
+
+    let mut child = Command::new(binary)
         .arg("--backend=cranelift")
         .arg(&fixture.path)
         .env("NO_COLOR", "1")
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap_or_else(|e| {
             panic!(
                 "failed to spawn JIT binary {:?} for fixture {:?}: {}",
@@ -427,10 +437,36 @@ pub fn run_jit_subprocess(binary: &Path, fixture: &TestFixture) -> InterpOutcome
             )
         });
 
-    InterpOutcome {
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        exit_code: output.status.code().unwrap_or(-1),
+    // Take pipe handles before calling wait_timeout so we can read them after
+    // the process exits without a second wait() call.
+    let mut stdout_pipe = child.stdout.take().expect("stdout is piped");
+    let mut stderr_pipe = child.stderr.take().expect("stderr is piped");
+
+    match child.wait_timeout(JIT_TIMEOUT).unwrap_or_else(|e| {
+        panic!("wait_timeout failed for fixture {:?}: {}", fixture.path, e)
+    }) {
+        Some(status) => {
+            let mut stdout_bytes = Vec::new();
+            let mut stderr_bytes = Vec::new();
+            stdout_pipe.read_to_end(&mut stdout_bytes).unwrap_or(0);
+            stderr_pipe.read_to_end(&mut stderr_bytes).unwrap_or(0);
+            InterpOutcome {
+                stdout: String::from_utf8_lossy(&stdout_bytes).into_owned(),
+                stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
+                exit_code: status.code().unwrap_or(-1),
+            }
+        }
+        None => {
+            let _ = child.kill();
+            InterpOutcome {
+                stdout: String::new(),
+                stderr: format!(
+                    "JIT subprocess timed out after {}s",
+                    JIT_TIMEOUT.as_secs()
+                ),
+                exit_code: -1,
+            }
+        }
     }
 }
 
