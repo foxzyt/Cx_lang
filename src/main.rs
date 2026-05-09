@@ -229,15 +229,19 @@ fn run() {
                 Ok(ir) => ir,
                 Err(err) => {
                     eprintln!("{}", err);
-                    return;
+                    // IR lowering failure = this Cx program uses a feature the JIT
+                    // pipeline does not yet lower.  Exit 127 so the differential
+                    // harness counts it as SKIP (unsupported construct), not PARITY_FAIL.
+                    std::process::exit(127);
                 }
             };
             if flags.trace {
                 println!("{}", crate::ir::printer::print_module(&ir));
             }
             let b = backend::cranelift::CraneliftBackend;
-            if let Err(msg) = b.execute(&ir) {
-                eprintln!("{}", msg);
+            if let Err(err) = b.execute(&ir) {
+                eprintln!("{}", err.message);
+                std::process::exit(err.exit_code);
             }
         }
         backend::BackendKind::Llvm => {
@@ -245,12 +249,13 @@ fn run() {
                 Ok(ir) => ir,
                 Err(err) => {
                     eprintln!("{}", err);
-                    return;
+                    std::process::exit(1);
                 }
             };
             let b = backend::llvm::LlvmBackend;
-            if let Err(msg) = b.execute(&ir) {
-                eprintln!("{}", msg);
+            if let Err(err) = b.execute(&ir) {
+                eprintln!("{}", err.message);
+                std::process::exit(err.exit_code);
             }
         }
         backend::BackendKind::Validate => {
@@ -258,7 +263,7 @@ fn run() {
                 Ok(ir) => ir,
                 Err(err) => {
                     eprintln!("Lowering failed: {}", err);
-                    return;
+                    std::process::exit(1);
                 }
             };
             match crate::ir::validate::validate_module(&ir) {
@@ -272,6 +277,7 @@ fn run() {
                     for e in &errors {
                         eprintln!("  {:?}", e);
                     }
+                    std::process::exit(1);
                 }
             }
         }

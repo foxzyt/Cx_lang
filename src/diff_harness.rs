@@ -501,16 +501,15 @@ pub fn parity_by_feature(
 
         // Two SKIP signals:
         //
-        // 1. exit 127 (JIT_SKIP_EXIT_CODE): the binary correctly propagated the
-        //    unsupported-construct sentinel. Included for forward compatibility.
+        // 1. exit 127 (JIT_SKIP_EXIT_CODE): the binary propagated the
+        //    unsupported-construct sentinel (JitExitCode::UNSUPPORTED_CONSTRUCT).
+        //    This is the canonical SKIP path after CX-74.
         //
-        // 2. exit 0 with non-empty stderr: the IR lowering or JIT codegen step
-        //    failed and printed an error message to stderr. The binary always
-        //    exits 0 in this case (the Cx main() never ran); a non-empty stderr
-        //    distinguishes this from a successful run that produced no stdout.
-        //    Expected-fail (semantic-error) fixtures take the same path but exit
-        //    non-zero (std::process::exit(1) in the semantic phase), so they are
-        //    not mistakenly classified as SKIP.
+        // 2. exit 0 with non-empty stderr: legacy fallback retained for safety.
+        //    Before CX-74 this fired when IR lowering or JIT codegen failed
+        //    without propagating a non-zero exit code.  After CX-74 all error
+        //    paths in main.rs propagate non-zero exit codes, so this condition
+        //    should no longer fire in practice.
         if outcome.exit_code == JIT_SKIP_EXIT_CODE
             || (outcome.exit_code == 0 && !outcome.stderr.is_empty())
         {
