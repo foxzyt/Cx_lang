@@ -18,7 +18,7 @@ set:
 
 | Category       | Description                                  | Key fixtures |
 |----------------|----------------------------------------------|--------------|
-| Arithmetic     | Integer arithmetic, overflow, eval order     | t01, t89–t96, t103, t114_eval_order_binary_arith, t115_eval_order_compare, t116 |
+| Arithmetic     | Integer arithmetic, overflow, eval order     | t01, t89–t95, t103, t114_eval_order_binary_arith, t115_eval_order_compare, t116 |
 | VariableDecl   | Variable/const declarations, scope, type errors | t15, t56, t57, t101, t102 |
 | IfElse         | Conditional branches                         | t44, t45, t46 |
 | WhileLoop      | While loops and while-in construct           | t23, t34, t35, t105, t107, t108 |
