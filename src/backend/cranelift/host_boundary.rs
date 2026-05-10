@@ -275,12 +275,20 @@ extern "C" fn cx_printn(n: i64) {
     let _ = writeln!(stdout, "{n}");
 }
 
+/// Backend-private symbol name for the F64 remainder host helper.
+///
+/// Using a mangled name (double-underscore prefix) keeps it out of the user-visible namespace.
+/// A user-defined `fn fmod(...)` in Cx source will be declared under its plain name and must
+/// not collide with — or overwrite — this runtime intrinsic in `func_id_map`.
+const JIT_F64_REM_SYMBOL: &str = "__cx_fmod";
+
 /// Wrapper around Rust's `%` operator exposed as a C-ABI symbol for the JIT.
 ///
 /// Rust's `f64 % f64` uses truncated-toward-zero remainder (same semantics as C's `fmod`).
 /// Using a Rust wrapper avoids depending on the C stdlib `fmod` symbol being resolvable
-/// by the JIT linker. Registered as `"fmod"` in the JIT symbol table so that the declared
-/// import signature `(F64, F64) -> F64` resolves correctly for all F64 Rem lowering.
+/// by the JIT linker. Registered as [`JIT_F64_REM_SYMBOL`] (`"__cx_fmod"`) in the JIT symbol
+/// table so that the declared import signature `(F64, F64) -> F64` resolves correctly for all
+/// F64 Rem lowering without polluting the user-function namespace.
 #[cfg(feature = "jit")]
 extern "C" fn host_fmod(a: f64, b: f64) -> f64 {
     a % b
@@ -332,7 +340,7 @@ impl HostBoundary {
         let mut jit_builder =
             JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
         jit_builder.symbol("cx_printn", cx_printn as *const u8);
-        jit_builder.symbol("fmod", host_fmod as *const u8);
+        jit_builder.symbol(JIT_F64_REM_SYMBOL, host_fmod as *const u8);
         let mut module = JITModule::new(jit_builder);
 
         // Pass 1: declare every user-defined function AND runtime intrinsics into
@@ -354,7 +362,9 @@ impl HostBoundary {
             func_id_map.insert("cx_printn".to_string(), id);
         }
 
-        // Pre-declare fmod(f64, f64) -> f64 for F64 Rem lowering.
+        // Pre-declare __cx_fmod(f64, f64) -> f64 for F64 Rem lowering.
+        // Uses JIT_F64_REM_SYMBOL ("__cx_fmod") to avoid colliding with any user-defined
+        // function named "fmod" in the Cx program.
         {
             use cranelift_codegen::ir::{AbiParam, types};
             let call_conv = module.target_config().default_call_conv;
@@ -363,11 +373,11 @@ impl HostBoundary {
             sig.params.push(AbiParam::new(types::F64));
             sig.returns.push(AbiParam::new(types::F64));
             let id = module
-                .declare_function("fmod", Linkage::Import, &sig)
+                .declare_function(JIT_F64_REM_SYMBOL, Linkage::Import, &sig)
                 .map_err(|e| JitExecutionError::CodegenFailure {
                     detail: e.to_string(),
                 })?;
-            func_id_map.insert("fmod".to_string(), id);
+            func_id_map.insert(JIT_F64_REM_SYMBOL.to_string(), id);
         }
 
         for ir_func in &ir.functions {
@@ -619,9 +629,12 @@ fn compile_ir_function(
                             BinaryOp::Mul => builder.ins().fmul(lhs_val, rhs_val),
                             BinaryOp::Div => builder.ins().fdiv(lhs_val, rhs_val),
                             BinaryOp::Rem => {
-                                let fmod_id = *func_id_map.get("fmod").ok_or_else(|| {
+                                let fmod_id = *func_id_map.get(JIT_F64_REM_SYMBOL).ok_or_else(|| {
                                     JitExecutionError::CodegenFailure {
-                                        detail: "fmod not pre-declared in func_id_map".to_string(),
+                                        detail: format!(
+                                            "{} not pre-declared in func_id_map",
+                                            JIT_F64_REM_SYMBOL
+                                        ),
                                     }
                                 })?;
                                 let fmod_ref =
@@ -4266,8 +4279,12 @@ mod determinism_tests {
         };
         let result = HostBoundary::new().execute(&module);
         assert!(result.is_ok(), "JIT failed: {:?}", result.unwrap_err());
-        // fmod(1.7e308, 1e-10) is in [0, 1e-10); fcvt_to_sint_sat → 0
-        assert_eq!(result.unwrap().exit_code.raw(), 0);
+        let code = result.unwrap().exit_code.raw();
+        // The broken inline formula (a - trunc(a/b)*b) overflows a/b to +Inf, making
+        // the final fsub produce -Inf. fcvt_to_sint_sat(-Inf) saturates to i32::MIN.
+        // The correct fmod result is in [0, 1e-10); fcvt_to_sint_sat truncates to 0.
+        assert!(code >= 0, "rem was negative — broken formula saturates to i32::MIN ({}); got {}", i32::MIN, code);
+        assert_eq!(code, 0, "fmod(1.7e308, 1e-10) ∈ [0, 1e-10) must cast to 0 via fcvt_to_sint_sat");
     }
 
     // ── CX-91: Cast ───────────────────────────────────────────────────────────
