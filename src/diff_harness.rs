@@ -134,6 +134,11 @@ pub fn feature_of(fixture_name: &str) -> FeatureCategory {
         | "t114_eval_order_binary_arith"
         | "t115_eval_order_compare"
         | "t116_eval_order_nested"
+        | "t117_arith_add_exit"
+        | "t118_arith_sub_exit"
+        | "t119_arith_mul_exit"
+        | "t120_arith_div_exit"
+        | "t121_arith_mod_exit"
             => FeatureCategory::Arithmetic,
 
         // ── VariableDecl ──────────────────────────────────────────────────────
@@ -142,6 +147,9 @@ pub fn feature_of(fixture_name: &str) -> FeatureCategory {
         | "t57_const_reassign_reject"
         | "t101_undefined_var_hint"
         | "t102_type_mismatch_uses_cx_names"
+        | "t122_vardecl_int_exit"
+        | "t123_vardecl_reassign_exit"
+        | "t124_vardecl_arith_exit"
             => FeatureCategory::VariableDecl,
 
         // ── IfElse ────────────────────────────────────────────────────────────
