@@ -8,6 +8,13 @@ for i in 0..5 {
 }
 assert_eq(total, 10)
 
+// Non-zero lower bound: 2+3+4 = 9; catches start-bound off-by-one.
+offset_total: t64 = 0
+for i in 2..5 {
+    offset_total = offset_total + i
+}
+assert_eq(offset_total, 9)
+
 // Empty range: start == end yields 0 iterations.
 count: t64 = 0
 for i in 3..3 {
