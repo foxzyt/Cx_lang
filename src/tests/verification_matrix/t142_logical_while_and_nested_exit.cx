@@ -1,6 +1,13 @@
-// CX-107: exit-code-based JIT parity — LogicalOps in while conditions
+// CX-107/CX-110: exit-code-based JIT parity — LogicalOps in while conditions
 // and nested/chained expressions.
 // No stdout; correctness verified by exit code only (0 = all asserts held).
+
+// rhs_trap() calls assert(false); if ever invoked it causes a non-zero exit.
+// Used below to prove that short-circuit evaluation truly suppresses RHS calls.
+fnc: bool rhs_trap() {
+    assert(false)
+    return false
+}
 
 // ─── While with && condition ─────────────────────────────────────────────────
 // Loop while both i < 5 and j > 0 hold simultaneously.
@@ -75,3 +82,15 @@ assert_eq(chain3, true)
 // (true || false) || false → inner OR short-circuits to true; outer: true || false → true.
 chain4: bool = true || false || false
 assert_eq(chain4, true)
+
+// ─── Observable short-circuit proof ──────────────────────────────────────────
+// rhs_trap() would assert(false) if called, proving the RHS is never evaluated
+// when the LHS already settles the result.
+
+// AND: lhs false → short-circuit (rhs_trap must NOT be called)
+sc_and_proof: bool = false && rhs_trap()
+assert_eq(sc_and_proof, false)
+
+// OR: lhs true → short-circuit (rhs_trap must NOT be called)
+sc_or_proof: bool = true || rhs_trap()
+assert_eq(sc_or_proof, true)
