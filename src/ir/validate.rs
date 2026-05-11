@@ -510,6 +510,23 @@ fn validate_inst(
             }
             define_value(function, block, *dst, IrType::Ptr, "Alloca destination", defined_values, errors);
         }
+        IrInst::ArrayAlloca { dst, element_type, count } => {
+            if *count == 0 {
+                errors.push(IrValidationError::InvalidTypeUsage {
+                    function: function.name.clone(),
+                    block,
+                    detail: "ArrayAlloca count must be > 0".to_string(),
+                });
+            }
+            if matches!(element_type, IrType::Void) {
+                errors.push(IrValidationError::InvalidTypeUsage {
+                    function: function.name.clone(),
+                    block,
+                    detail: "ArrayAlloca element_type must be storable, got Void".to_string(),
+                });
+            }
+            define_value(function, block, *dst, IrType::Ptr, "ArrayAlloca destination", defined_values, errors);
+        }
         IrInst::PtrOffset { dst, base, .. } => {
             require_value(function, block, *base, "PtrOffset base", defined_values, errors);
             if let Some(base_ty) = defined_values.get(base) {

@@ -722,6 +722,34 @@ fn compile_ir_function(
                     val_map.insert(*dst, ptr_val);
                 }
 
+                IrInst::ArrayAlloca { dst, element_type, count } => {
+                    use crate::ir::types::compute_array_layout;
+                    use cranelift_codegen::ir::stackslot::{StackSlotData, StackSlotKind};
+                    use cranelift_codegen::ir::types;
+
+                    let layout = compute_array_layout(element_type, *count);
+                    let slot_size = u32::try_from(layout.total_size).map_err(|_| {
+                        JitExecutionError::UnsupportedConstruct {
+                            construct: format!(
+                                "ArrayAlloca total size {} exceeds Cranelift stack-slot limit",
+                                layout.total_size
+                            ),
+                        }
+                    })?;
+                    let align_shift = if layout.alignment == 0 {
+                        0u8
+                    } else {
+                        layout.alignment.trailing_zeros() as u8
+                    };
+                    let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        slot_size,
+                        align_shift,
+                    ));
+                    let ptr_val = builder.ins().stack_addr(types::I64, slot, 0);
+                    val_map.insert(*dst, ptr_val);
+                }
+
                 IrInst::Load { dst, ty, ptr } => {
                     use cranelift_codegen::ir::MemFlags;
 
