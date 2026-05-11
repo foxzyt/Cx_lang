@@ -1,0 +1,13 @@
+// CX-124: exit-code-based JIT parity — for-in loop inside a user-defined function.
+// No stdout; correctness verified by exit code only (0 = all asserts held).
+fnc: t64 sum_range(n: t64) {
+    total: t64 = 0
+    for i in 0..n {
+        total = total + i
+    }
+    return total
+}
+
+assert_eq(sum_range(5), 10)
+assert_eq(sum_range(0), 0)
+assert_eq(sum_range(1), 0)
