@@ -142,6 +142,7 @@ pub fn feature_of(fixture_name: &str) -> FeatureCategory {
         | "t119_arith_mul_exit"
         | "t120_arith_div_exit"
         | "t121_arith_mod_exit"
+        | "t172_arith_t128_exit"
             => FeatureCategory::Arithmetic,
 
         // ── VariableDecl ──────────────────────────────────────────────────────
@@ -153,6 +154,8 @@ pub fn feature_of(fixture_name: &str) -> FeatureCategory {
         | "t122_vardecl_int_exit"
         | "t123_vardecl_reassign_exit"
         | "t124_vardecl_arith_exit"
+        | "t173_const_decl_exit"
+        | "t174_block_scope_shadow_exit"
             => FeatureCategory::VariableDecl,
 
         // ── IfElse ────────────────────────────────────────────────────────────
@@ -186,6 +189,8 @@ pub fn feature_of(fixture_name: &str) -> FeatureCategory {
         "t25_loop_break"
         | "t106_loop_break_in_func"
         | "t134_loop_break_exit"
+        | "t167_infinite_loop_counter_exit"
+        | "t168_infinite_loop_countdown_exit"
             => FeatureCategory::InfiniteLoop,
 
         // ── DirectCall ────────────────────────────────────────────────────────
@@ -200,6 +205,12 @@ pub fn feature_of(fixture_name: &str) -> FeatureCategory {
         | "t29_forward_decl"
         | "t50_nested_func_no_leak"
         | "t113_recursive_fib"
+        | "t159_direct_call_implicit_return_exit"
+        | "t160_direct_call_explicit_return_exit"
+        | "t161_direct_call_no_args_exit"
+        | "t162_direct_call_chained_exit"
+        | "t163_direct_call_forward_decl_exit"
+        | "t164_direct_call_recursive_exit"
             => FeatureCategory::DirectCall,
 
         // ── Struct ────────────────────────────────────────────────────────────
@@ -214,6 +225,9 @@ pub fn feature_of(fixture_name: &str) -> FeatureCategory {
         | "t125_struct_field_read_exit"
         | "t126_struct_second_field_read_exit"
         | "t127_struct_field_write_exit"
+        | "t175_impl_basic_exit"
+        | "t176_impl_return_exit"
+        | "t177_multi_alias_impl_exit"
             => FeatureCategory::Struct,
 
         // ── Array ─────────────────────────────────────────────────────────────
@@ -231,15 +245,20 @@ pub fn feature_of(fixture_name: &str) -> FeatureCategory {
         | "t151_var_compound_assign_exit"
         | "t152_compound_assign_dotaccess_exit"
         | "t153_compound_assign_index_exit"
+        | "t169_compound_assign_func_exit"
             => FeatureCategory::CompoundAssign,
 
         // ── Unary ─────────────────────────────────────────────────────────────
         "t96_overflow_t8_unary_neg"
+        | "t165_unary_neg_int_exit"
+        | "t166_unary_not_bool_exit"
             => FeatureCategory::Unary,
 
         // ── Cast ─────────────────────────────────────────────────────────────
         "t139_cast_t32_to_f64_exit"
         | "t140_cast_f64_truncate_exit"
+        | "t157_cast_neg_t32_to_f64_exit"
+        | "t158_cast_t64_to_f64_exit"
             => FeatureCategory::Cast,
 
         // ── FloatOps ──────────────────────────────────────────────────────────
@@ -248,6 +267,8 @@ pub fn feature_of(fixture_name: &str) -> FeatureCategory {
         | "t136_float_arith_sub_exit"
         | "t137_float_arith_mul_exit"
         | "t138_float_arith_div_exit"
+        | "t155_float_arith_mod_exit"
+        | "t156_float_neg_exit"
             => FeatureCategory::FloatOps,
 
         // ── BuiltinAssert ─────────────────────────────────────────────────────
@@ -255,6 +276,8 @@ pub fn feature_of(fixture_name: &str) -> FeatureCategory {
         | "t78_assert_eq_strings"
         | "t79_assert_false_reject"
         | "t80_assert_eq_mismatch_reject"
+        | "t170_assert_pass_exit"
+        | "t171_assert_eq_pass_exit"
             => FeatureCategory::BuiltinAssert,
 
         // ── LogicalOps ────────────────────────────────────────────────────────
@@ -563,6 +586,7 @@ pub fn parity_by_feature(
                 }
             };
             if is_parity_fail {
+                emit_parity_fail_diagnostic(cat, fixture, &outcome, binary);
                 entry.2 += 1; // PARITY_FAIL
             } else {
                 entry.0 += 1; // pass
@@ -571,6 +595,98 @@ pub fn parity_by_feature(
     }
 
     map
+}
+
+// ── PARITY_FAIL diagnostic ────────────────────────────────────────────────────
+
+/// Emit a diagnostic to stderr when `parity_by_feature` detects a PARITY_FAIL.
+///
+/// Prints the fixture name, feature category, expected vs actual outcome, and
+/// a full IR dump produced by running `<binary> --backend=validate <fixture>`
+/// as a subprocess. The IR dump subprocess is bounded by [`JIT_TIMEOUT`]; if
+/// it times out the diagnostic says so and returns without hanging the test.
+#[cfg(feature = "jit")]
+fn emit_parity_fail_diagnostic(
+    category: FeatureCategory,
+    fixture: &TestFixture,
+    outcome: &InterpOutcome,
+    binary: &Path,
+) {
+    use std::io::Read;
+    use wait_timeout::ChildExt;
+
+    eprintln!("\nPARITY_FAIL: {} [{}]", fixture.name, category);
+
+    let expected_desc = match &fixture.expectation {
+        TestExpectation::Fail => "exit non-zero (expected-fail)".to_string(),
+        TestExpectation::PassAny => "exit 0".to_string(),
+        TestExpectation::PassWithOutput(s) => {
+            format!(
+                "exit 0, stdout = {:?}",
+                s.lines().next().unwrap_or("(empty)")
+            )
+        }
+    };
+    eprintln!("  expected:  {}", expected_desc);
+    eprintln!("  exit code: {}", outcome.exit_code);
+    eprintln!(
+        "  stdout:    {}",
+        outcome.stdout.lines().next().unwrap_or("(empty)")
+    );
+    eprintln!(
+        "  stderr:    {}",
+        outcome.stderr.lines().next().unwrap_or("(empty)")
+    );
+
+    eprintln!("  IR dump:");
+    let child = Command::new(binary)
+        .arg("--backend=validate")
+        .arg(&fixture.path)
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("    (IR dump failed: {})", e);
+            return;
+        }
+    };
+
+    let mut stdout_pipe = child.stdout.take().expect("stdout is piped");
+    let mut stderr_pipe = child.stderr.take().expect("stderr is piped");
+
+    match child.wait_timeout(JIT_TIMEOUT) {
+        Ok(Some(_status)) => {
+            let mut ir_bytes = Vec::new();
+            let mut err_bytes = Vec::new();
+            stdout_pipe.read_to_end(&mut ir_bytes).unwrap_or(0);
+            stderr_pipe.read_to_end(&mut err_bytes).unwrap_or(0);
+            let ir_text = String::from_utf8_lossy(&ir_bytes);
+            let err_text = String::from_utf8_lossy(&err_bytes);
+            if !ir_text.is_empty() {
+                for line in ir_text.lines() {
+                    eprintln!("    {}", line);
+                }
+            } else if !err_text.is_empty() {
+                eprintln!(
+                    "    (validation error: {})",
+                    err_text.lines().next().unwrap_or("")
+                );
+            } else {
+                eprintln!("    (no IR output)");
+            }
+        }
+        Ok(None) => {
+            let _ = child.kill();
+            eprintln!("    (IR dump timed out after {}s)", JIT_TIMEOUT.as_secs());
+        }
+        Err(e) => {
+            eprintln!("    (IR dump failed: {})", e);
+        }
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
