@@ -53,6 +53,7 @@ pub struct Analyzer {
     enums: HashMap<String, EnumInfo>,
     structs: HashMap<String, Vec<(String, Type)>>,
     pub method_registry: HashMap<(String, String), SemanticFunction>,
+    pub method_alias_counts: HashMap<(String, String), usize>,
     pub struct_type_params: HashMap<String, Vec<String>>,
     enum_defs: Vec<SemanticEnum>,
     pub module_aliases: HashMap<String, ExportTable>,
@@ -73,6 +74,7 @@ impl Analyzer {
             enums: HashMap::new(),
             structs: HashMap::new(),
             method_registry: HashMap::new(),
+            method_alias_counts: HashMap::new(),
             struct_type_params: HashMap::new(),
             enum_defs: Vec::new(),
             module_aliases: HashMap::new(),
@@ -280,6 +282,7 @@ impl Analyzer {
                     .collect();
 
                 let mut semantic_methods: Vec<SemanticFunction> = Vec::new();
+                let mut method_alias_params: Vec<Vec<SemanticParam>> = Vec::new();
 
                 for (method_name, params, ret_ty, body, ret_expr) in methods {
                     // Prepend aliases as typed params so analyze_function declares them in scope
@@ -290,12 +293,24 @@ impl Analyzer {
 
                     match self.analyze_function(method_name, &[], &full_params, ret_ty, body, ret_expr, *pos, false) {
                         Ok(SemanticStmt::FuncDef(mut sem_func)) => {
-                            // Remove the alias params from the semantic function's param list
-                            // so they don't appear as external call params
+                            // Capture the alias params (carrying this method's
+                            // BindingIds) BEFORE the strip. The body's
+                            // VarRef/DotAccess nodes reference these BindingIds;
+                            // the IR layer re-prepends these exact params so the
+                            // receiver resolves. The strip itself is unchanged,
+                            // so the interpreter's call_semantic_method arity is
+                            // preserved.
+                            let captured: Vec<SemanticParam> = sem_func
+                                .params
+                                .iter()
+                                .take(aliases.len())
+                                .cloned()
+                                .collect();
                             sem_func.params = sem_func.params.into_iter()
                                 .skip(aliases.len())
                                 .collect();
                             semantic_methods.push(sem_func);
+                            method_alias_params.push(captured);
                         }
                         Ok(_) => {}
                         Err(e) => return Err(e),
@@ -310,6 +325,10 @@ impl Analyzer {
                                 (type_name.clone(), sem_func.name.clone()),
                                 sem_func.clone(),
                             );
+                            self.method_alias_counts.insert(
+                                (type_name.clone(), sem_func.name.clone()),
+                                semantic_aliases.len(),
+                            );
                         }
                     }
                 }
@@ -318,6 +337,7 @@ impl Analyzer {
                     name: name.clone(),
                     aliases: semantic_aliases,
                     methods: semantic_methods,
+                    method_alias_params,
                     pos: *pos,
                 })
             }
@@ -1342,22 +1362,71 @@ Expr::Unary(op, inner, pos) => {
                     .map(|info| info.inferred.clone().or_else(|| info.declared.as_ref().map(|t| semantic_type_from_decl(t.clone(), &[]))).unwrap_or(SemanticType::Unknown))
                     .unwrap_or(SemanticType::Unknown);
 
+                let struct_name = if let SemanticType::Struct(tn) = &instance_ty {
+                    tn.clone()
+                } else {
+                    String::new()
+                };
+                let instance_binding = self.lookup_var(instance)
+                    .map(|i| i.binding)
+                    .unwrap_or(BindingId(u32::MAX));
+
                 // Look up return type from method registry
-                let ret_ty = if let SemanticType::Struct(type_name) = &instance_ty {
+                let ret_ty = if !struct_name.is_empty() {
                     self.method_registry
-                        .get(&(type_name.clone(), method.clone()))
+                        .get(&(struct_name.clone(), method.clone()))
                         .and_then(|f| f.return_ty.clone())
                         .unwrap_or(SemanticType::Void)
                 } else {
                     SemanticType::Unknown
                 };
 
+                let method_fn = if !struct_name.is_empty() {
+                    self.method_registry
+                        .get(&(struct_name.clone(), method.clone()))
+                        .cloned()
+                } else {
+                    None
+                };
+                let alias_count = self.method_alias_counts
+                    .get(&(struct_name.clone(), method.clone()))
+                    .copied()
+                    .unwrap_or(1);
+                let extra_alias_count = alias_count.saturating_sub(1);
+
                 // analyze args
                 let mut semantic_args: Vec<SemanticCallArg> = Vec::new();
-                for arg in args {
+                for (index, arg) in args.iter().enumerate() {
                     match arg {
                         CallArg::Expr(expr) => {
                             let sem_expr = self.analyze_expr(expr)?;
+                            let sem_expr = if index >= extra_alias_count {
+                                // user-typed arg: narrow against the method's
+                                // declared param type, mirroring the free-fn
+                                // call path (~semantic.rs:1574).
+                                let user_idx = index - extra_alias_count;
+                                let expected = method_fn
+                                    .as_ref()
+                                    .and_then(|f| f.params.get(user_idx))
+                                    .and_then(|p| p.ty.clone());
+                                if let Some(expected) = expected {
+                                    if !types_compatible(&expected, &sem_expr.ty) {
+                                        return Err(sem_err!(
+                                            *pos,
+                                            "argument {} to method '{}.{}': expected {}, got {}",
+                                            user_idx + 1, instance, method,
+                                            type_name(&expected), type_name(&sem_expr.ty)
+                                        ));
+                                    }
+                                    insert_cast_if_needed(sem_expr, &expected)
+                                } else {
+                                    sem_expr
+                                }
+                            } else {
+                                // extra-alias (struct receiver-alias) arg:
+                                // pass through, never narrow.
+                                sem_expr
+                            };
                             semantic_args.push(SemanticCallArg::Expr(sem_expr));
                         }
                         CallArg::Copy(name) => {
@@ -1390,6 +1459,8 @@ Expr::Unary(op, inner, pos) => {
                         instance: instance.clone(),
                         method: method.clone(),
                         args: semantic_args,
+                        instance_binding,
+                        struct_name,
                         pos: *pos,
                     },
                 })
@@ -1483,6 +1554,33 @@ Expr::Unary(op, inner, pos) => {
                         semantic_args.push(SemanticCallArg::Expr(sem_expr));
                     }
                     _ => {}
+                }
+            }
+            if name == "assert_eq" && semantic_args.len() == 2 {
+                let lhs_ty = if let SemanticCallArg::Expr(e) = &semantic_args[0] {
+                    Some(e.ty.clone())
+                } else { None };
+                let rhs_ty = if let SemanticCallArg::Expr(e) = &semantic_args[1] {
+                    Some(e.ty.clone())
+                } else { None };
+                if let (Some(lhs_ty), Some(rhs_ty)) = (lhs_ty, rhs_ty) {
+                    if lhs_ty == SemanticType::Numeric
+                        && rhs_ty != SemanticType::Numeric
+                        && is_numeric(&rhs_ty)
+                    {
+                        if let SemanticCallArg::Expr(lhs) = semantic_args[0].clone() {
+                            semantic_args[0] =
+                                SemanticCallArg::Expr(insert_cast_if_needed(lhs, &rhs_ty));
+                        }
+                    } else if rhs_ty == SemanticType::Numeric
+                        && lhs_ty != SemanticType::Numeric
+                        && is_numeric(&lhs_ty)
+                    {
+                        if let SemanticCallArg::Expr(rhs) = semantic_args[1].clone() {
+                            semantic_args[1] =
+                                SemanticCallArg::Expr(insert_cast_if_needed(rhs, &lhs_ty));
+                        }
+                    }
                 }
             }
             let ret_ty = if name == "read" || name == "input" {
@@ -1707,6 +1805,11 @@ Expr::Unary(op, inner, pos) => {
                         },
                     })
                 } else {
+                    if is_numeric(&lhs.ty) && is_numeric(&rhs.ty) {
+                        let compare_ty = common_numeric_type(&lhs.ty, &rhs.ty);
+                        lhs = insert_cast_if_needed(lhs, &compare_ty);
+                        rhs = insert_cast_if_needed(rhs, &compare_ty);
+                    }
                     Ok(SemanticExpr {
                         ty: SemanticType::Bool,
                         kind: SemanticExprKind::Binary {

@@ -8435,6 +8435,183 @@ mod determinism_tests {
         assert_deterministic_with_expected(&module, 13);
     }
 
+    // ── Stage probes — Ptr-across-Call mutation/read ────────────────────────
+    //
+    // Empirical check: does a struct pointer passed as an IrInst::Call argument
+    // let the callee mutate / read through it across the function boundary?
+    // No existing JIT test exercises this — these are the first.
+    //
+    // Composed from the struct alloca/PtrOffset/Store/Load scaffold above
+    // (jit_determinism_struct_two_fields_write_and_read,
+    // jit_determinism_struct_field_isolation) plus the cross-function IrInst::Call
+    // pattern from jit_determinism_call_with_args. No new IR shapes invented.
+
+    #[test]
+    fn jit_probe_ptr_arg_mutation_across_call() {
+        // set_field(p: Ptr) {                  (void)
+        //   bb0(p):
+        //     v1 = const i32 42
+        //     store(p, v1)                     // write through caller's pointer
+        //     return
+        // }
+        //
+        // main() -> I32 {
+        //   bb0:
+        //     v0 = alloca size=4 align=4       // one-field I32 struct
+        //     v1 = const i32 0
+        //     store(v0, v1)                    // field[0] = 0
+        //     call set_field(v0)               // void; mutate via Ptr arg
+        //     v2 = load i32 v0                 // read field[0] after call
+        //     return v2                        // expect 42 if write-through-Ptr visible
+        // }
+        let module = IrModule {
+            debug_name: "probe_ptr_arg_mutation".to_string(),
+            functions: vec![
+                IrFunction {
+                    name: "set_field".to_string(),
+                    params: vec![IrParam { name: "p".to_string(), ty: IrType::Ptr }],
+                    return_ty: None,
+                    blocks: vec![IrBlock {
+                        id: BlockId(0),
+                        params: vec![BlockParam {
+                            value: ValueId(0),
+                            ty: IrType::Ptr,
+                            read_only: true,
+                        }],
+                        insts: vec![
+                            IrInst::ConstInt {
+                                dst: ValueId(1),
+                                ty: IrType::I32,
+                                value: 42,
+                            },
+                            IrInst::Store {
+                                ptr: ValueId(0),
+                                value: ValueId(1),
+                            },
+                        ],
+                        term: IrTerminator::Return { value: None },
+                    }],
+                },
+                IrFunction {
+                    name: "main".to_string(),
+                    params: vec![],
+                    return_ty: Some(IrType::I32),
+                    blocks: vec![IrBlock {
+                        id: BlockId(0),
+                        params: vec![],
+                        insts: vec![
+                            IrInst::Alloca {
+                                dst: ValueId(0),
+                                size: 4,
+                                align: 4,
+                            },
+                            IrInst::ConstInt {
+                                dst: ValueId(1),
+                                ty: IrType::I32,
+                                value: 0,
+                            },
+                            IrInst::Store {
+                                ptr: ValueId(0),
+                                value: ValueId(1),
+                            },
+                            IrInst::Call {
+                                dst: None,
+                                callee: "set_field".to_string(),
+                                args: vec![ValueId(0)],
+                                return_ty: None,
+                            },
+                            IrInst::Load {
+                                dst: ValueId(2),
+                                ty: IrType::I32,
+                                ptr: ValueId(0),
+                            },
+                        ],
+                        term: IrTerminator::Return { value: Some(ValueId(2)) },
+                    }],
+                },
+            ],
+        };
+        assert_deterministic_with_expected(&module, 42);
+    }
+
+    #[test]
+    fn jit_probe_ptr_arg_read_across_call() {
+        // Isolates Ptr-in + read-across-boundary from the write-back-visibility
+        // question of the mutation probe above.
+        //
+        // get_field(p: Ptr) -> I32 {
+        //   bb0(p):
+        //     v1 = load i32 p
+        //     return v1
+        // }
+        //
+        // main() -> I32 {
+        //   bb0:
+        //     v0 = alloca size=4 align=4
+        //     v1 = const i32 7
+        //     store(v0, v1)                    // field[0] = 7
+        //     v2 = call get_field(v0) -> I32
+        //     return v2                         // expect 7
+        // }
+        let module = IrModule {
+            debug_name: "probe_ptr_arg_read".to_string(),
+            functions: vec![
+                IrFunction {
+                    name: "get_field".to_string(),
+                    params: vec![IrParam { name: "p".to_string(), ty: IrType::Ptr }],
+                    return_ty: Some(IrType::I32),
+                    blocks: vec![IrBlock {
+                        id: BlockId(0),
+                        params: vec![BlockParam {
+                            value: ValueId(0),
+                            ty: IrType::Ptr,
+                            read_only: true,
+                        }],
+                        insts: vec![IrInst::Load {
+                            dst: ValueId(1),
+                            ty: IrType::I32,
+                            ptr: ValueId(0),
+                        }],
+                        term: IrTerminator::Return { value: Some(ValueId(1)) },
+                    }],
+                },
+                IrFunction {
+                    name: "main".to_string(),
+                    params: vec![],
+                    return_ty: Some(IrType::I32),
+                    blocks: vec![IrBlock {
+                        id: BlockId(0),
+                        params: vec![],
+                        insts: vec![
+                            IrInst::Alloca {
+                                dst: ValueId(0),
+                                size: 4,
+                                align: 4,
+                            },
+                            IrInst::ConstInt {
+                                dst: ValueId(1),
+                                ty: IrType::I32,
+                                value: 7,
+                            },
+                            IrInst::Store {
+                                ptr: ValueId(0),
+                                value: ValueId(1),
+                            },
+                            IrInst::Call {
+                                dst: Some(ValueId(2)),
+                                callee: "get_field".to_string(),
+                                args: vec![ValueId(0)],
+                                return_ty: Some(IrType::I32),
+                            },
+                        ],
+                        term: IrTerminator::Return { value: Some(ValueId(2)) },
+                    }],
+                },
+            ],
+        };
+        assert_deterministic_with_expected(&module, 7);
+    }
+
     // ── CompoundAssign Var-target (CX-215/CX-188) ────────────────────────────
     //
     // CompoundAssign on a variable target lowers to:

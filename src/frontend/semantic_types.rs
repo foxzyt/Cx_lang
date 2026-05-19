@@ -127,6 +127,8 @@ pub enum SemanticExprKind {
         instance: String,
         method: String,
         args: Vec<SemanticCallArg>,
+        instance_binding: BindingId,
+        struct_name: String,
         pos: usize,
     },
     StructInstance {
@@ -378,6 +380,7 @@ ExprStmt {
         name: String,
         aliases: Vec<(String, SemanticType)>,
         methods: Vec<SemanticFunction>,
+        method_alias_params: Vec<Vec<SemanticParam>>,
         pos: usize,
     },
     ConstDecl {

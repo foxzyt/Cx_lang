@@ -745,7 +745,7 @@ impl RunTime {
                 let result = self.run_semantic_when(val, arms)?;
                 Ok(result)
             }
-            SemanticExprKind::MethodCall { instance, method, args, pos } => {
+            SemanticExprKind::MethodCall { instance, method, args, pos, .. } => {
                 self.call_semantic_method(instance, method, args, *pos)
             }
             SemanticExprKind::Range { .. } => Ok(Value::Num(0)), // stub

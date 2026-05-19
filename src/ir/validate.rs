@@ -124,7 +124,7 @@ fn is_reserved_runtime_intrinsic(name: &str) -> bool {
     matches!(
         name,
         "print" | "println" | "printn" | "read" | "input"
-            | "assert" | "assert_eq" | "is_known"
+            | "assert" | "assert_eq" | "is_known" | "cx_printn"
     )
 }
 
@@ -149,6 +149,31 @@ fn validate_function(
             function: function.name.clone(),
         });
         return;
+    }
+
+    // Function-header storable-type checks.  Use the entry block's id for the
+    // InvalidTypeUsage error slot (the variant requires a block id, but these
+    // sites are function-scoped — the entry block is the closest meaningful
+    // anchor).  `function.return_ty == None` canonically encodes void and is
+    // intentionally allowed; only `Some(IrType::Void)` is rejected.
+    let entry_block_id = function.blocks[0].id;
+    for (i, param) in function.params.iter().enumerate() {
+        ensure_storable_type(
+            &param.ty,
+            function,
+            entry_block_id,
+            &format!("function parameter {} ('{}')", i, param.name),
+            errors,
+        );
+    }
+    if let Some(ret_ty) = &function.return_ty {
+        ensure_storable_type(
+            ret_ty,
+            function,
+            entry_block_id,
+            "function return_ty",
+            errors,
+        );
     }
 
     let mut block_ids = HashSet::new();
@@ -193,6 +218,13 @@ fn validate_function(
                     value: param.value,
                 });
             }
+            ensure_storable_type(
+                &param.ty,
+                function,
+                block.id,
+                "block parameter type",
+                errors,
+            );
             define_value(
                 function,
                 block.id,
@@ -292,6 +324,7 @@ fn validate_inst(
             );
         }
         IrInst::SsaBind { dst, ty, src } => {
+            ensure_storable_type(ty, function, block, "SsaBind destination type", errors);
             let src_ty = require_value(
                 function,
                 block,
@@ -455,6 +488,7 @@ fn validate_inst(
                     });
                     return;
                 };
+                ensure_storable_type(return_ty, function, block, "Call return_ty", errors);
                 define_value(
                     function,
                     block,
@@ -472,6 +506,7 @@ fn validate_inst(
             to,
             value,
         } => {
+            ensure_storable_type(to, function, block, "Cast destination type", errors);
             let value_ty = require_value(
                 function,
                 block,
@@ -526,13 +561,7 @@ fn validate_inst(
                     detail: "ArrayAlloca count must be > 0".to_string(),
                 });
             }
-            if matches!(element_type, IrType::Void) {
-                errors.push(IrValidationError::InvalidTypeUsage {
-                    function: function.name.clone(),
-                    block,
-                    detail: "ArrayAlloca element_type must be storable, got Void".to_string(),
-                });
-            }
+            ensure_storable_type(element_type, function, block, "ArrayAlloca element_type", errors);
             define_value(function, block, *dst, IrType::Ptr, "ArrayAlloca destination", defined_values, errors);
         }
         IrInst::PtrOffset { dst, base, .. } => {
@@ -572,6 +601,7 @@ fn validate_inst(
             define_value(function, block, *dst, IrType::Ptr, "PtrAdd destination", defined_values, errors);
         }
         IrInst::Load { dst, ty, ptr } => {
+            ensure_storable_type(ty, function, block, "Load destination type", errors);
             require_value(function, block, *ptr, "Load ptr", defined_values, errors);
             if let Some(ptr_ty) = defined_values.get(ptr) {
                 if *ptr_ty != IrType::Ptr {
@@ -727,6 +757,33 @@ fn define_value(
             function: function.name.clone(),
             value,
             context: context.to_string(),
+        });
+    }
+}
+
+/// Reject `IrType::Void` in storable positions.
+///
+/// `IrType::Void` is not a storable type: it cannot back a parameter, block
+/// param, SSA value, or any slot that holds a runtime value.  It is only
+/// legitimate in *return-position*, where `IrFunction::return_ty` /
+/// `IrInst::Call::return_ty` use `Option<IrType>` and `None` canonically
+/// encodes "no return value" — `Some(IrType::Void)` is an invariant violation.
+///
+/// Callers extract the bare `IrType` (unwrapping `Option<IrType>` themselves
+/// when needed) and invoke this helper at every storable slot.  Emits
+/// `IrValidationError::InvalidTypeUsage` matching the existing variant shape.
+fn ensure_storable_type(
+    ty: &IrType,
+    function: &IrFunction,
+    block: BlockId,
+    context: &str,
+    errors: &mut Vec<IrValidationError>,
+) {
+    if matches!(ty, IrType::Void) {
+        errors.push(IrValidationError::InvalidTypeUsage {
+            function: function.name.clone(),
+            block,
+            detail: format!("{context} must be a storable type, got Void"),
         });
     }
 }
@@ -1600,9 +1657,203 @@ mod tests {
         )));
     }
 
+    // cx_printn is pre-seeded in `known_intrinsic_sigs` as an IR-level runtime
+    // intrinsic; the reserved-name gate must reject user-defined functions of
+    // that name so they cannot overwrite the seeded signature in `function_sigs`
+    // and corrupt validation of intrinsic calls.
+    #[test]
+    fn rejects_function_named_cx_printn() {
+        let errors = validate_module(&single_block_function("cx_printn"))
+            .expect_err("validator should reject function named 'cx_printn'");
+        assert!(errors.iter().any(|err| matches!(
+            err,
+            IrValidationError::ReservedRuntimeIntrinsicName { function, .. }
+                if function == "cx_printn"
+        )));
+    }
+
     #[test]
     fn accepts_function_with_non_reserved_name() {
         assert_eq!(validate_module(&single_block_function("my_func")), Ok(()));
+    }
+
+    // ---------------------------------------------------------------------------
+    // Storable-type guard tests (`ensure_storable_type`)
+    //
+    // `IrType::Void` is rejected at every storable position; `None` in
+    // `IrFunction::return_ty` remains the canonical "void return" encoding and
+    // must continue to validate.
+    // ---------------------------------------------------------------------------
+
+    fn assert_void_storable_error(errors: &[IrValidationError], substring: &str) {
+        assert!(
+            errors.iter().any(|err| matches!(
+                err,
+                IrValidationError::InvalidTypeUsage { detail, .. }
+                    if detail.contains(substring) && detail.contains("got Void")
+            )),
+            "expected InvalidTypeUsage containing '{}' and 'got Void', got: {:?}",
+            substring,
+            errors
+        );
+    }
+
+    #[test]
+    fn rejects_void_function_param_type() {
+        let module = IrModule {
+            debug_name: "m".to_string(),
+            functions: vec![IrFunction {
+                name: "f".to_string(),
+                params: vec![IrParam { name: "x".to_string(), ty: IrType::Void }],
+                return_ty: None,
+                blocks: vec![IrBlock {
+                    id: BlockId(0),
+                    params: vec![],
+                    insts: vec![],
+                    term: IrTerminator::Return { value: None },
+                }],
+            }],
+        };
+        let errors = validate_module(&module)
+            .expect_err("validator must reject Void function parameter type");
+        assert_void_storable_error(&errors, "function parameter");
+    }
+
+    #[test]
+    fn rejects_void_function_return_ty() {
+        let module = IrModule {
+            debug_name: "m".to_string(),
+            functions: vec![IrFunction {
+                name: "f".to_string(),
+                params: vec![],
+                return_ty: Some(IrType::Void),
+                blocks: vec![IrBlock {
+                    id: BlockId(0),
+                    params: vec![],
+                    insts: vec![],
+                    term: IrTerminator::Return { value: None },
+                }],
+            }],
+        };
+        let errors = validate_module(&module)
+            .expect_err("validator must reject Some(IrType::Void) return type — canonical void is None");
+        assert_void_storable_error(&errors, "function return_ty");
+    }
+
+    #[test]
+    fn accepts_none_function_return_ty_as_canonical_void() {
+        // None is the canonical encoding for "no return value" (void) and must
+        // continue to validate — the new guard only rejects Some(IrType::Void).
+        let module = IrModule {
+            debug_name: "m".to_string(),
+            functions: vec![IrFunction {
+                name: "f".to_string(),
+                params: vec![],
+                return_ty: None,
+                blocks: vec![IrBlock {
+                    id: BlockId(0),
+                    params: vec![],
+                    insts: vec![],
+                    term: IrTerminator::Return { value: None },
+                }],
+            }],
+        };
+        assert_eq!(validate_module(&module), Ok(()));
+    }
+
+    #[test]
+    fn rejects_void_block_param_type() {
+        let module = IrModule {
+            debug_name: "m".to_string(),
+            functions: vec![IrFunction {
+                name: "f".to_string(),
+                params: vec![],
+                return_ty: None,
+                blocks: vec![IrBlock {
+                    id: BlockId(0),
+                    params: vec![BlockParam {
+                        value: ValueId(0),
+                        ty: IrType::Void,
+                        read_only: false,
+                    }],
+                    insts: vec![],
+                    term: IrTerminator::Return { value: None },
+                }],
+            }],
+        };
+        let errors = validate_module(&module)
+            .expect_err("validator must reject Void block parameter type");
+        assert_void_storable_error(&errors, "block parameter type");
+    }
+
+    #[test]
+    fn rejects_void_ssabind_destination_type() {
+        // Construct an SsaBind whose declared destination type is Void.  The
+        // source value's type would never legitimately be Void either, but the
+        // helper at the destination slot catches the declaration directly.
+        let module = int_main(
+            vec![
+                IrInst::ConstInt { dst: ValueId(0), ty: IrType::I64, value: 0 },
+                IrInst::SsaBind { dst: ValueId(1), ty: IrType::Void, src: ValueId(0) },
+            ],
+            IrTerminator::Return { value: None },
+        );
+        let errors = validate_module(&module)
+            .expect_err("validator must reject Void SsaBind destination type");
+        assert_void_storable_error(&errors, "SsaBind destination type");
+    }
+
+    #[test]
+    fn rejects_void_load_destination_type() {
+        // A Load that declares its result type as Void violates the storable
+        // invariant — Void can never back a runtime value.
+        let module = int_main(
+            vec![
+                IrInst::Alloca { dst: ValueId(0), size: 8, align: 8 },
+                IrInst::Load { dst: ValueId(1), ty: IrType::Void, ptr: ValueId(0) },
+            ],
+            IrTerminator::Return { value: None },
+        );
+        let errors = validate_module(&module)
+            .expect_err("validator must reject Void Load destination type");
+        assert_void_storable_error(&errors, "Load destination type");
+    }
+
+    #[test]
+    fn rejects_void_cast_destination_type() {
+        let module = int_main(
+            vec![
+                IrInst::ConstInt { dst: ValueId(0), ty: IrType::I32, value: 1 },
+                IrInst::Cast {
+                    dst: ValueId(1),
+                    from: IrType::I32,
+                    to: IrType::Void,
+                    value: ValueId(0),
+                },
+            ],
+            IrTerminator::Return { value: None },
+        );
+        let errors = validate_module(&module)
+            .expect_err("validator must reject Void Cast destination type");
+        assert_void_storable_error(&errors, "Cast destination type");
+    }
+
+    #[test]
+    fn rejects_void_array_alloca_element_type_via_helper() {
+        // Regression-check: the inline Void guard at the ArrayAlloca site was
+        // replaced with a call to `ensure_storable_type`; behavior must be
+        // preserved (Void element_type still rejected).
+        let module = int_main(
+            vec![IrInst::ArrayAlloca {
+                dst: ValueId(0),
+                element_type: IrType::Void,
+                count: 4,
+            }],
+            IrTerminator::Return { value: None },
+        );
+        let errors = validate_module(&module)
+            .expect_err("validator must continue to reject Void ArrayAlloca element_type");
+        assert_void_storable_error(&errors, "ArrayAlloca element_type");
     }
 
     #[test]

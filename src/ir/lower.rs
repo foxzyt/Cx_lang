@@ -109,6 +109,11 @@ struct FunctionSignature {
     return_ty: Option<IrType>,
 }
 
+/// Mangled IR name for an impl-block method: `<FirstAliasStruct>$<method>`.
+fn mangle_method(struct_name: &str, method: &str) -> String {
+    format!("{}${}", struct_name, method)
+}
+
 fn build_signature_table(program: &SemanticProgram) -> HashMap<String, FunctionSignature> {
     let mut table = HashMap::new();
     for stmt in &program.stmts {
@@ -133,11 +138,8 @@ fn build_signature_table(program: &SemanticProgram) -> HashMap<String, FunctionS
             if !all_params_ok { continue; }
 
             let return_ty = match &function.return_ty {
-                Some(ty) => match lower_type(ty) {
-                    // IrType::Void in return position is canonicalised to None
-                    // (the IR uses Option<IrType> where None = void).
-                    Ok(IrType::Void) => None,
-                    Ok(ir_ty) => Some(ir_ty),
+                Some(ty) => match lower_return_type(ty) {
+                    Ok(opt) => opt,
                     Err(_) => continue,
                 },
                 None => None,
@@ -147,6 +149,73 @@ fn build_signature_table(program: &SemanticProgram) -> HashMap<String, FunctionS
                 param_types,
                 return_ty,
             });
+        }
+        // Impl-block methods are registered alongside free functions so calls
+        // (after Stage 2 desugaring) resolve through the same signature_table
+        // lookup. Mangled key: `<FirstAliasStruct>$<method>`. The receiver and
+        // any extra aliases are prepended to the user params, mirroring the
+        // IrFunction shape emitted in lower_program_inner.
+        if let SemanticStmt::ImplBlock { aliases, methods, method_alias_params, .. } = stmt {
+            if aliases.is_empty() { continue; }
+            let tn = match &aliases[0].1 {
+                SemanticType::Struct(name) => name.clone(),
+                _ => continue,
+            };
+            for (i, method) in methods.iter().enumerate() {
+                let mut param_types = Vec::new();
+                let mut all_params_ok = true;
+                // Alias params first (each is a struct → Ptr).
+                if let Some(alias_params) = method_alias_params.get(i) {
+                    for param in alias_params {
+                        match param.kind {
+                            SemanticParamKind::Typed => {
+                                let Some(ref ty) = param.ty else {
+                                    all_params_ok = false;
+                                    break;
+                                };
+                                match lower_type(ty) {
+                                    Ok(ir_ty) => param_types.push(ir_ty),
+                                    Err(_) => { all_params_ok = false; break; }
+                                }
+                            }
+                            _ => { all_params_ok = false; break; }
+                        }
+                    }
+                } else {
+                    all_params_ok = false;
+                }
+                if !all_params_ok { continue; }
+                // Then the user-declared params.
+                for param in &method.params {
+                    match param.kind {
+                        SemanticParamKind::Typed => {
+                            let Some(ref ty) = param.ty else {
+                                all_params_ok = false;
+                                break;
+                            };
+                            match lower_type(ty) {
+                                Ok(ir_ty) => param_types.push(ir_ty),
+                                Err(_) => { all_params_ok = false; break; }
+                            }
+                        }
+                        _ => { all_params_ok = false; break; }
+                    }
+                }
+                if !all_params_ok { continue; }
+
+                let return_ty = match &method.return_ty {
+                    Some(ty) => match lower_return_type(ty) {
+                        Ok(opt) => opt,
+                        Err(_) => continue,
+                    },
+                    None => None,
+                };
+
+                table.insert(
+                    mangle_method(&tn, &method.name),
+                    FunctionSignature { param_types, return_ty },
+                );
+            }
         }
     }
     table
@@ -403,6 +472,49 @@ fn lower_program_inner(program: &SemanticProgram, trace: bool) -> Result<IrModul
             // executable semantics and produce no IR, so skip them here rather
             // than routing them into the synthetic-main statement sequence.
             SemanticStmt::StructDef { .. } => {}
+            // Impl-block methods are emitted as IrFunctions under mangled names.
+            // The captured `method_alias_params` carry the BindingIds the body's
+            // VarRef/DotAccess nodes reference, so re-prepending them lets
+            // lower_semantic_function's bindings map resolve receiver access.
+            // The ImplBlock statement itself produces no IR — handled below in
+            // lower_stmt; this arm just keeps it out of the synthetic-main
+            // statement sequence.
+            SemanticStmt::ImplBlock { aliases, methods, method_alias_params, .. } => {
+                if aliases.is_empty() { continue; }
+                let tn = match &aliases[0].1 {
+                    SemanticType::Struct(name) => name.clone(),
+                    _ => continue,
+                };
+                for (i, method) in methods.iter().enumerate() {
+                    let mangled = mangle_method(&tn, &method.name);
+                    if reserved_runtime_intrinsics.contains(mangled.as_str()) {
+                        return Err(LoweringError::UnsupportedSemanticConstruct {
+                            construct: format!(
+                                "function name '{}' is reserved for runtime intrinsics",
+                                mangled
+                            ),
+                        });
+                    }
+                    let alias_params = match method_alias_params.get(i) {
+                        Some(ap) => ap.clone(),
+                        None => continue,
+                    };
+                    let mut full_params = alias_params;
+                    full_params.extend(method.params.iter().cloned());
+                    let reconstructed = crate::frontend::semantic_types::SemanticFunction {
+                        id: method.id,
+                        name: mangled,
+                        type_params: method.type_params.clone(),
+                        params: full_params,
+                        return_ty: method.return_ty.clone(),
+                        body: method.body.clone(),
+                        ret_expr: method.ret_expr.clone(),
+                        is_test: method.is_test,
+                        pos: method.pos,
+                    };
+                    module.functions.push(lower_semantic_function(&reconstructed, &signature_table, &struct_table, trace, target)?);
+                }
+            }
             other => top_level_stmts.push(other),
         }
     }
@@ -458,14 +570,9 @@ fn lower_semantic_function(
     let mut ir_params = Vec::with_capacity(function.params.len());
     let mut block_params = Vec::with_capacity(function.params.len());
     let mut bindings = HashMap::new();
-    let return_ty = {
-        let raw = function.return_ty.as_ref().map(lower_type).transpose()?;
-        // Canonicalise: IrType::Void in return position is equivalent to no return value.
-        // IrFunction::return_ty uses Option<IrType> where None already encodes void.
-        match raw {
-            Some(IrType::Void) => None,
-            other => other,
-        }
+    let return_ty = match &function.return_ty {
+        Some(ty) => lower_return_type(ty)?,
+        None => None,
     };
 
     let mut ctx = LoweringCtx::new(signature_table.clone(), struct_table.clone(), trace, target);
@@ -707,6 +814,31 @@ fn lower_stmt(
                 if let Some((None, param_types)) = sig_info {
                     let callee = callee.clone();
                     lower_void_call(&callee, args, &param_types, ctx, &mut current)?;
+                    return Ok(Some(current));
+                }
+            }
+            // Same void-call detection for MethodCall: build the synthetic
+            // receiver-as-arg list (Stage 1 IR param order is
+            // [receiver, extra_aliases..., user_params...]) and route through
+            // lower_void_call so the receiver lowers through the existing
+            // VarRef→Ptr path. Mirrors the Call arm above; same fall-through
+            // to lower_expr for non-void.
+            if let SemanticExprKind::MethodCall { instance, method, args, instance_binding, struct_name, .. } = &expr.kind {
+                let recv_arg = SemanticCallArg::Expr(SemanticExpr {
+                    ty: SemanticType::Struct(struct_name.clone()),
+                    kind: SemanticExprKind::VarRef {
+                        binding: *instance_binding,
+                        name: instance.clone(),
+                    },
+                });
+                let mut full_args = Vec::with_capacity(args.len() + 1);
+                full_args.push(recv_arg);
+                full_args.extend(args.iter().cloned());
+                let callee = mangle_method(struct_name, method);
+                let sig_info = ctx.signature_table.get(callee.as_str())
+                    .map(|s| (s.return_ty.clone(), s.param_types.clone()));
+                if let Some((None, param_types)) = sig_info {
+                    lower_void_call(&callee, &full_args, &param_types, ctx, &mut current)?;
                     return Ok(Some(current));
                 }
             }
@@ -957,7 +1089,12 @@ SemanticStmt::Block { .. } => { unsupported!("Block") },
         // Struct definitions are pre-processed into the struct_table before
         // lowering begins; there is no IR to emit for the definition itself.
         SemanticStmt::StructDef { .. } => Ok(Some(current)),
-        SemanticStmt::ImplBlock { .. } => { unsupported!("ImplBlock") },
+        // Methods are emitted as IrFunctions in lower_program_inner; the
+        // ImplBlock statement itself carries no executable IR. This arm is
+        // defense-in-depth in case an ImplBlock reaches statement lowering by
+        // any path (it currently does not — lower_program_inner filters it out
+        // of the synthetic-main statement sequence).
+        SemanticStmt::ImplBlock { .. } => Ok(Some(current)),
         SemanticStmt::ConstDecl { .. } => { unsupported!("ConstDecl") },
     }
 }
@@ -1796,10 +1933,34 @@ fn lower_expr(
         SemanticExprKind::Index { target, index, .. } => {
             lower_index(target, index, &expr.ty, ctx, active)
         }
-        SemanticExprKind::MethodCall { instance, method, .. } => {
-            Err(LoweringError::UnsupportedSemanticConstruct {
-                construct: format!("MethodCall '{}.{}'", instance, method),
-            })
+        SemanticExprKind::MethodCall { instance, method, args, instance_binding, struct_name, pos: _ } => {
+            // Synthesize an equivalent Call and recurse into the existing Call
+            // arm (which has the proven signature_table lookup, void-in-value-
+            // position rejection, arity check, per-arg ensure_type_match, and
+            // IrInst::Call emission). The synthetic receiver arg is a VarRef
+            // that lowers to the receiver's Ptr SSA via the existing VarRef
+            // arm. Arg order matches Stage 1's IrFunction param order
+            // [receiver, extra_aliases..., user_params...].
+            let recv_arg = SemanticCallArg::Expr(SemanticExpr {
+                ty: SemanticType::Struct(struct_name.clone()),
+                kind: SemanticExprKind::VarRef {
+                    binding: *instance_binding,
+                    name: instance.clone(),
+                },
+            });
+            let mut full_args = Vec::with_capacity(args.len() + 1);
+            full_args.push(recv_arg);
+            full_args.extend(args.iter().cloned());
+            let callee = mangle_method(struct_name, method);
+            let synthetic = SemanticExpr {
+                ty: expr.ty.clone(),
+                kind: SemanticExprKind::Call {
+                    callee,
+                    function: crate::frontend::semantic_types::FunctionId(u32::MAX),
+                    args: full_args,
+                },
+            };
+            lower_expr(&synthetic, ctx, active)
         }
         // Struct literal lowering strategy
         //
@@ -2652,10 +2813,27 @@ fn lower_type(ty: &SemanticType) -> Result<IrType, LoweringError> {
         SemanticType::Struct(_) => Ok(IrType::Ptr),
         SemanticType::Array(_, _) => Ok(IrType::Ptr),
         SemanticType::Result(_) => { unsupported_type!("Result") },
-        // Void is a first-class IR type used to represent the absence of a return value.
-        // Callers that use lower_type for return-type lowering must canonicalise
-        // Some(IrType::Void) to None before placing it in IrFunction::return_ty.
-        SemanticType::Void => Ok(IrType::Void),
+        // Void is not a storable type — it is only valid in return position,
+        // where `lower_return_type` canonicalises it to `None`.  Letting Void
+        // leak into params, block params, locals, or SSA values would violate
+        // the non-storable-void invariant.
+        SemanticType::Void => Err(LoweringError::InternalInvariantViolation {
+            detail: "SemanticType::Void is not storable; use lower_return_type for return-type slots".to_string(),
+        }),
+    }
+}
+
+/// Lower a return-type slot.  `SemanticType::Void` canonicalises to `None`
+/// (the absence of a return value); all other types delegate to `lower_type`.
+///
+/// This is the **only** path that may legitimately accept `SemanticType::Void`.
+/// `IrFunction::return_ty` and `FunctionSignature::return_ty` are
+/// `Option<IrType>` where `None` already encodes void; `IrType::Void` must
+/// never appear in either slot.
+fn lower_return_type(ty: &SemanticType) -> Result<Option<IrType>, LoweringError> {
+    match ty {
+        SemanticType::Void => Ok(None),
+        _ => Ok(Some(lower_type(ty)?)),
     }
 }
 
@@ -5540,13 +5718,27 @@ mod tests {
         assert_eq!(result, Ok(IrType::Ptr));
     }
 
-    // lower_type must map SemanticType::Void to IrType::Void (not an error).
-    // Callers (lower_semantic_function, build_signature_table) canonicalise
-    // Some(IrType::Void) → None before it enters IrFunction::return_ty.
+    // lower_type must reject SemanticType::Void: Void is not storable and must
+    // not leak into params, block params, locals, or SSA values.  The only
+    // legitimate Void→IR path is `lower_return_type`, which canonicalises Void
+    // to `None` for `IrFunction::return_ty`.
     #[test]
-    fn lower_type_void_maps_to_irtype_void() {
+    fn lower_type_rejects_void_in_storable_position() {
         let result = lower_type(&SemanticType::Void);
-        assert_eq!(result, Ok(IrType::Void));
+        assert!(
+            matches!(result, Err(LoweringError::InternalInvariantViolation { .. })),
+            "lower_type(Void) must error in storable position, got {:?}",
+            result
+        );
+    }
+
+    // lower_return_type must canonicalise SemanticType::Void to None.
+    // Non-Void types delegate to lower_type and are wrapped in Some.
+    #[test]
+    fn lower_return_type_void_canonicalises_to_none() {
+        assert_eq!(lower_return_type(&SemanticType::Void), Ok(None));
+        assert_eq!(lower_return_type(&SemanticType::I64), Ok(Some(IrType::I64)));
+        assert_eq!(lower_return_type(&SemanticType::Bool), Ok(Some(IrType::Bool)));
     }
 
     // A user-defined void-return function (SemanticType::Void return type)
@@ -5892,6 +6084,8 @@ mod tests {
                         instance: "obj".to_string(),
                         method: "foo".to_string(),
                         args: vec![],
+                        instance_binding: BindingId(u32::MAX),
+                        struct_name: String::new(),
                         pos: 0,
                     },
                 },
