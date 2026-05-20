@@ -275,6 +275,19 @@ extern "C" fn cx_printn(n: i64) {
     let _ = writeln!(stdout, "{n}");
 }
 
+/// Runtime intrinsic: print a Bool to stdout as "true"/"false" followed by a newline.
+///
+/// Exported as `cx_print_bool` in the JIT symbol table. JIT-compiled Cx code calls
+/// this via `IrInst::Call { callee: "cx_print_bool", args: [i8_value] }` for any
+/// Bool argument to print/println/printn. The text formatting matches the
+/// interpreter's `print_value` behavior for Bool so JIT and interpreter stdout
+/// converge on Bool printing.
+extern "C" fn cx_print_bool(b: i8) {
+    use std::io::{self, Write};
+    let mut stdout = io::stdout().lock();
+    let _ = writeln!(stdout, "{}", if b != 0 { "true" } else { "false" });
+}
+
 /// Backend-private symbol name for the F64 remainder host helper.
 ///
 /// Using a mangled name (double-underscore prefix) keeps it out of the user-visible namespace.
@@ -340,6 +353,7 @@ impl HostBoundary {
         let mut jit_builder =
             JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
         jit_builder.symbol("cx_printn", cx_printn as *const u8);
+        jit_builder.symbol("cx_print_bool", cx_print_bool as *const u8);
         jit_builder.symbol(JIT_F64_REM_SYMBOL, host_fmod as *const u8);
         let mut module = JITModule::new(jit_builder);
 
@@ -360,6 +374,22 @@ impl HostBoundary {
                     detail: e.to_string(),
                 })?;
             func_id_map.insert("cx_printn".to_string(), id);
+        }
+
+        // cx_print_bool(i8) — Bool routes here so the JIT emits "true"/"false"
+        // matching the interpreter's print_value formatting. Bool lowers to
+        // cranelift types::I8 per ir_type_to_cranelift (src/backend/cranelift/mod.rs:83).
+        {
+            use cranelift_codegen::ir::AbiParam;
+            let call_conv = module.target_config().default_call_conv;
+            let mut sig = cranelift_codegen::ir::Signature::new(call_conv);
+            sig.params.push(AbiParam::new(cranelift_codegen::ir::types::I8));
+            let id = module
+                .declare_function("cx_print_bool", Linkage::Import, &sig)
+                .map_err(|e| JitExecutionError::CodegenFailure {
+                    detail: e.to_string(),
+                })?;
+            func_id_map.insert("cx_print_bool".to_string(), id);
         }
 
         // Pre-declare __cx_fmod(f64, f64) -> f64 for F64 Rem lowering.

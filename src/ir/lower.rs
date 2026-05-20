@@ -2873,13 +2873,51 @@ fn ensure_type_match(context: &str, expected: IrType, got: IrType) -> Result<(),
 // Unsupported types (e.g. Ptr, F64, StrRef) produce a structured
 // UnsupportedSemanticConstruct error so the caller gets a clear diagnostic.
 
+/// Route a print argument to the appropriate runtime intrinsic.
+///
+/// Returns the SSA value to pass and the callee name to invoke:
+///   - I64 passes through directly to `cx_printn`
+///   - I8/I16/I32 sign-extend to I64 via `IrInst::Cast` and call `cx_printn`
+///   - Bool/TBool pass through unmodified to `cx_print_bool` (formats true/false
+///     to match the interpreter's `print_value` Bool behavior; convergent stdout)
+///   - F64, I128, Ptr, Str, and composites are not yet supported — returns None,
+///     the caller emits a structured error.
+///
+/// This is the single edit point for adding more (callee, value) routing
+/// branches when post-0.1 work adds f64/string/composite print intrinsics.
+fn route_print_arg(
+    value: ValueId,
+    value_ty: IrType,
+    ctx: &mut LoweringCtx,
+    current: &mut ActiveBlock,
+) -> Result<Option<(ValueId, &'static str)>, LoweringError> {
+    match value_ty {
+        IrType::I64 => Ok(Some((value, "cx_printn"))),
+        IrType::I8 | IrType::I16 | IrType::I32 => {
+            let dst = ctx.fresh_value();
+            current.emit(IrInst::Cast {
+                dst,
+                from: value_ty.clone(),
+                to: IrType::I64,
+                value,
+            })?;
+            Ok(Some((dst, "cx_printn")))
+        }
+        IrType::Bool | IrType::TBool => Ok(Some((value, "cx_print_bool"))),
+        _ => Ok(None),
+    }
+}
+
 /// Lower `printn(n)` to `IrInst::Call { callee: "cx_printn", args: [i64_value] }`.
 ///
 /// `printn` is a Cx builtin that prints an integer to stdout.  At the IR level
 /// it lowers to a call to the `cx_printn` runtime intrinsic, which is pre-declared
 /// in the JIT module as an imported C-ABI symbol.
 ///
-/// Only `I64` arguments are accepted; other types produce a structured error.
+/// Narrow integer widths (I8/I16/I32) and Bool/TBool are widened to I64 at the
+/// boundary via `widen_to_i64_for_print` (mirrors the semantic-phase narrowing
+/// idiom for typed sinks).  F64, I128, Ptr, Str, and composite types produce a
+/// structured error.
 fn lower_printn_stmt(
     args: &[SemanticCallArg],
     ctx: &mut LoweringCtx,
@@ -2899,18 +2937,17 @@ fn lower_printn_stmt(
         }
     };
     let arg = lower_expr(arg_expr, ctx, &mut current)?;
-    if arg.ty != IrType::I64 {
-        return Err(LoweringError::UnsupportedSemanticConstruct {
+    let (routed_value, callee) = route_print_arg(arg.value, arg.ty.clone(), ctx, &mut current)?
+        .ok_or_else(|| LoweringError::UnsupportedSemanticConstruct {
             construct: format!(
-                "printn argument must be I64, got {:?} — other types not yet supported",
+                "printn argument must be a numeric integer (I8/I16/I32/I64) or Bool, got {:?} — F64, I128, Str, and composite types not yet supported",
                 arg.ty
             ),
-        });
-    }
+        })?;
     current.emit(IrInst::Call {
         dst: None,
-        callee: "cx_printn".to_string(),
-        args: vec![arg.value],
+        callee: callee.to_string(),
+        args: vec![routed_value],
         return_ty: None,
     })?;
     Ok(Some(current))
@@ -2918,10 +2955,10 @@ fn lower_printn_stmt(
 
 /// Lower `print(n)` or `println(n)` to `IrInst::Call { callee: "cx_printn", args: [i64_value] }`.
 ///
-/// Both `print` and `println` in Cx print a value followed by a newline.  For I64
-/// arguments this maps to the `cx_printn` runtime intrinsic which is already registered
-/// in the JIT symbol table.  Non-I64 arguments (e.g. strings) produce a structured
-/// error because string printing requires string ABI support not yet available.
+/// Both `print` and `println` in Cx print a value followed by a newline.  Narrow
+/// integer widths (I8/I16/I32) and Bool/TBool are widened to I64 at the boundary
+/// via `widen_to_i64_for_print`.  F64, I128, Ptr, Str, and composite types
+/// produce a structured error.
 fn lower_print_stmt(
     builtin_name: &str,
     args: &[SemanticCallArg],
@@ -2942,18 +2979,17 @@ fn lower_print_stmt(
         }
     };
     let arg = lower_expr(arg_expr, ctx, &mut current)?;
-    if arg.ty != IrType::I64 {
-        return Err(LoweringError::UnsupportedSemanticConstruct {
+    let (routed_value, callee) = route_print_arg(arg.value, arg.ty.clone(), ctx, &mut current)?
+        .ok_or_else(|| LoweringError::UnsupportedSemanticConstruct {
             construct: format!(
-                "{} argument must be I64, got {:?} — string and other types not yet supported",
+                "{} argument must be a numeric integer (I8/I16/I32/I64) or Bool, got {:?} — F64, I128, Str, and composite types not yet supported",
                 builtin_name, arg.ty
             ),
-        });
-    }
+        })?;
     current.emit(IrInst::Call {
         dst: None,
-        callee: "cx_printn".to_string(),
-        args: vec![arg.value],
+        callee: callee.to_string(),
+        args: vec![routed_value],
         return_ty: None,
     })?;
     Ok(Some(current))
@@ -6228,23 +6264,26 @@ mod tests {
     }
 
     #[test]
-    fn print_non_i64_arg_returns_unsupported_construct() {
-        // print with an I32 argument must return UnsupportedSemanticConstruct.
+    fn print_f64_arg_returns_unsupported_construct() {
+        // print with an F64 argument must return UnsupportedSemanticConstruct.
+        // Post-widening contract: I8/I16/I32 sign-extend to I64 via Cast and
+        // succeed; Bool/TBool route to cx_print_bool. F64, I128, Str, and
+        // composites are the still-unsupported set the lowering must reject.
         let program = SemanticProgram {
             stmts: vec![builtin_stmt(
                 "print",
-                vec![SemanticCallArg::Expr(int_expr(42, SemanticType::I32))],
+                vec![SemanticCallArg::Expr(float_expr(3.14))],
             )],
             enums: vec![],
         };
-        let err = lower_program(&program).expect_err("lowering should fail for non-I64 print arg");
+        let err = lower_program(&program).expect_err("lowering should fail for F64 print arg");
         assert!(
             matches!(
                 &err,
                 LoweringError::UnsupportedSemanticConstruct { construct }
-                if construct.contains("I64")
+                if construct.contains("F64")
             ),
-            "expected UnsupportedSemanticConstruct mentioning I64, got: {:?}",
+            "expected UnsupportedSemanticConstruct mentioning F64, got: {:?}",
             err
         );
     }
@@ -6280,23 +6319,25 @@ mod tests {
     }
 
     #[test]
-    fn printn_with_non_i64_arg_returns_error() {
-        // printn with an I32 argument must return UnsupportedSemanticConstruct.
+    fn printn_with_f64_arg_returns_error() {
+        // printn with an F64 argument must return UnsupportedSemanticConstruct.
+        // Post-widening contract: integers and Bool succeed via route_print_arg;
+        // F64 is in the still-unsupported set (no cx_print_f64 intrinsic yet).
         let program = SemanticProgram {
             stmts: vec![builtin_stmt(
                 "printn",
-                vec![SemanticCallArg::Expr(int_expr(42, SemanticType::I32))],
+                vec![SemanticCallArg::Expr(float_expr(3.14))],
             )],
             enums: vec![],
         };
-        let err = lower_program(&program).expect_err("lowering should fail for non-I64 printn arg");
+        let err = lower_program(&program).expect_err("lowering should fail for F64 printn arg");
         assert!(
             matches!(
                 &err,
                 LoweringError::UnsupportedSemanticConstruct { construct }
-                if construct.contains("I64")
+                if construct.contains("F64")
             ),
-            "expected UnsupportedSemanticConstruct mentioning I64, got: {:?}",
+            "expected UnsupportedSemanticConstruct mentioning F64, got: {:?}",
             err
         );
     }
