@@ -6068,9 +6068,12 @@ mod tests {
         assert!(lower_program(&program).is_err());
     }
 
-    // MethodCall produces a named structured error that includes both the
-    // instance name and the method name, rather than the generic "MethodCall"
-    // placeholder produced by the unsupported! macro.
+    // MethodCall with an empty struct_name (degenerate state — semantic phase
+    // couldn't resolve the instance's struct type) lowers via the post-H2
+    // synthetic-Call path: mangle_method("", "foo") = "$foo", which misses in
+    // signature_table and surfaces as a named UnresolvedSemanticArtifact whose
+    // artifact field carries the mangled callee. Regression-check that the
+    // error remains structured and named, not a generic placeholder.
     #[test]
     fn method_call_produces_named_structured_error() {
         let program = SemanticProgram {
@@ -6096,10 +6099,10 @@ mod tests {
         assert!(
             matches!(
                 &err,
-                LoweringError::UnsupportedSemanticConstruct { construct }
-                if construct.contains("obj") && construct.contains("foo")
+                LoweringError::UnresolvedSemanticArtifact { artifact }
+                if artifact.contains("$foo")
             ),
-            "expected named error mentioning instance and method, got: {:?}",
+            "expected UnresolvedSemanticArtifact carrying the mangled callee '$foo', got: {:?}",
             err
         );
     }
