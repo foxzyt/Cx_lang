@@ -119,7 +119,8 @@ pub struct WhenArm {
 #[derive(Debug, Clone)]
 pub enum AssignTarget {
     Var(String),
-    Field(String, String), // container_name, field_name
+    Field(String, String),          // container_name, field_name
+    Index(String, Box<Expr>),       // array_name, index_expr
 }
 
 #[derive(Debug, Clone)]
@@ -154,6 +155,7 @@ pub struct ImportDecl {
 pub enum Stmt {
     ImportBlock {
         imports: Vec<ImportDecl>,
+        #[allow(dead_code)] // source-position field preserved for future diagnostics
         pos: usize,
     },
     StructDef {
@@ -167,6 +169,7 @@ pub enum Stmt {
         name: String,
         aliases: Vec<(String, Type)>,
         methods: Vec<(String, Vec<ParamKind>, Option<Type>, Vec<Stmt>, Option<Expr>)>,
+        #[allow(dead_code)] // visibility tag preserved for future module-scope work
         is_pub: bool,
         pos: usize,
     },
