@@ -143,7 +143,7 @@ Items: 24 verified / 5 weak / 8 drifted / 0 not-done / 0 untested / 0 untracked 
 
 # Cx Project Roadmap — Living Summary
 
-Last updated: 2026-05-10
+Last updated: 2026-05-21
 
 This file is a concise synthesis of the project's roadmap state. Detailed roadmaps live at:
 - Frontend: `docs/frontend/ROADMAP.md` (v5.0)
@@ -199,7 +199,7 @@ The backend pipeline converts verified SemanticProgram → IR → machine output
   - [x] Runtime intrinsics dispatch — print family (CX-77/CX-82) <!-- audit: **VERIFIED** — same anchor as Phase 9.2 above; `cx_printn` seeded + reserved-name gate at `src/ir/validate.rs:123`. -->
 
 ### Active
-- [ ] Phase 11 — Surface area reduction (nearly complete) <!-- audit: **DRIFTED** — "nearly complete" is contradicted by the two open sub-items below being genuinely unfinished (see H2, H3 in header). Phase as a whole accurately marked `[ ]`. -->
+- [x] Phase 11 — Surface area reduction (complete) <!-- audit: **VERIFIED** — both previously-open sub-items now landed (H2 method-call lowering at 0ab7e9b; H3 when-block lowering at bed71c1, Option A). -->
   - [x] Compound assign <!-- audit: **VERIFIED** — CompoundAssign 6 PASS / 1 SKIP / 0 PARITY_FAIL (`docs/backend/cx_jit_parity_checklist.md` §3 line 141); fixtures t26, t128, t151–t153, t169. -->
   - [x] Unary expressions <!-- audit: **VERIFIED** — Unary 2 PASS / 1 SKIP / 0 PARITY_FAIL (checklist §3 line 142); fixtures t165, t166. README at `README.md:105` separately claims unary negation is "not yet JIT-lowered" — see Soft Blocker S2; that's a README issue, not a roadmap one. -->
   - [x] Struct literal lowering (CX-9) <!-- audit: **VERIFIED** — Struct category 6 PASS / 8 SKIP / 0 PARITY_FAIL (checklist §3 line 139). -->
@@ -213,15 +213,15 @@ The backend pipeline converts verified SemanticProgram → IR → machine output
   - [x] Array element writes (CX-20) <!-- audit: **VERIFIED** — `src/ir/lower.rs` Index-target compound assign (t147_array_write_exit, t153_compound_assign_index_exit in PASS list). -->
   - [x] MethodCall structured error (CX-21) <!-- audit: **VERIFIED** — `src/ir/lower.rs:1791` `SemanticExprKind::MethodCall { .. } => unsupported!("MethodCall '{}.{}'")`. -->
   - [x] Loop variable read-only invariant in validator (CX-40) <!-- audit: **VERIFIED** — `IrValidationError::LoopVariableReassignment` variant + enforcement at `src/ir/validate.rs::validate_target_args:818`; `rejects_compound_assign_equivalent_ssabind_reaching_read_only_param` test. -->
-  - [ ] Method call actual lowering (structured error only) <!-- audit: **VERIFIED** (still-open is accurate) — only path is `unsupported!("MethodCall '{}.{}'")` at `src/ir/lower.rs:1791`; no other MethodCall lowering exists. **Hard Blocker H2.** -->
-  - [ ] `when` block lowering or structured rejection <!-- audit: **DRIFTED** — structured rejection IS present (`src/ir/lower.rs:932` for stmt, `:1870` for expr — both `unsupported!`); WhenBlock parity fixtures t143–t145 SKIP per checklist §3 lines 190–192. Lowering is not. Roadmap line allows either; "or" reading would make this VERIFIED. **Hard Blocker H3** depending on which half the team is committing to. -->
+  - [x] Method call actual lowering (landed at 0ab7e9b) <!-- audit: **DELIVERED** — H2 closed; mangled `{Struct}${method}` dispatch with multi-alias `impl` support, fixtures t175/t176/t177 PASS. -->
+  - [x] `when` block lowering (Option A — Literal/Range/Bool/Catchall + TBool unknown wire-match at bed71c1; EnumVariant arms remain post-0.1) <!-- audit: **DELIVERED** — H3 closed; `lower_when_stmt` + `lower_when_expr` chained Compare/Branch CFG modeled on lower_logical; TBool unknown via ConstInt(I8, 2) + Cast(I8→scrutinee.ty). -->
 - [ ] Phase 8 Round 2 — str/strref layout, Handle<T>, TBool calling convention <!-- audit: **VERIFIED** (still-open is accurate) — `StrRef`, `Str`, `Handle` all `unsupported_type!` in `src/ir/lower.rs::lower_type` (lines 2645–2649); no TBool calling convention in `docs/backend/cx_abi_v0.1.md`. Roadmap doesn't gate 0.1 on this (it's listed `[ ]` without "(0.1)" markers); no blocker. -->
 - [ ] Phase 12 — Differential harness <!-- audit: **DRIFTED** at parent level — most sub-items done, two `[ ]` remain; per-item below. -->
   - [x] Harness shell — interpreter baseline capture (CX-23) <!-- audit: **VERIFIED** — `src/diff_harness.rs::run_interpreter` + `interpreter_baseline_all` test. -->
-  - [x] Per-feature parity classification, 15 categories (CX-69) <!-- audit: **DRIFTED** — actual is 16 categories now (checklist §3 line 17 says "The 16 categories"; visible in `jit_parity_by_feature` output this run: 16 rows). Roadmap says 15. -->
+  - [x] Per-feature parity classification, 16 categories (CX-69) <!-- audit: **VERIFIED** — 16 categories as of submain; visible in `jit_parity_by_feature` output. -->
   - [x] Loop construct fixtures (CX-68) <!-- audit: **VERIFIED** — WhileLoop/ForLoop/InfiniteLoop categories all have fixtures, 14 PASS / 5 SKIP combined. -->
   - [x] Exit-code-based fixtures — arithmetic/variable decl (CX-92) <!-- audit: **VERIFIED** — t172_arith_t128_exit, t173_const_decl_exit, t174_block_scope_shadow_exit in checklist (§3 line 21, 22). -->
-  - [x] 181 fixtures, 0 PARITY_FAILs (per docs/backend/cx_jit_parity_checklist.md §3, captured 2026-05-17) <!-- audit: **VERIFIED** — re-confirmed live this run after fresh `cargo build --features jit`: `jit_parity_by_feature: 181 fixtures checked across 16 feature categories, 0 PARITY_FAILs`. Caveat: see Hard Blocker H1. -->
+  - [x] 182 fixtures, 120 PASS / 62 SKIP / 0 PARITY_FAIL (captured 2026-05-21) <!-- audit: **VERIFIED** — AUTHORITATIVE TOTALS this run: `jit_parity_by_feature: 182 fixtures checked across 16 feature categories, 0 PARITY_FAILs; 120 PASS / 62 SKIP`. -->
   - [x] Determinism tests (CX-55) <!-- audit: **VERIFIED** — same anchor as Phase 14 Determinism tests above. -->
   - [ ] Full construct set coverage expansion (CX-34 on feature branch) <!-- audit: **VERIFIED** (still-open is accurate) — feature branch not on submain; not visible in matrix. -->
   - [ ] CI gate on every PR <!-- audit: **DRIFTED** — `.github/workflows/ci.yml::backend` job (line 91) runs `cargo test --features jit` which DOES include `jit_parity_by_feature`. So the gate exists. But the `frontend` job (line 17) runs the matrix script with exit-code-only comparison — see Soft Blocker S4 — so "CI gate" coverage is weaker than the prose implies; the backend gate is real, the frontend matrix gate is weak. -->
@@ -259,10 +259,10 @@ The backend pipeline converts verified SemanticProgram → IR → machine output
 
 ## Working Notes
 
-**2026-05-10 (CX-95):** Backend roadmap reconciled to v4.2. Phase 14 complete — arithmetic, branches, memory ops, direct calls, PtrOffset, print dispatch all execute in JIT. Phase 15 active — no-panic, float, exit-code, PtrOffset/PtrAdd, intrinsic validation, numeric casts all landed. Phase 11 nearly complete — `when` block rejection and method call actual lowering are the two remaining open items. Phase 9 sub-packet 2 done (print family via runtime dispatch). Phase 12 harness operational at 120 fixtures, 0 PARITY_FAILs. CX-91 (cast JIT), CX-93 (fmod libcall), CX-94 (DotAccess parity) in flight on feature branches. Submain 40+ commits ahead of main.
+**2026-05-10 (CX-95) — historical snapshot, counts as of 2026-05-10:** Backend roadmap reconciled to v4.2. Phase 14 complete — arithmetic, branches, memory ops, direct calls, PtrOffset, print dispatch all execute in JIT. Phase 15 active — no-panic, float, exit-code, PtrOffset/PtrAdd, intrinsic validation, numeric casts all landed. Phase 11 nearly complete — `when` block rejection and method call actual lowering are the two remaining open items. Phase 9 sub-packet 2 done (print family via runtime dispatch). Phase 12 harness operational at 120 fixtures, 0 PARITY_FAILs (as of 2026-05-10). CX-91 (cast JIT), CX-93 (fmod libcall), CX-94 (DotAccess parity) in flight on feature branches. Submain 40+ commits ahead of main.
 <!-- audit: **DRIFTED** — "120 fixtures" is stale (current is 181, see `docs/backend/cx_jit_parity_checklist.md` §3 line 149 and the in-file "181 fixtures" line at 79); the rest of this note is a 2026-05-10 timestamped snapshot and is properly historical, but the "120" needs either an "(as of 2026-05-10)" qualifier or replacement. **Soft Blocker S3.** -->
 
-**2026-05-09:** 9 PRs merged to submain. CX-74 (exit-code propagation), CX-48/73 (assert lowering), CX-52 (float cmp), CX-53 (void return), CX-67 (CodeRabbit), CX-70/71 (review fixes), CX-54/55. 10 new branches (CX-56–66) expanding JIT instruction coverage. Submain 40 commits ahead of main. JIT: 243 tests, 0 parity failures.
+**2026-05-09 — historical snapshot, counts as of 2026-05-09:** 9 PRs merged to submain. CX-74 (exit-code propagation), CX-48/73 (assert lowering), CX-52 (float cmp), CX-53 (void return), CX-67 (CodeRabbit), CX-70/71 (review fixes), CX-54/55. 10 new branches (CX-56–66) expanding JIT instruction coverage. Submain 40 commits ahead of main. JIT: 243 tests, 0 parity failures (as of 2026-05-09).
 <!-- audit: **DRIFTED** — "JIT: 243 tests" is stale (current with `--features jit`: 409 total, 0 failures, this run). Historical snapshot but the headline figure has drifted far enough that readers will misread the trajectory. **Soft Blocker S3.** -->
 
 **2026-05-05:** CX-18/19/20 merged to submain. CX-21–24 committed branch-local (Phase 11 error, Phase 12 start, Phase 13 start, host boundary). Submain 26+ commits ahead of main. Matrix 117/117 stable.

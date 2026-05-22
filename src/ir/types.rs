@@ -1,6 +1,7 @@
 use crate::ir::instr::{IrInst, IrTerminator};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // TBool + Void: reserved first-class IR type variants per docs/backend/cx_abi_v0.1.md; current lowering encodes TBool via Cast(I8) and canonicalises Void to Option<IrType>::None at the function boundary
 pub enum IrType {
     I8,
     I16,
@@ -90,6 +91,8 @@ pub fn compute_struct_layout(fields: &[IrType]) -> StructLayout {
 }
 
 pub struct ArrayLayout {
+    /// Reserved for layout introspection; read by unit tests, not by current lowering (stride is the live field).
+    #[allow(dead_code)]
     pub element_size: usize,
     pub stride: usize,
     pub total_size: usize,

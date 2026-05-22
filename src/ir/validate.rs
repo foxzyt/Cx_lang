@@ -40,6 +40,7 @@ pub enum IrValidationError {
         function: String,
         detail: String,
     },
+    #[allow(dead_code)] // reserved variant for future validator pass
     InvalidTerminatorPlacement {
         function: String,
         block: BlockId,

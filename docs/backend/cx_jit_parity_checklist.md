@@ -102,7 +102,7 @@ Captured from:
 cargo build --features jit && cargo test --features jit jit_parity_by_feature -- --nocapture
 ```
 
-Run on branch `train/backend-determinism` (submain as of CX-230 merge window, 2026-05-17).
+Run on submain as of 2026-05-21 (commit 2e4f0c6 + the polish-pass commit). Earlier baseline: `train/backend-determinism` (CX-230 merge window, 2026-05-17).
 Includes exit-code-verified fixtures added in CX-102 (t129–t134), CX-105/CX-107 LogicalOps
 fixtures (t141–t142), the CX-111 bool-variable negation extension to t131,
 CX-113 when-block exit-code fixtures (t143–t145), CX-119 var compound assign
@@ -129,24 +129,24 @@ and Struct/MethodCall SKIP (t175–t177).
 ```text
 Feature                PASS   SKIP  PARITY_FAIL
 ------------------------------------------------
-Arithmetic                8     10            0
+Arithmetic               14      4            0
 VariableDecl              5      5            0
-IfElse                    4      2            0
+IfElse                    6      0            0
 WhileLoop                 6      2            0
 ForLoop                   4      0            0
-InfiniteLoop              4      1            0
+InfiniteLoop              5      0            0
 DirectCall               12      5            0
-Struct                    6      8            0
+Struct                   13      1            0
 Array                     3      2            0
-CompoundAssign            6      1            0
-Unary                     2      1            0
-Cast                      0      4            0
-FloatOps                  0      7            0
+CompoundAssign            7      0            0
+Unary                     3      0            0
+Cast                      4      0            0
+FloatOps                  6      1            0
 BuiltinAssert             4      2            0
 LogicalOps                2      0            0
-Other                    17     48            0
+Other                    26     40            0
 ------------------------------------------------
-Total: 181 fixtures, 0 PARITY_FAILs
+Total: 182 fixtures, 120 PASS / 62 SKIP / 0 PARITY_FAILs
 ```
 
 ### Interpretation
@@ -164,11 +164,14 @@ Total: 181 fixtures, 0 PARITY_FAILs
   and execute successfully (no stderr error, exit 0) also appear as PASS.
 
 **SKIP fixtures** are those where IR lowering or JIT codegen has not yet been
-implemented for the construct used. The primary remaining gaps are constructs
-not yet JIT-lowerable (when-blocks, float ops, casts, t128 multi-word arithmetic,
-const declarations, block scopes, method calls, enums, generics, handles, and
-other Phase 14+ constructs). As subsequent phases land, SKIP counts will
-continue to decrease and PASS counts will increase.
+implemented for the construct used. After the 0.1 polish pass (when-block
+Option A, method-call lowering, Cast + F64 binary arithmetic, narrow-int and
+Bool print intrinsics), the remaining gaps are: enums and `EnumVariant` arms
+in `when`, generics and `TypeParam`, `Handle<T>`, `Str`/`StrRef` and string
+interpolation, `Result<T>`/`?` propagation, `WhileIn` source-to-IR, full TBool
+unknown propagation through arithmetic/logical ops, and `t128`/`f64` print
+formatting. As subsequent phases land, SKIP counts will continue to decrease
+and PASS counts will increase.
 
 **PARITY_FAIL = 0** across all 16 categories. The gate holds.
 

@@ -2026,19 +2026,6 @@ pub(crate) fn type_name(ty: &SemanticType) -> String {
     }
 }
 
-fn classify_type(ty: &SemanticType) -> SemanticType {
-    match ty {
-        SemanticType::I8
-        | SemanticType::I16
-        | SemanticType::I32
-        | SemanticType::I64
-        | SemanticType::I128
-        | SemanticType::F64
-        | SemanticType::Numeric => SemanticType::Numeric,
-        other => other.clone(),
-    }
-}
-
 fn binding_type(info: &VarInfo, type_params: &[String]) -> SemanticType {
     info.declared
         .clone()

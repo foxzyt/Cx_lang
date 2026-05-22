@@ -7,7 +7,7 @@ pub fn print_module(module: &IrModule) -> String {
     let mut out = String::new();
     writeln!(out, "module {}", module.debug_name).unwrap();
     for (i, function) in module.functions.iter().enumerate() {
-        if i > 0 || true {
+        if i > 0 {
             writeln!(out).unwrap();
         }
         write!(out, "{}", print_function(function)).unwrap();

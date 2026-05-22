@@ -46,7 +46,7 @@ Cx 0.1 is at release candidate stage. Both execution paths are active.
 
 The tree-walk interpreter is the reference implementation. All 0.1 language constructs are supported and tested.
 
-- 155 verification matrix tests, all passing
+- 182 verification matrix tests, all passing
 - 8 examples passing (`bash examples/run_all.sh`)
 - All 9 hard blockers resolved — syntax frozen, no breaking changes after 0.1
 - Two full audits completed: parser/semantic/interpreter agreement (12 programs) and memory boundary soundness (12 programs)
@@ -55,9 +55,9 @@ The tree-walk interpreter is the reference implementation. All 0.1 language cons
 
 The Cranelift JIT backend compiles Cx programs to native machine code. It is the 0.1 backend target and is in active development.
 
-- 155 fixtures run through the differential harness
+- 182 fixtures run through the differential harness
 - **0 PARITY_FAILs** — every supported construct produces output identical to the interpreter
-- 67 PASS / 88 SKIP across 16 feature categories
+- 120 PASS / 62 SKIP across 16 feature categories
 - ABI and data layout locked for x86-64 (scalar types, struct alignment, calling convention)
 - Determinism tested and guaranteed on valid IR
 
@@ -65,23 +65,23 @@ The Cranelift JIT backend compiles Cx programs to native machine code. It is the
 
 | Category       | PASS | SKIP | PARITY_FAIL |
 |----------------|------|------|-------------|
-| Arithmetic     | 8    | 9    | 0           |
-| VariableDecl   | 5    | 3    | 0           |
-| IfElse         | 4    | 2    | 0           |
-| WhileLoop      | 5    | 3    | 0           |
+| Arithmetic     | 14   | 4    | 0           |
+| VariableDecl   | 5    | 5    | 0           |
+| IfElse         | 6    | 0    | 0           |
+| WhileLoop      | 6    | 2    | 0           |
 | ForLoop        | 4    | 0    | 0           |
-| InfiniteLoop   | 2    | 1    | 0           |
-| DirectCall     | 7    | 4    | 0           |
-| Struct         | 6    | 5    | 0           |
+| InfiniteLoop   | 5    | 0    | 0           |
+| DirectCall     | 12   | 5    | 0           |
+| Struct         | 13   | 1    | 0           |
 | Array          | 3    | 2    | 0           |
-| CompoundAssign | 6    | 1    | 0           |
-| Unary          | 0    | 1    | 0           |
-| Cast           | 0    | 2    | 0           |
-| FloatOps       | 0    | 5    | 0           |
-| BuiltinAssert  | 2    | 2    | 0           |
+| CompoundAssign | 7    | 0    | 0           |
+| Unary          | 3    | 0    | 0           |
+| Cast           | 4    | 0    | 0           |
+| FloatOps       | 6    | 1    | 0           |
+| BuiltinAssert  | 4    | 2    | 0           |
 | LogicalOps     | 2    | 0    | 0           |
-| Other          | 18   | 48   | 0           |
-| **Total**      | **71** | **88** | **0** |
+| Other          | 26   | 40   | 0           |
+| **Total**      | **120** | **62** | **0** |
 
 SKIP means the construct is not yet lowered to JIT codegen — it exits cleanly with an unsupported-construct error rather than producing wrong output. PARITY_FAIL (semantic divergence from the interpreter) is the hard gate: it must stay at zero.
 
@@ -91,19 +91,24 @@ SKIP means the construct is not yet lowered to JIT codegen — it exits cleanly 
 - Variable declarations, typed and inferred
 - Control flow: `if`/`else`, `while`, `for` ranges (`0..n`, `1..=n`), `loop`/`break`/`continue`
 - Direct function calls — arity/type validation, return value handling
+- Method calls (`obj.method()`) — mangled-name dispatch with multi-alias `impl` support
+- `when` blocks — Literal/Range/Bool/Catchall arms + TBool unknown wire-match (Option A)
 - Struct literals, field read/write, struct-in-function
 - Fixed-size arrays: stack allocation (`ArrayAlloca`), element read/write, array-in-function
-- Runtime intrinsics: `print`, `println`, `printn` (i64 arguments), `assert`, `assert_eq`
-- Integer type casting (numeric cast, target-aware)
+- Unary negation and boolean NOT
+- Integer and float casts (target-aware numeric cast, including `t32→f64`/`t64→f64`)
+- `f64` arithmetic, comparison, and negation
+- Runtime intrinsics: `print`, `println`, `printn`, `cx_print_bool` (narrow ints widened, Bool routed via dedicated intrinsic), `assert`, `assert_eq`
 - Void function returns, exit code propagation
 
 **Constructs not yet JIT-lowered (SKIP):**
-- `when` blocks (three-way TBool branching; design work needed)
-- Method calls (`obj.method()`)
-- `f64` floating-point operations
-- Explicit cast (`as`) — core cast locked; full branch coverage in-flight
-- Unary negation
-- Enums, generics, `Handle<T>`, string arena operations, `Result<T>`/`?`
+- Enums and `EnumVariant` arms in `when`
+- Generics and `TypeParam`
+- `Handle<T>`, `Str`/`StrRef`, string arena operations, string interpolation
+- `Result<T>`/`?` propagation
+- `WhileIn` source-to-IR (range-bound `while in`)
+- Full TBool unknown propagation through arithmetic/logical ops
+- `t128` and `f64` print formatting
 
 ## Getting Started
 
@@ -116,8 +121,9 @@ cargo build --features jit
 # Run a program with the interpreter (default)
 cargo run -- examples/hello.cx
 
-# Run a program with the Cranelift JIT backend
-cargo run --features jit -- --backend=cranelift examples/hello.cx
+# Run a program with the Cranelift JIT backend (fibonacci is the example that runs end-to-end under JIT today;
+# most other examples require features deferred post-0.1: string interpolation, Result/?, generics)
+cargo run --features jit -- --backend=cranelift examples/fibonacci.cx
 
 # Run the full test suite
 cargo test --features jit

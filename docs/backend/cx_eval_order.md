@@ -41,10 +41,11 @@ evaluated first, then `B`, then `C`.
 | `f(A, B, …)` | A then B then … | argument list, left-to-right |
 | `(A ⊕ B) ⊕ C` | A then B then C | nested, outermost rule applied recursively |
 | `A && B`, `A || B` | A then B (B skipped on short-circuit) | short-circuit logical; lowered via `lower_logical()` in `src/ir/lower.rs` (decision/rhs/sc/merge CFG), fixtures t141/t142 |
+| `when X { ... }` (statement and expression) | X then arms left-to-right | chained Compare/Branch CFG via `lower_when_stmt` / `lower_when_expr` in `src/ir/lower.rs` (Option A, landed bed71c1); supports Literal/Range/Bool/Catchall arms + TBool unknown wire-match; fixtures t143/t144/t145 PASS |
 
 **Not covered in 0.1** (unsupported in IR lowering, structured error returned):
 
-- `when` expressions — three-way branch design not finalised for 0.1
+- `EnumVariant` arms in `when` — rejected with structured error pending enum lowering
 
 ---
 

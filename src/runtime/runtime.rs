@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 #[derive(Debug)]
+#[allow(dead_code)] // HandleAlloc/Drop/Access: handle-lifecycle trace events reserved for future --trace-handles wiring
 pub enum ScopeEvent {
     Open(String),
     Close(String),
