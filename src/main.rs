@@ -212,6 +212,18 @@ fn run() {
                     println!("PASS: {}", name);
                     passed += 1;
                 }
+                // exit(0) inside a test counts as pass; exit(n!=0) as fail.
+                // The runner continues to the next test — Exit never terminates
+                // the process from inside --test mode (no process::exit here),
+                // which is what stops exit() from silently killing the suite.
+                Err(RuntimeError::Exit(0)) => {
+                    println!("PASS: {} (via exit(0))", name);
+                    passed += 1;
+                }
+                Err(RuntimeError::Exit(code)) => {
+                    println!("FAIL: {} — exit({})", name, code);
+                    failed += 1;
+                }
                 Err(RuntimeError::AssertionFailed { msg, .. }) => {
                     println!("FAIL: {} — {}", name, msg);
                     failed += 1;
@@ -332,6 +344,15 @@ fn run_with_interpreter(program: SemanticProgram, input: &str, flags: &DebugFlag
     let mut step_count = 0;
     for stmt in &program.stmts {
         if let Err(err) = rt.run_semantic_stmt(stmt) {
+            // exit(code) raises the Exit control-flow signal. Catch it BEFORE
+            // any error rendering so a clean exit(0) prints no error banner.
+            // Flush stdout first: process::exit skips Drop and does not flush,
+            // so `print(...); exit(N)` would lose piped output without this.
+            if let RuntimeError::Exit(code) = err {
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+                std::process::exit(code);
+            }
             diagnostics::print_runtime(input, &err);
             diagnostics::print_summary(1);
             std::process::exit(1);

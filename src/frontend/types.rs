@@ -99,6 +99,13 @@ pub enum RuntimeError {
         name: String,
     },
     EarlyReturn(Value),
+    /// Control-flow signal raised by the `exit(code)` builtin. Not an error
+    /// condition — it carries the process exit code requested by the program.
+    /// Propagates uncaught to the top-level interpreter loop (or the --test
+    /// loop), which translates it to `std::process::exit(code)`. Sibling of
+    /// EarlyReturn/BreakSignal/ContinueSignal: RuntimeError is the runtime's
+    /// control-flow-signal carrier, not solely an error type.
+    Exit(i32),
     AssertionFailed {
         msg: String,
         pos: usize,

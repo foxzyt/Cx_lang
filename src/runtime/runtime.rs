@@ -1289,6 +1289,45 @@ SemanticStmt::Decl { name, ty, .. } => {
             }
         }
 
+        // Built-in: exit(code) / exit() — request process termination.
+        // Returns the Exit control-flow signal (NOT a process::exit call here);
+        // the top-level loop / --test loop translates it to a real exit so
+        // stdout can be flushed first. Negative codes pass through to i32
+        // unchanged; the OS layer (POSIX) may truncate to u8 — not normalised.
+        if callee == "exit" {
+            let code: i32 = match args.first() {
+                None => 0,
+                Some(SemanticCallArg::Expr(e)) => {
+                    let v = self.eval_semantic_expr(e)?;
+                    match v {
+                        Value::Num(n) => {
+                            if n < i32::MIN as i128 || n > i32::MAX as i128 {
+                                // Out of i32 range: surface as a normal runtime
+                                // error, not an Exit signal.
+                                return Err(RuntimeError::TypeMismatch {
+                                    pos,
+                                    expected: Type::T32,
+                                    got: Type::T64,
+                                });
+                            }
+                            n as i32
+                        }
+                        other => {
+                            return Err(RuntimeError::TypeMismatch {
+                                pos,
+                                expected: Type::T32,
+                                got: type_of_value(&other),
+                            });
+                        }
+                    }
+                }
+                // Non-Expr arg form (copy/copyfree/copyinto) is not valid for
+                // exit; arity/shape is already enforced in the semantic phase.
+                Some(_) => 0,
+            };
+            return Err(RuntimeError::Exit(code));
+        }
+
         // Built-in: print (with newline) and printn (no newline)
         if callee == "print" || callee == "println" {
             for arg in args {

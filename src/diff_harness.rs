@@ -958,6 +958,112 @@ mod tests {
         );
     }
 
+    // ── exit() builtin in --test mode ─────────────────────────────────────────
+
+    /// Write `src` to a unique temp `.cx` file, run `<binary> --test <file>`,
+    /// and return (stdout, exit_code). The temp file is removed before return.
+    fn run_test_mode(src: &str, tag: &str) -> (String, i32) {
+        let dir = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let file = dir.join(format!("cx_exit_testmode_{}_{}.cx", tag, nanos));
+        std::fs::write(&file, src).expect("write temp test-mode fixture");
+
+        let output = std::process::Command::new(cx_binary_path())
+            .arg("--test")
+            .arg(&file)
+            .output()
+            .expect("spawn --test subprocess");
+
+        let _ = std::fs::remove_file(&file);
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let code = output.status.code().unwrap_or(-1);
+        (stdout, code)
+    }
+
+    /// A `#[test]` function calling `exit(1)` must be recorded as a failure and
+    /// must NOT terminate the runner — the second test must still execute.
+    /// This is the structural property that stops `exit()` from silently
+    /// disabling the rest of the test suite.
+    #[test]
+    fn test_mode_exit_nonzero_counts_as_fail_and_runner_continues() {
+        let binary = cx_binary_path();
+        if !binary.exists() {
+            eprintln!("SKIP — binary not found at {:?}; build first.", binary);
+            return;
+        }
+
+        let src = "\
+#[test]
+fnc: first() {
+    exit(1)
+}
+#[test]
+fnc: second() {
+    assert_eq(1, 1)
+}
+";
+        let (stdout, code) = run_test_mode(src, "fail");
+
+        // The second test must have run — this is the anti-silent-disable check.
+        assert!(
+            stdout.contains("second"),
+            "second test did not run — exit() killed the runner. stdout:\n{}",
+            stdout
+        );
+        // first counts as a failure.
+        assert!(
+            stdout.contains("FAIL: first"),
+            "exit(1) in a test should be recorded as FAIL. stdout:\n{}",
+            stdout
+        );
+        // Overall accounting: one pass, one fail; runner exits non-zero.
+        assert!(
+            stdout.contains("1 passed, 1 failed"),
+            "expected '1 passed, 1 failed'. stdout:\n{}",
+            stdout
+        );
+        assert_ne!(code, 0, "runner must exit non-zero when a test failed");
+    }
+
+    /// A `#[test]` function calling `exit(0)` must be recorded as a pass and the
+    /// runner must continue to the next test.
+    #[test]
+    fn test_mode_exit_zero_counts_as_pass_and_runner_continues() {
+        let binary = cx_binary_path();
+        if !binary.exists() {
+            eprintln!("SKIP — binary not found at {:?}; build first.", binary);
+            return;
+        }
+
+        let src = "\
+#[test]
+fnc: first() {
+    exit(0)
+}
+#[test]
+fnc: second() {
+    assert_eq(2, 2)
+}
+";
+        let (stdout, code) = run_test_mode(src, "pass");
+
+        assert!(
+            stdout.contains("second"),
+            "second test did not run after exit(0). stdout:\n{}",
+            stdout
+        );
+        assert!(
+            stdout.contains("2 passed, 0 failed"),
+            "expected '2 passed, 0 failed' (exit(0) = pass). stdout:\n{}",
+            stdout
+        );
+        assert_eq!(code, 0, "runner must exit 0 when all tests passed");
+    }
+
     // ── JIT parity by feature ─────────────────────────────────────────────────
 
     /// Per-feature JIT parity gate (Phase 12 checklist).

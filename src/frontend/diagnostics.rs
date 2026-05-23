@@ -197,6 +197,13 @@ pub(crate) fn runtime_error_message(err: &RuntimeError) -> (String, usize) {
             "unhandled control flow signal -- this is likely a compiler bug, please report".to_string(),
             0,
         ),
+        // Never-render arm: Exit is caught at the top-level interpreter loop and
+        // the --test loop before any rendering. If this fires, the catch-site
+        // ordering in main.rs is wrong.
+        RuntimeError::Exit(_) => (
+            "exit signal — should not reach renderer (bug: top-level catch missed it)".to_string(),
+            0,
+        ),
         RuntimeError::AssertionFailed { pos, msg } => (
             format!("{}", msg),
             *pos,

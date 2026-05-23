@@ -1585,6 +1585,32 @@ Expr::Unary(op, inner, pos) => {
             });
         }
 
+        // Built-in: exit(code) / exit() — terminate with a process exit code.
+        // Accepts 0 or 1 arg; arity enforced here so the runtime sees only the
+        // valid shapes. Return type Void (no usable value); divergence is a
+        // runtime concern, not a type-system one for 0.1 (no Never/Diverges).
+        if name == "exit" {
+            if args.len() > 1 {
+                return Err(sem_err!(
+                    pos,
+                    "'exit' expects 0 or 1 argument(s), got {}",
+                    args.len()
+                ));
+            }
+            let mut semantic_args = Vec::new();
+            if let Some(CallArg::Expr(expr)) = args.first() {
+                semantic_args.push(SemanticCallArg::Expr(self.analyze_expr(expr)?));
+            }
+            return Ok(SemanticExpr {
+                ty: SemanticType::Void,
+                kind: SemanticExprKind::Call {
+                    callee: name.to_string(),
+                    function: FunctionId(u32::MAX),
+                    args: semantic_args,
+                },
+            });
+        }
+
         // Built-in: read(var) and input("prompt", var)
         if name == "read" || name == "input" || name == "print" || name == "println" || name == "printn" || name == "assert" || name == "assert_eq" {
             let mut semantic_args = Vec::new();
