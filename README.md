@@ -1,67 +1,213 @@
 # Cx
 
-Cx is a systems language for game engines with deterministic memory, no garbage collector, and no borrow checker.
+Cx is a compiled, GC-free systems programming language for game engines, tools, and systems programmers.
 
-## The Problem It Solves
+The goal of Cx is to give engine-facing code predictable memory behavior, explicit value movement, deterministic teardown, and low-level control without forcing every feature to become allocator plumbing.
 
-Engine code often needs predictable allocation, explicit lifetime control, and data movement you can reason about frame to frame. Teams building gameplay, tooling, and runtime systems usually end up mixing high-level ergonomics with low-level ownership concerns by hand. Cx is aimed at that gap: a language where memory behavior is visible, stable, and intentional without turning every feature into allocator plumbing. The goal is to make engine-facing code easier to reason about under load, at boundaries, and over long-lived runtime sessions.
+**Current release: v0.1.0**
 
-## The Approach
+Cx 0.1.0 is the first end-to-end language milestone: source code now moves through parsing, semantic analysis, IR, a reference interpreter, and a Cranelift JIT backend with parity verification.
 
-Cx is built around arenas, handles, and explicit value movement. Owned values stay owned, handles give you stable indirection with stale-handle detection, and scoped arena cleanup keeps teardown deterministic. Unknown state is part of the language model rather than an afterthought, which lets control-flow rules stay explicit.
+0.1.0 is not production-ready yet.  
+It is the first working compiler foundation.
 
-## A Code Taste
+---
 
-```cx
-fnc spawn_enemy(kind: EnemyKind) {
-    let h;
-    h = Handle.new(kind)
+## Why Cx Exists
 
-    when kind {
-        EnemyKind::Grunt => print("grunt"),
-        EnemyKind::Elite => print("elite"),
-        _ => print("unknown"),
-    }
+Engine and systems code often needs:
 
-    print(h.val)
-    h.drop()
-}
+- predictable allocation
+- explicit lifetime control
+- stable data layout
+- deterministic cleanup
+- value movement that can be reasoned about frame to frame
+- runtime behavior that does not depend on hidden garbage collection
+
+Most teams end up mixing high-level ergonomics with low-level ownership rules by hand.
+
+Cx is aimed at that gap.
+
+It is designed around explicit memory behavior, stable handles, arena-oriented allocation, declared-width arithmetic, and a language model where unknown state is represented directly instead of being hidden behind ad hoc runtime conventions.
+
+---
+
+## What 0.1.0 Proves
+
+Cx 0.1.0 establishes the first working compiler pipeline:
+
+```text
+source code
+→ lexer/parser
+→ AST
+→ semantic analysis
+→ IR
+→ interpreter
+→ Cranelift JIT
+→ parity verification
 ```
+
+The interpreter is the reference semantics backend.
+
+The Cranelift JIT is the native execution backend.
+
+The differential harness checks that supported JIT features produce the same observable behavior as the interpreter.
+
+---
+
+## Current Verification Status
+
+Cx 0.1.0 closed with:
+
+- **411 unit tests passing**
+- **182 verification fixtures**
+  - 120 PASS
+  - 62 SKIP
+  - 0 PARITY_FAIL
+- **zero compiler warnings**
+- **zero Clippy errors**
+
+`SKIP` means a fixture covers a language feature that is not yet lowered to JIT codegen.  
+`PARITY_FAIL` means semantic divergence between interpreter and JIT. That number must stay zero.
+
+---
+
+## Code Taste
 
 ```cx
 fnc: t64 sum_range(n: t64) {
     let total: t64 = 0
+
     for i in 0..n {
         total += i
     }
+
     total
 }
 ```
 
-## Current Status
+```cx
+fnc: t64 abs_or_zero(x: t64) {
+    when x {
+        0 => 0,
+        -10..=-1 => -x,
+        _ => x,
+    }
+}
+```
 
-Cx 0.1 is at release candidate stage. Both execution paths are active.
+```cx
+fnc: bool is_large(n: t64) {
+    if n > 100 {
+        true
+    } else {
+        false
+    }
+}
+```
 
-### Interpreter — Release Candidate
+---
 
-The tree-walk interpreter is the reference implementation. All 0.1 language constructs are supported and tested.
+## What Works in 0.1.0
 
-- 182 verification matrix tests, all passing
-- 8 examples passing (`bash examples/run_all.sh`)
-- All 9 hard blockers resolved — syntax frozen, no breaking changes after 0.1
-- Two full audits completed: parser/semantic/interpreter agreement (12 programs) and memory boundary soundness (12 programs)
+### Language Core
 
-### Cranelift JIT Backend — Phase 15 Active
+- integer types: `t8`, `t16`, `t32`, `t64`, `t128`
+- `f64`
+- `bool`
+- `tbool` with wire values:
+  - `false = 0`
+  - `true = 1`
+  - `unknown = 2`
+- `char`
+- `str`
+- structs
+- arrays
+- free functions
+- struct methods
+- generic functions over types
+- implicit last-expression return
+- explicit `return`
+- `if` / `else`
+- `while`
+- `for`
+- infinite `loop`
+- `break` / `continue`
+- `when` matching for literal, range, bool, catchall, and TBool wire-value patterns
+- declared-width wrapping arithmetic
+- comparisons
+- logical short-circuiting
+- compound assignment
+- dot access
+- built-ins:
+  - `print`
+  - `println`
+  - `printn`
+  - `assert`
+  - `assert_eq`
+  - `read`
+  - `input`
 
-The Cranelift JIT backend compiles Cx programs to native machine code. It is the 0.1 backend target and is in active development.
+### Memory Model
 
-- 182 fixtures run through the differential harness
-- **0 PARITY_FAILs** — every supported construct produces output identical to the interpreter
-- 120 PASS / 62 SKIP across 16 feature categories
-- ABI and data layout locked for x86-64 (scalar types, struct alignment, calling convention)
-- Determinism tested and guaranteed on valid IR
+Cx 0.1.0 includes the foundation for explicit value movement:
 
-**JIT parity by category (current baseline):**
+- stack-allocated structs
+- stack-allocated arrays
+- explicit copy semantics
+- `.copy`
+- `.copy.free`
+- `copy_into`
+- no garbage collector
+- no borrow checker
+
+Longer-term memory features such as `Handle<T>`, string arenas, and richer ownership tools are planned post-0.1.
+
+---
+
+## Interpreter
+
+The tree-walking interpreter is the reference implementation for Cx semantics.
+
+It supports the 0.1 language surface and is used as the comparison target for JIT parity testing.
+
+---
+
+## Cranelift JIT Backend
+
+The Cranelift backend compiles supported Cx IR to native machine code.
+
+Current JIT-supported areas include:
+
+- integer arithmetic
+- declared-width wrapping behavior
+- comparisons
+- logical AND/OR short-circuiting
+- typed and inferred variable declarations
+- `if` / `else`
+- `while`
+- `for` ranges
+- infinite `loop`
+- `break` / `continue`
+- direct function calls
+- method dispatch through mangled-name lowering
+- `when` blocks for literal/range/bool/catchall/TBool wire-value patterns
+- struct literals
+- struct field reads and writes
+- fixed-size arrays
+- array element reads and writes
+- unary negation
+- boolean NOT
+- integer and float casts
+- `f64` arithmetic and comparison
+- runtime intrinsics for print/assert behavior
+- void returns and exit-code propagation
+
+The JIT is still under active expansion, but all currently supported JIT fixtures match interpreter behavior.
+
+---
+
+## JIT Parity Baseline
 
 | Category       | PASS | SKIP | PARITY_FAIL |
 |----------------|------|------|-------------|
@@ -83,141 +229,159 @@ The Cranelift JIT backend compiles Cx programs to native machine code. It is the
 | Other          | 26   | 40   | 0           |
 | **Total**      | **120** | **62** | **0** |
 
-SKIP means the construct is not yet lowered to JIT codegen — it exits cleanly with an unsupported-construct error rather than producing wrong output. PARITY_FAIL (semantic divergence from the interpreter) is the hard gate: it must stay at zero.
+---
 
-**Constructs JIT-lowered and working:**
-- Integer arithmetic, comparisons, compound assign (`+=`, `-=`, `*=`, `/=`, `%=`)
-- Logical AND/OR with short-circuit
-- Variable declarations, typed and inferred
-- Control flow: `if`/`else`, `while`, `for` ranges (`0..n`, `1..=n`), `loop`/`break`/`continue`
-- Direct function calls — arity/type validation, return value handling
-- Method calls (`obj.method()`) — mangled-name dispatch with multi-alias `impl` support
-- `when` blocks — Literal/Range/Bool/Catchall arms + TBool unknown wire-match (Option A)
-- Struct literals, field read/write, struct-in-function
-- Fixed-size arrays: stack allocation (`ArrayAlloca`), element read/write, array-in-function
-- Unary negation and boolean NOT
-- Integer and float casts (target-aware numeric cast, including `t32→f64`/`t64→f64`)
-- `f64` arithmetic, comparison, and negation
-- Runtime intrinsics: `print`, `println`, `printn`, `cx_print_bool` (narrow ints widened, Bool routed via dedicated intrinsic), `assert`, `assert_eq`
-- Void function returns, exit code propagation
+## Deferred Post-0.1
 
-**Constructs not yet JIT-lowered (SKIP):**
-- Enums and `EnumVariant` arms in `when`
-- Generics and `TypeParam`
-- `Handle<T>`, `Str`/`StrRef`, string arena operations, string interpolation
-- `Result<T>`/`?` propagation
-- `WhileIn` source-to-IR (range-bound `while in`)
-- Full TBool unknown propagation through arithmetic/logical ops
-- `t128` and `f64` print formatting
+The following are intentionally not part of the 0.1 completion claim:
+
+- `f64` and `t128` print formatting runtime ABI extension
+- `?` expression literal lowering
+- full TBool unknown propagation through arithmetic, comparison, and logical operations
+- enum IR lowering
+- `EnumVariant` arms in `when`
+- Cranelift AOT compilation
+- LLVM AOT backend
+- `WhileIn` source-to-IR lowering
+- `Result<T>` / `?` operator
+- string interpolation
+- string arena
+- `Handle<T>`
+- generic standard library
+
+---
 
 ## Getting Started
 
-**Build requirements:** Rust toolchain (stable). Cranelift JIT requires the `jit` feature.
+### Requirements
+
+- Rust stable toolchain
+- Cranelift JIT support requires the `jit` feature
+
+### Build
 
 ```bash
-# Build both interpreter and JIT backend
 cargo build --features jit
+```
 
-# Run a program with the interpreter (default)
+### Run with the interpreter
+
+```bash
 cargo run -- examples/hello.cx
+```
 
-# Run a program with the Cranelift JIT backend (fibonacci is the example that runs end-to-end under JIT today;
-# most other examples require features deferred post-0.1: string interpolation, Result/?, generics)
+### Run with the Cranelift JIT
+
+```bash
 cargo run --features jit -- --backend=cranelift examples/fibonacci.cx
+```
 
-# Run the full test suite
+### Run the full test suite
+
+```bash
 cargo test --features jit
+```
 
-# Run JIT parity gate only
+### Run the JIT parity gate
+
+```bash
 cargo test --features jit jit_parity_by_feature -- --nocapture
 ```
 
-The interpreter and JIT produce identical output for all PASS fixtures. The differential harness enforces this.
+---
 
 ## Examples
 
-Eight working examples are in `examples/`:
+Working examples are in `examples/`.
 
-| File | Demonstrates |
-|------|-------------|
-| `hello.cx` | Print and basic syntax |
-| `fizzbuzz.cx` | Control flow, modulo |
-| `fibonacci.cx` | Recursion, function calls |
-| `structs_and_methods.cx` | Struct definitions, impl blocks, methods |
-| `error_handling.cx` | `Result<T>`, `Ok`/`Err`, `?` propagation |
-| `arrays_and_loops.cx` | Fixed arrays, for loops, range iteration |
-| `generics.cx` | Generic functions and structs |
-| `tbool_uncertainty.cx` | TBool three-state, unknown propagation, `when` |
+Run all examples:
 
-Run all examples: `bash examples/run_all.sh`
+```bash
+bash examples/run_all.sh
+```
 
-## Language Features
+Some examples demonstrate interpreter-only or post-0.1 features. The JIT backend should be tested through the parity harness rather than assuming every example is JIT-ready.
 
-**Fully supported (interpreter + JIT where noted):**
-- Integer types: `t8`, `t16`, `t32`, `t64`, `t128` — signed, wrapping arithmetic
-- Float type: `f64`
-- Boolean: `bool` (two-state), `tbool` (three-state: true/false/unknown)
-- `Handle<T>` — stable indirection with stale-handle detection
-- Arenas and scoped cleanup — deterministic teardown
-- Structs with `impl` blocks and multi-alias `impl (a: A, b: B)` forms
-- Generics — single and multiple type parameters on functions and structs
-- Arrays — fixed-size, stack-allocated, index read/write, iteration
-- Control flow: `if`/`else`/`else if`, `while`, `for` range, `loop`, `break`, `continue`
-- `when` blocks — pattern matching on enums and TBool (interpreter only)
-- Functions with explicit return types, `return`, and implicit last-expression return
-- `Result<T>` and `?` error propagation
-- `assert(cond)` and `assert_eq(a, b)` test builtins
-- Multi-file imports via `#![imports]` blocks
-- String interpolation `{varname}` in print calls
-- `const` declarations
-- `#[test]` macro and `--test` mode
+---
 
-**Known 0.1 limitations (documented, not blocking):**
-- String arena grows monotonically in the interpreter
-- No `strref` constructor syntax — `strref` exists as a boundary type only
-- Expression statements still require semicolons (all other statements have optional semicolons)
-- Pattern matching named binding (`as v`) and guard clauses (`if n > 5`) are post-0.1
+## Data Layout and ABI
 
-## Data Layout and ABI (Locked for x86-64)
+The Cx 0.1 ABI is locked for x86-64.
 
-The Cx 0.1 ABI is locked. Changes are breaking.
+Highlights:
 
-- Scalars: `t8`/`t16`/`t32`/`t64`/`t128`, `f64`, `bool`, `tbool`, `Ptr` — sizes and alignments defined
-- `tbool` wire representation: false=0, true=1, unknown=2 (passed as i8)
-- Structs: C-compatible alignment with natural padding
-- Arrays: contiguous stack allocation via `ArrayAlloca`, element size derived from type
-- Calling convention: C ABI / SystemV on Linux x86-64
-- Expression evaluation order: left-to-right, documented and tested
+- scalar sizes and alignments are defined
+- `tbool` wire representation is fixed:
+  - `false = 0`
+  - `true = 1`
+  - `unknown = 2`
+- structs use C-compatible alignment with natural padding
+- arrays use contiguous stack allocation through `ArrayAlloca`
+- expression evaluation order is left-to-right
+- current calling convention target: C ABI / SystemV on Linux x86-64
 
-See `docs/backend/cx_abi_v0.1.md` for the full specification.
+See:
+
+```text
+docs/backend/cx_abi_v0.1.md
+```
+
+---
+
+## Project Status
+
+Cx is early-stage and experimental.
+
+Use it for:
+
+- compiler development
+- language design validation
+- backend/JIT experimentation
+- systems-language research
+- test-driven expansion of the Cx feature set
+
+Do not use it for production applications yet.
+
+---
 
 ## Roadmap
 
-**0.1 — In progress**
-- Interpreter: release candidate, all hard blockers resolved
-- Cranelift JIT: Phase 15 active — expanding PASS coverage, no PARITY_FAILs
-- Remaining JIT work: `when` blocks, method calls, `f64` ops, casts, enums, generics
+Near-term post-0.1 priorities:
 
-**Post-0.1 — Deferred**
+- stabilize 0.1.1
+- improve examples and documentation
+- expand JIT PASS coverage
+- add missing runtime ABI extensions
+- continue enum, string, result, and standard-library work
+
+Longer-term goals:
+
 - Cranelift AOT compilation
 - LLVM AOT backend
 - C FFI surface
-- gene + phen trait system and operator overloading
-- Minimal stdlib (dynamic array, hashmap, string utilities)
-- Filesystem I/O, windowing, GPU system
-- LSP and tooling (`cx build`, `cx test`, `cx check`)
+- minimal standard library
+- language server tooling
+- `cx build`, `cx test`, and `cx check`
+- game-engine-oriented runtime and memory tooling
+
+---
 
 ## Built With
 
-- [Rust](https://www.rust-lang.org/) — implementation language for the compiler, interpreter, and tooling
-- [Logos](https://github.com/maciejhirsz/logos) — tokenization
-- [Chumsky](https://github.com/zesterer/chumsky) — parser construction
-- [Cranelift](https://cranelift.dev/) — JIT code generation backend (0.115)
+- [Rust](https://www.rust-lang.org/) — compiler, interpreter, tooling
+- [Logos](https://github.com/maciejhirsz/logos) — lexer
+- [Chumsky](https://github.com/zesterer/chumsky) — parser
+- [Cranelift](https://cranelift.dev/) — JIT backend
+
+---
 
 ## Contributing / Contact
 
-Open an issue or PR to discuss language behavior, runtime semantics, or backend work.
+Open an issue or PR to discuss language behavior, runtime semantics, backend work, or documentation.
 
-The verification matrix in `src/tests/verification_matrix/` is the clearest picture of what is working today. The JIT parity checklist is in `docs/backend/cx_jit_parity_checklist.md`. The full ABI specification is in `docs/backend/cx_abi_v0.1.md`.
+Useful files:
 
-See `CONTRIBUTING.md` for branch policy and merge workflow.
+- `src/tests/verification_matrix/` — feature verification fixtures
+- `docs/backend/cx_jit_parity_checklist.md` — JIT parity status
+- `docs/backend/cx_abi_v0.1.md` — ABI specification
+- `CONTRIBUTING.md` — branch policy and merge workflow
