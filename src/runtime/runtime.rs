@@ -1,5 +1,6 @@
 // incremental rebuild test 3
 use crate::frontend::{ast::*, diagnostics, types::*};
+use crate::frontend::builtins::{self, BuiltinKind};
 use crate::frontend::semantic_types::*;
 use crate::runtime::arena::Arena;
 use crate::runtime::handle::HandleRegistry;
@@ -1284,166 +1285,178 @@ SemanticStmt::Decl { name, ty, .. } => {
     }
 
     pub fn call_semantic_func(&mut self, callee: &str, args: &[SemanticCallArg], pos: usize) -> Result<Value, RuntimeError> {
-        // Built-in: is_known
-        if callee == "is_known" {
-            if let Some(SemanticCallArg::Expr(e)) = args.first() {
-                let val = self.eval_semantic_expr(e)?;
-                return Ok(match val {
-                    Value::Unknown(_) | Value::TBool(2) => Value::Bool(false),
-                    _ => Value::Bool(true),
-                });
-            }
-        }
+        // Built-in dispatch — names come from the single-source-of-truth
+        // registry (crate::frontend::builtins, #008). Each kind's body is its
+        // pre-#008 behavior verbatim. Only `is_known` may fall out of the match
+        // (when its first arg is not an Expr) to the user-function path below;
+        // every other arm returns.
+        if let Some(def) = builtins::lookup(callee) {
+            match def.kind {
+                BuiltinKind::IsKnown => {
+                    if let Some(SemanticCallArg::Expr(e)) = args.first() {
+                        let val = self.eval_semantic_expr(e)?;
+                        return Ok(match val {
+                            Value::Unknown(_) | Value::TBool(2) => Value::Bool(false),
+                            _ => Value::Bool(true),
+                        });
+                    }
+                }
 
-        // Built-in: exit(code) / exit() — request process termination.
-        // Returns the Exit control-flow signal (NOT a process::exit call here);
-        // the top-level loop / --test loop translates it to a real exit so
-        // stdout can be flushed first. Negative codes pass through to i32
-        // unchanged; the OS layer (POSIX) may truncate to u8 — not normalised.
-        if callee == "exit" {
-            let code: i32 = match args.first() {
-                None => 0,
-                Some(SemanticCallArg::Expr(e)) => {
-                    let v = self.eval_semantic_expr(e)?;
-                    match v {
-                        Value::Num(n) => {
-                            if n < i32::MIN as i128 || n > i32::MAX as i128 {
-                                // Out of i32 range: surface as a normal runtime
-                                // error, not an Exit signal.
-                                return Err(RuntimeError::TypeMismatch {
-                                    pos,
-                                    expected: Type::T32,
-                                    got: Type::T64,
-                                });
+                // exit(code) / exit() — request process termination. Returns the
+                // Exit control-flow signal (NOT a process::exit call here); the
+                // top-level loop / --test loop translates it to a real exit so
+                // stdout can be flushed first. Negative codes pass through to i32
+                // unchanged; the OS layer (POSIX) may truncate to u8 — not
+                // normalised.
+                BuiltinKind::Exit => {
+                    let code: i32 = match args.first() {
+                        None => 0,
+                        Some(SemanticCallArg::Expr(e)) => {
+                            let v = self.eval_semantic_expr(e)?;
+                            match v {
+                                Value::Num(n) => {
+                                    if n < i32::MIN as i128 || n > i32::MAX as i128 {
+                                        // Out of i32 range: surface as a normal
+                                        // runtime error, not an Exit signal.
+                                        return Err(RuntimeError::TypeMismatch {
+                                            pos,
+                                            expected: Type::T32,
+                                            got: Type::T64,
+                                        });
+                                    }
+                                    n as i32
+                                }
+                                other => {
+                                    return Err(RuntimeError::TypeMismatch {
+                                        pos,
+                                        expected: Type::T32,
+                                        got: type_of_value(&other),
+                                    });
+                                }
                             }
-                            n as i32
                         }
-                        other => {
-                            return Err(RuntimeError::TypeMismatch {
+                        // Non-Expr arg form (copy/copyfree/copyinto) is not valid
+                        // for exit; arity/shape is enforced in the semantic phase.
+                        Some(_) => 0,
+                    };
+                    return Err(RuntimeError::Exit(code));
+                }
+
+                // print (with newline) and println — see #034: both currently
+                // behave identically (no distinct newline).
+                BuiltinKind::Print | BuiltinKind::Println => {
+                    for arg in args {
+                        if let SemanticCallArg::Expr(e) = arg {
+                            let v = self.eval_semantic_expr(e)?;
+                            self.print_value(&v);
+                        }
+                    }
+                    return Ok(Value::Num(0));
+                }
+
+                // printn (no newline)
+                BuiltinKind::Printn => {
+                    for arg in args {
+                        if let SemanticCallArg::Expr(e) = arg {
+                            let v = self.eval_semantic_expr(e)?;
+                            self.print_value_inline(&v);
+                        }
+                    }
+                    return Ok(Value::Num(0));
+                }
+
+                // assert(cond) — runtime error if condition is false
+                BuiltinKind::Assert => {
+                    if let Some(SemanticCallArg::Expr(e)) = args.first() {
+                        let val = self.eval_semantic_expr(e)?;
+                        let passed = match val {
+                            Value::Bool(b) => b,
+                            Value::Num(n) => n != 0,
+                            _ => false,
+                        };
+                        if !passed {
+                            return Err(RuntimeError::AssertionFailed {
+                                msg: "assertion failed".to_string(),
                                 pos,
-                                expected: Type::T32,
-                                got: type_of_value(&other),
                             });
                         }
                     }
+                    return Ok(Value::Num(0));
                 }
-                // Non-Expr arg form (copy/copyfree/copyinto) is not valid for
-                // exit; arity/shape is already enforced in the semantic phase.
-                Some(_) => 0,
-            };
-            return Err(RuntimeError::Exit(code));
-        }
 
-        // Built-in: print (with newline) and printn (no newline)
-        if callee == "print" || callee == "println" {
-            for arg in args {
-                if let SemanticCallArg::Expr(e) = arg {
-                    let v = self.eval_semantic_expr(e)?;
-                    self.print_value(&v);
+                // assert_eq(a, b) — runtime error if a != b
+                BuiltinKind::AssertEq => {
+                    let mut iter = args.iter();
+                    let left = if let Some(SemanticCallArg::Expr(e)) = iter.next() {
+                        self.eval_semantic_expr(e)?
+                    } else { return Ok(Value::Num(0)); };
+                    let right = if let Some(SemanticCallArg::Expr(e)) = iter.next() {
+                        self.eval_semantic_expr(e)?
+                    } else { return Ok(Value::Num(0)); };
+                    let equal = match (&left, &right) {
+                        (Value::Num(a), Value::Num(b)) => a == b,
+                        (Value::Bool(a), Value::Bool(b)) => a == b,
+                        (Value::Float(a), Value::Float(b)) => a == b,
+                        (Value::Str(ao, al), Value::Str(bo, bl)) => {
+                            self.resolve_str(*ao, *al) == self.resolve_str(*bo, *bl)
+                        }
+                        (Value::ResultOk(a), Value::ResultOk(b)) => a == b,
+                        (Value::ResultErr(a), Value::ResultErr(b)) => a == b,
+                        _ => false,
+                    };
+                    if !equal {
+                        return Err(RuntimeError::AssertionFailed {
+                            msg: format!("assert_eq failed: {} != {}",
+                                value_to_string(self, left),
+                                value_to_string(self, right)),
+                            pos,
+                        });
+                    }
+                    return Ok(Value::Num(0));
                 }
-            }
-            return Ok(Value::Num(0));
-        }
-        if callee == "printn" {
-            for arg in args {
-                if let SemanticCallArg::Expr(e) = arg {
-                    let v = self.eval_semantic_expr(e)?;
-                    self.print_value_inline(&v);
-                }
-            }
-            return Ok(Value::Num(0));
-        }
 
-        // Built-in: assert(cond) — runtime error if condition is false
-        if callee == "assert" {
-            if let Some(SemanticCallArg::Expr(e)) = args.first() {
-                let val = self.eval_semantic_expr(e)?;
-                let passed = match val {
-                    Value::Bool(b) => b,
-                    Value::Num(n) => n != 0,
-                    _ => false,
-                };
-                if !passed {
-                    return Err(RuntimeError::AssertionFailed {
-                        msg: "assertion failed".to_string(),
-                        pos,
-                    });
+                // read(var) — reads a line from stdin into var
+                BuiltinKind::Read => {
+                    if let Some(SemanticCallArg::Expr(e)) = args.first() {
+                        let mut input = String::new();
+                        std::io::stdin().read_line(&mut input).unwrap_or(0);
+                        let input = input.trim_end_matches('\n').trim_end_matches('\r').to_string();
+                        let (off, len) = self.alloc_str(&input);
+                        if let SemanticExprKind::VarRef { name, .. } = &e.kind {
+                            self.set_var(name.clone(), Value::Str(off, len), 0)?;
+                        }
+                        return Ok(Value::Str(off, len));
+                    }
+                    return Ok(Value::Num(0));
                 }
-            }
-            return Ok(Value::Num(0));
-        }
 
-        // Built-in: assert_eq(a, b) — runtime error if a != b
-        if callee == "assert_eq" {
-            let mut iter = args.iter();
-            let left = if let Some(SemanticCallArg::Expr(e)) = iter.next() {
-                self.eval_semantic_expr(e)?
-            } else { return Ok(Value::Num(0)); };
-            let right = if let Some(SemanticCallArg::Expr(e)) = iter.next() {
-                self.eval_semantic_expr(e)?
-            } else { return Ok(Value::Num(0)); };
-            let equal = match (&left, &right) {
-                (Value::Num(a), Value::Num(b)) => a == b,
-                (Value::Bool(a), Value::Bool(b)) => a == b,
-                (Value::Float(a), Value::Float(b)) => a == b,
-                (Value::Str(ao, al), Value::Str(bo, bl)) => {
-                    self.resolve_str(*ao, *al) == self.resolve_str(*bo, *bl)
+                // input("prompt", var) — prints prompt then reads into var
+                BuiltinKind::Input => {
+                    let mut iter = args.iter();
+                    // First arg is the prompt string
+                    if let Some(SemanticCallArg::Expr(prompt_expr)) = iter.next() {
+                        let prompt_val = self.eval_semantic_expr(prompt_expr)?;
+                        match &prompt_val {
+                            Value::Str(off, len) => print!("{}", self.resolve_str(*off, *len)),
+                            other => print!("{}", value_to_string(self, other.clone())),
+                        }
+                        use std::io::Write;
+                        std::io::stdout().flush().unwrap_or(());
+                    }
+                    // Second arg is the variable to fill
+                    if let Some(SemanticCallArg::Expr(var_expr)) = iter.next() {
+                        let mut input = String::new();
+                        std::io::stdin().read_line(&mut input).unwrap_or(0);
+                        let input = input.trim_end_matches('\n').trim_end_matches('\r').to_string();
+                        let (off, len) = self.alloc_str(&input);
+                        if let SemanticExprKind::VarRef { name, .. } = &var_expr.kind {
+                            self.set_var(name.clone(), Value::Str(off, len), 0)?;
+                        }
+                        return Ok(Value::Str(off, len));
+                    }
+                    return Ok(Value::Num(0));
                 }
-                (Value::ResultOk(a), Value::ResultOk(b)) => a == b,
-                (Value::ResultErr(a), Value::ResultErr(b)) => a == b,
-                _ => false,
-            };
-            if !equal {
-                return Err(RuntimeError::AssertionFailed {
-                    msg: format!("assert_eq failed: {} != {}",
-                        value_to_string(self, left),
-                        value_to_string(self, right)),
-                    pos,
-                });
             }
-            return Ok(Value::Num(0));
-        }
-
-        // Built-in: read(var) — reads a line from stdin into var
-        if callee == "read" {
-            if let Some(SemanticCallArg::Expr(e)) = args.first() {
-                let mut input = String::new();
-                std::io::stdin().read_line(&mut input).unwrap_or(0);
-                let input = input.trim_end_matches('\n').trim_end_matches('\r').to_string();
-                let (off, len) = self.alloc_str(&input);
-                if let SemanticExprKind::VarRef { name, .. } = &e.kind {
-                    self.set_var(name.clone(), Value::Str(off, len), 0)?;
-                }
-                return Ok(Value::Str(off, len));
-            }
-            return Ok(Value::Num(0));
-        }
-
-        // Built-in: input("prompt", var) — prints prompt then reads into var
-        if callee == "input" {
-            let mut iter = args.iter();
-            // First arg is the prompt string
-            if let Some(SemanticCallArg::Expr(prompt_expr)) = iter.next() {
-                let prompt_val = self.eval_semantic_expr(prompt_expr)?;
-                match &prompt_val {
-                    Value::Str(off, len) => print!("{}", self.resolve_str(*off, *len)),
-                    other => print!("{}", value_to_string(self, other.clone())),
-                }
-                use std::io::Write;
-                std::io::stdout().flush().unwrap_or(());
-            }
-            // Second arg is the variable to fill
-            if let Some(SemanticCallArg::Expr(var_expr)) = iter.next() {
-                let mut input = String::new();
-                std::io::stdin().read_line(&mut input).unwrap_or(0);
-                let input = input.trim_end_matches('\n').trim_end_matches('\r').to_string();
-                let (off, len) = self.alloc_str(&input);
-                if let SemanticExprKind::VarRef { name, .. } = &var_expr.kind {
-                    self.set_var(name.clone(), Value::Str(off, len), 0)?;
-                }
-                return Ok(Value::Str(off, len));
-            }
-            return Ok(Value::Num(0));
         }
 
         // Native copy semantics — no fallback to AST path needed

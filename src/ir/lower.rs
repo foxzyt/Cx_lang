@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 use crate::frontend::ast::Op;
+use crate::frontend::builtins::{self, BuiltinKind, JitStatus};
 use crate::frontend::semantic_types::{
     BindingId, SemanticCallArg, SemanticExpr, SemanticExprKind, SemanticLValue,
     SemanticParamKind, SemanticProgram, SemanticStmt, SemanticType, SemanticValue,
@@ -93,7 +94,13 @@ impl std::error::Error for LoweringError {}
 // Builtins that are handled before this gate (assert, assert_eq, print, println, printn)
 // are intercepted in `lower_stmt` and never reach `is_cx_builtin`.
 fn is_cx_builtin(name: &str) -> bool {
-    matches!(name, "read" | "input")
+    // Builtins the JIT does not yet lower but should reject with a structured
+    // error (today: read, input). Derived from the registry's JIT status (#008)
+    // rather than a hardcoded name list.
+    matches!(
+        builtins::lookup(name).map(|d| d.jit),
+        Some(JitStatus::GatedUnsupported)
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -782,13 +789,14 @@ fn lower_stmt(
             // they are routed to the dedicated lowering functions rather than
             // returning a structured error.
             if let SemanticExprKind::Call { callee, args, .. } = &expr.kind {
-                match callee.as_str() {
-                    "assert" => return lower_assert_stmt(args, ctx, current),
-                    "assert_eq" => return lower_assert_eq_stmt(args, ctx, current),
-                    "print" | "println" => {
+                // Builtin lowering dispatch keyed on the registry kind (#008).
+                match builtins::lookup(callee).map(|d| d.kind) {
+                    Some(BuiltinKind::Assert) => return lower_assert_stmt(args, ctx, current),
+                    Some(BuiltinKind::AssertEq) => return lower_assert_eq_stmt(args, ctx, current),
+                    Some(BuiltinKind::Print) | Some(BuiltinKind::Println) => {
                         return lower_print_stmt(callee.as_str(), args, ctx, current)
                     }
-                    "printn" => return lower_printn_stmt(args, ctx, current),
+                    Some(BuiltinKind::Printn) => return lower_printn_stmt(args, ctx, current),
                     _ => {}
                 }
             }

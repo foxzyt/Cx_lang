@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::frontend::ast::*;
+use crate::frontend::builtins::{self, BuiltinKind, BuiltinRet};
 use crate::frontend::semantic_types::*;
 
 #[derive(Debug, Clone)]
@@ -1604,101 +1605,114 @@ Expr::Unary(op, inner, pos) => {
         args: &[CallArg],
         pos: usize,
     ) -> Result<SemanticExpr, SemanticError> {
-        if name == "is_known" {
-            let expr = match args.first() {
-                Some(CallArg::Expr(expr)) => self.analyze_expr(expr)?,
-                _ => {
-                    return Err(sem_err!(pos, "call to undefined function '{}'", name));
-                }
-            };
-            return Ok(SemanticExpr {
-                ty: SemanticType::Bool,
-                kind: SemanticExprKind::Call {
-                    callee: name.to_string(),
-                    function: FunctionId(u32::MAX),
-                    args: vec![SemanticCallArg::Expr(expr)],
-                },
-            });
-        }
-
-        // Built-in: exit(code) / exit() — terminate with a process exit code.
-        // Accepts 0 or 1 arg; arity enforced here so the runtime sees only the
-        // valid shapes. Return type Void (no usable value); divergence is a
-        // runtime concern, not a type-system one for 0.1 (no Never/Diverges).
-        if name == "exit" {
-            if args.len() > 1 {
-                return Err(sem_err!(
-                    pos,
-                    "'exit' expects 0 or 1 argument(s), got {}",
-                    args.len()
-                ));
-            }
-            let mut semantic_args = Vec::new();
-            if let Some(CallArg::Expr(expr)) = args.first() {
-                semantic_args.push(SemanticCallArg::Expr(self.analyze_expr(expr)?));
-            }
-            return Ok(SemanticExpr {
-                ty: SemanticType::Void,
-                kind: SemanticExprKind::Call {
-                    callee: name.to_string(),
-                    function: FunctionId(u32::MAX),
-                    args: semantic_args,
-                },
-            });
-        }
-
-        // Built-in: read(var) and input("prompt", var)
-        if name == "read" || name == "input" || name == "print" || name == "println" || name == "printn" || name == "assert" || name == "assert_eq" {
-            let mut semantic_args = Vec::new();
-            for arg in args {
-                match arg {
-                    CallArg::Expr(expr) => {
-                        let sem_expr = self.analyze_expr(expr)?;
-                        semantic_args.push(SemanticCallArg::Expr(sem_expr));
-                    }
-                    _ => {}
-                }
-            }
-            if name == "assert_eq" && semantic_args.len() == 2 {
-                let lhs_ty = if let SemanticCallArg::Expr(e) = &semantic_args[0] {
-                    Some(e.ty.clone())
-                } else { None };
-                let rhs_ty = if let SemanticCallArg::Expr(e) = &semantic_args[1] {
-                    Some(e.ty.clone())
-                } else { None };
-                if let (Some(lhs_ty), Some(rhs_ty)) = (lhs_ty, rhs_ty) {
-                    if lhs_ty == SemanticType::Numeric
-                        && rhs_ty != SemanticType::Numeric
-                        && is_numeric(&rhs_ty)
-                    {
-                        if let SemanticCallArg::Expr(lhs) = semantic_args[0].clone() {
-                            semantic_args[0] =
-                                SemanticCallArg::Expr(insert_cast_if_needed(lhs, &rhs_ty));
+        // Built-in dispatch — names and per-builtin metadata come from the
+        // single-source-of-truth registry (crate::frontend::builtins, #008).
+        // Each kind keeps its existing recognition behavior verbatim.
+        if let Some(def) = builtins::lookup(name) {
+            match def.kind {
+                BuiltinKind::IsKnown => {
+                    let expr = match args.first() {
+                        Some(CallArg::Expr(expr)) => self.analyze_expr(expr)?,
+                        _ => {
+                            return Err(sem_err!(pos, "call to undefined function '{}'", name));
                         }
-                    } else if rhs_ty == SemanticType::Numeric
-                        && lhs_ty != SemanticType::Numeric
-                        && is_numeric(&lhs_ty)
-                    {
-                        if let SemanticCallArg::Expr(rhs) = semantic_args[1].clone() {
-                            semantic_args[1] =
-                                SemanticCallArg::Expr(insert_cast_if_needed(rhs, &lhs_ty));
+                    };
+                    return Ok(SemanticExpr {
+                        ty: SemanticType::Bool,
+                        kind: SemanticExprKind::Call {
+                            callee: name.to_string(),
+                            function: FunctionId(u32::MAX),
+                            args: vec![SemanticCallArg::Expr(expr)],
+                        },
+                    });
+                }
+
+                // Built-in: exit(code) / exit() — terminate with a process exit
+                // code. Arity (0 or 1) enforced here via the registry so the
+                // runtime sees only valid shapes. Return type Void (no usable
+                // value); divergence is a runtime concern, not a type-system one
+                // for 0.2 (no Never/Diverges).
+                BuiltinKind::Exit => {
+                    if !def.arity.accepts(args.len()) {
+                        return Err(sem_err!(
+                            pos,
+                            "'exit' expects 0 or 1 argument(s), got {}",
+                            args.len()
+                        ));
+                    }
+                    let mut semantic_args = Vec::new();
+                    if let Some(CallArg::Expr(expr)) = args.first() {
+                        semantic_args.push(SemanticCallArg::Expr(self.analyze_expr(expr)?));
+                    }
+                    return Ok(SemanticExpr {
+                        ty: SemanticType::Void,
+                        kind: SemanticExprKind::Call {
+                            callee: name.to_string(),
+                            function: FunctionId(u32::MAX),
+                            args: semantic_args,
+                        },
+                    });
+                }
+
+                // read(var), input("prompt", var), print/println/printn, assert,
+                // assert_eq — collect Expr args; return type comes from the
+                // registry (Str for read/input, Void otherwise).
+                BuiltinKind::Read
+                | BuiltinKind::Input
+                | BuiltinKind::Print
+                | BuiltinKind::Println
+                | BuiltinKind::Printn
+                | BuiltinKind::Assert
+                | BuiltinKind::AssertEq => {
+                    let mut semantic_args = Vec::new();
+                    for arg in args {
+                        if let CallArg::Expr(expr) = arg {
+                            let sem_expr = self.analyze_expr(expr)?;
+                            semantic_args.push(SemanticCallArg::Expr(sem_expr));
                         }
                     }
+                    if def.kind == BuiltinKind::AssertEq && semantic_args.len() == 2 {
+                        let lhs_ty = if let SemanticCallArg::Expr(e) = &semantic_args[0] {
+                            Some(e.ty.clone())
+                        } else { None };
+                        let rhs_ty = if let SemanticCallArg::Expr(e) = &semantic_args[1] {
+                            Some(e.ty.clone())
+                        } else { None };
+                        if let (Some(lhs_ty), Some(rhs_ty)) = (lhs_ty, rhs_ty) {
+                            if lhs_ty == SemanticType::Numeric
+                                && rhs_ty != SemanticType::Numeric
+                                && is_numeric(&rhs_ty)
+                            {
+                                if let SemanticCallArg::Expr(lhs) = semantic_args[0].clone() {
+                                    semantic_args[0] =
+                                        SemanticCallArg::Expr(insert_cast_if_needed(lhs, &rhs_ty));
+                                }
+                            } else if rhs_ty == SemanticType::Numeric
+                                && lhs_ty != SemanticType::Numeric
+                                && is_numeric(&lhs_ty)
+                            {
+                                if let SemanticCallArg::Expr(rhs) = semantic_args[1].clone() {
+                                    semantic_args[1] =
+                                        SemanticCallArg::Expr(insert_cast_if_needed(rhs, &lhs_ty));
+                                }
+                            }
+                        }
+                    }
+                    let ret_ty = match def.ret {
+                        BuiltinRet::Str => SemanticType::Str,
+                        BuiltinRet::Bool => SemanticType::Bool,
+                        BuiltinRet::Void => SemanticType::Void,
+                    };
+                    return Ok(SemanticExpr {
+                        ty: ret_ty,
+                        kind: SemanticExprKind::Call {
+                            callee: name.to_string(),
+                            function: FunctionId(u32::MAX),
+                            args: semantic_args,
+                        },
+                    });
                 }
             }
-            let ret_ty = if name == "read" || name == "input" {
-                SemanticType::Str
-            } else {
-                SemanticType::Void
-            };
-            return Ok(SemanticExpr {
-                ty: ret_ty,
-                kind: SemanticExprKind::Call {
-                    callee: name.to_string(),
-                    function: FunctionId(u32::MAX),
-                    args: semantic_args,
-                },
-            });
         }
 
         let function = self.funcs.get(name).cloned().ok_or_else(|| sem_err!(pos, "call to undefined function '{}'", name))?;

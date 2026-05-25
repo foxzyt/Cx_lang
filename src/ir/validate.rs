@@ -122,11 +122,13 @@ pub fn validate_module(module: &IrModule) -> Result<(), Vec<IrValidationError>> 
 }
 
 fn is_reserved_runtime_intrinsic(name: &str) -> bool {
-    matches!(
-        name,
-        "print" | "println" | "printn" | "read" | "input"
-            | "assert" | "assert_eq" | "is_known" | "cx_printn"
-    )
+    // Composed from two single-source-of-truth lists (#008): the user-callable
+    // Cx builtin registry (every builtin except `exit`, whose
+    // validator_reserved=false — preserved asymmetry, #033) and the C-ABI
+    // runtime intrinsic names (`cx_printn`). Union reproduces the prior
+    // hardcoded set exactly.
+    crate::frontend::builtins::is_validator_reserved(name)
+        || runtime_intrinsic_names().contains(name)
 }
 
 fn validate_function(
