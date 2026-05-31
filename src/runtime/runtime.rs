@@ -2,7 +2,6 @@
 use crate::frontend::{ast::*, diagnostics, types::*};
 use crate::frontend::builtins::{self, BuiltinKind};
 use crate::frontend::semantic_types::*;
-use crate::runtime::arena::Arena;
 use crate::runtime::handle::HandleRegistry;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -19,7 +18,6 @@ pub enum ScopeEvent {
     HandleAlloc { slot: u32, gen: u32 },
     HandleDrop { slot: u32, gen: u32 },
     HandleAccess { slot: u32, gen: u32, stale: bool },
-    ArenaReset { bytes: usize, chunks: usize },
 }
 
 /// Identity hasher for `BindingId` (tracker #009). `BindingId` is a dense u32
@@ -60,19 +58,17 @@ pub struct ScopeFrame {
     pub by_name: HashMap<String, BindingId>,
     pub freed: HashSet<String>,
     pub bleed_back: HashMap<String, (usize, String)>,
-    pub arena: Option<Arena>,
     pub seen: HashSet<String>,
     // inner param name -> (outer scope index, outer var name)
 }
 
 impl ScopeFrame {
-    fn new(arena: Option<Arena>) -> Self {
+    fn new() -> Self {
         ScopeFrame {
             vars: VarMap::default(),
             by_name: HashMap::new(),
             freed: HashSet::new(),
             bleed_back: HashMap::new(),
-            arena,
             seen: HashSet::new(),
         }
     }
@@ -138,28 +134,13 @@ impl RunTime {
         }
     }
 
-    fn track_in_arena(&mut self, value: &Value) {
-        let size = match value {
-            Value::Str(_, len) => *len as usize + 1,
-            Value::Container(map) => map.iter().map(|(k, _)| k.len() + 16).sum::<usize>() + 32,
-            _ => return, // numbers, bools, chars not arena tracked
-        };
-
-        for frame in self.scopes.iter_mut().rev() {
-            if let Some(arena) = &mut frame.arena {
-                arena.alloc(size, 1);
-                return;
-            }
-        }
-    }
-
     pub fn new() -> Self {
         Self {
             string_arena: Vec::new(),
             handles: HandleRegistry::new(),
             structs: HashMap::new(),
             semantic_impls: HashMap::new(),
-            scopes: vec![ScopeFrame::new(None)], // top level is not a function scope
+            scopes: vec![ScopeFrame::new()],
             semantic_funcs: HashMap::new(),
             debug_scope: false,
             consts: HashMap::new(),
@@ -167,7 +148,7 @@ impl RunTime {
     }
 
     pub fn push_scope(&mut self) {
-        self.scopes.push(ScopeFrame::new(None)); // block scope - no arena
+        self.scopes.push(ScopeFrame::new());
         if self.debug_scope {
             diagnostics::print_scope_event(&ScopeEvent::Open(format!(
                 "scope#{}",
@@ -177,7 +158,7 @@ impl RunTime {
     }
 
     pub fn push_function_scope(&mut self) {
-        self.scopes.push(ScopeFrame::new(Some(Arena::new()))); // function scope - gets its own arena
+        self.scopes.push(ScopeFrame::new());
         if self.debug_scope {
             diagnostics::print_scope_event(&ScopeEvent::Open(format!(
                 "scope#{}",
@@ -226,9 +207,7 @@ impl RunTime {
                     .cloned()
                     .collect();
                 let close_label = format!("scope#{}", self.scopes.len() - 1);
-                let had_arena = frame.arena.as_ref()
-                    .map(|a| (a.bytes_used(), a.chunk_count()));
-                Some((free_names, bleed_events, close_label, had_arena))
+                Some((free_names, bleed_events, close_label))
             } else {
                 None
             };
@@ -246,7 +225,7 @@ impl RunTime {
             }
         }
 
-        if let Some((free_names, bleed_events, close_label, had_arena)) = debug_info {
+        if let Some((free_names, bleed_events, close_label)) = debug_info {
             for name in &free_names {
                 diagnostics::print_scope_event(&ScopeEvent::Free(name.clone()));
             }
@@ -254,9 +233,6 @@ impl RunTime {
                 diagnostics::print_scope_event(&ScopeEvent::BleedBack(name.clone(), val.clone()));
             }
             diagnostics::print_scope_event(&ScopeEvent::Close(close_label));
-            if let Some((bytes, chunks)) = had_arena {
-                diagnostics::print_scope_event(&ScopeEvent::ArenaReset { bytes, chunks });
-            }
         }
     }
 
@@ -279,9 +255,8 @@ impl RunTime {
     }
 
     /// Shared write path: type-check `value` against the entry at `binding` in
-    /// frame `i`, write it, track arena usage, emit debug events. The caller has
-    /// already located the owning frame (by binding on the hot path, by name on
-    /// the cold path).
+    /// frame `i`, write it, emit debug events. The caller has already located the
+    /// owning frame (by binding on the hot path, by name on the cold path).
     fn write_var_at(
         &mut self,
         i: usize,
@@ -290,37 +265,29 @@ impl RunTime {
         value: Value,
         pos: usize,
     ) -> Result<(), RuntimeError> {
-        let tracked_value;
-        {
-            let frame = &mut self.scopes[i];
-            let entry = frame.vars.get_mut(&binding).unwrap();
+        let frame = &mut self.scopes[i];
+        let entry = frame.vars.get_mut(&binding).unwrap();
 
-            let was_initialized = entry.val.is_some();
-            if entry.ty.is_none() {
-                entry.ty = Some(type_of_value(&value));
-            }
-
-            let expected = entry.ty.clone().unwrap();
-            let got = type_of_value(&value);
-            if !value_matches_type(&value, &expected) {
-                return Err(RuntimeError::TypeMismatch { pos, expected, got });
-            }
-
-            entry.val = Some(value);
-            tracked_value = entry.val.clone();
-
-            if self.debug_scope {
-                let logged = entry.val.clone().unwrap();
-                if was_initialized {
-                    diagnostics::print_scope_event(&ScopeEvent::Mutate(name.to_string(), logged));
-                } else {
-                    diagnostics::print_scope_event(&ScopeEvent::Add(name.to_string(), logged));
-                }
-            }
+        let was_initialized = entry.val.is_some();
+        if entry.ty.is_none() {
+            entry.ty = Some(type_of_value(&value));
         }
 
-        if let Some(v) = tracked_value.as_ref() {
-            self.track_in_arena(v);
+        let expected = entry.ty.clone().unwrap();
+        let got = type_of_value(&value);
+        if !value_matches_type(&value, &expected) {
+            return Err(RuntimeError::TypeMismatch { pos, expected, got });
+        }
+
+        entry.val = Some(value);
+
+        if self.debug_scope {
+            let logged = entry.val.clone().unwrap();
+            if was_initialized {
+                diagnostics::print_scope_event(&ScopeEvent::Mutate(name.to_string(), logged));
+            } else {
+                diagnostics::print_scope_event(&ScopeEvent::Add(name.to_string(), logged));
+            }
         }
         Ok(())
     }
@@ -402,7 +369,6 @@ impl RunTime {
             }
         }
 
-        self.track_in_arena(&logged);
         Ok(())
     }
 

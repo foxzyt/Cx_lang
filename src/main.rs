@@ -5,8 +5,6 @@ mod runtime;
 #[cfg(test)]
 mod diff_harness;
 
-pub use runtime::arena::Arena;
-
 use backend::Backend;
 use frontend::ast::*;
 use frontend::diagnostics;

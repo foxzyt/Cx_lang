@@ -531,15 +531,5 @@ pub fn print_scope_event(event: &ScopeEvent) {
                 eprintln!("  ⬡ handle access slot={} gen={} ok", slot, gen);
             }
         }
-        ScopeEvent::ArenaReset { bytes, chunks } => {
-            if *bytes == 0 {
-                eprintln!("  ? arena reset  N/A  {} chunk(s)", chunks);
-            } else {
-                eprintln!(
-                    "  ? arena reset  {} bytes freed  {} chunk(s)",
-                    bytes, chunks
-                );
-            }
-        }
     }
 }
