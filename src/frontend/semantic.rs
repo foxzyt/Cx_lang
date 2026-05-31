@@ -2058,23 +2058,42 @@ fn check_num_range(ty: &SemanticType, n: i128, pos: usize) -> Result<(), Semanti
     Ok(())
 }
 
-/// If `expr` is an integer literal, range-check it against the declared type
-/// `expected` (#028). Negative literals are `Unary(Minus, Num(_))`, not bare
-/// `Num`, so this catches the positive-overflow case the compiler can see
-/// statically (the documented `return 300` → `t8` scenario).
+/// If `expr` is an integer literal — bare `Num(n)` or a negated literal
+/// `Unary(Minus, Num(n))` — range-check its VALUE against the declared type
+/// `expected` (#028 + #037). The sign is folded first and the signed result is
+/// checked, so the check is value-aware: `Num(128)` is out of range for t8 but
+/// `-Num(128)` = -128 is the valid minimum. `n` is a positive `Num` (≤ i128::MAX
+/// — the lexer rejects larger), so `-n` never overflows.
 fn check_literal_fits(expr: &Expr, expected: &SemanticType, pos: usize) -> Result<(), SemanticError> {
-    if let Expr::Val(AstValue::Num(n)) = expr {
-        check_num_range(expected, *n, pos)?;
+    let value = match expr {
+        Expr::Val(AstValue::Num(n)) => Some(*n),
+        Expr::Unary(Op::Minus, inner, _) => match inner.as_ref() {
+            Expr::Val(AstValue::Num(n)) => Some(-*n),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(n) = value {
+        check_num_range(expected, n, pos)?;
     }
     Ok(())
 }
 
 /// Same as [`check_literal_fits`] but for an already-analyzed expression — used
 /// where only the `SemanticExpr` is in scope (field assignment, array elements,
-/// call arguments). A bare integer literal analyzes to `Value(Num(_))` (#028).
+/// call arguments). A bare integer literal analyzes to `Value(Num(_))`; a negated
+/// one to `Unary { Minus, Value(Num(_)) }` (the analyzer does not constant-fold).
 fn check_semantic_num_fits(sem: &SemanticExpr, expected: &SemanticType, pos: usize) -> Result<(), SemanticError> {
-    if let SemanticExprKind::Value(SemanticValue::Num(n)) = &sem.kind {
-        check_num_range(expected, *n, pos)?;
+    let value = match &sem.kind {
+        SemanticExprKind::Value(SemanticValue::Num(n)) => Some(*n),
+        SemanticExprKind::Unary { op: Op::Minus, expr, .. } => match &expr.kind {
+            SemanticExprKind::Value(SemanticValue::Num(n)) => Some(-*n),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(n) = value {
+        check_num_range(expected, n, pos)?;
     }
     Ok(())
 }
