@@ -1161,7 +1161,7 @@ Stmt::ExprStmt { expr, _pos } => Ok(SemanticStmt::ExprStmt {
 
     fn analyze_expr(&mut self, expr: &Expr) -> Result<SemanticExpr, SemanticError> {
         match expr {
-            Expr::Val(AstValue::StructInstance(type_name, _type_args, field_exprs)) => {
+            Expr::Val(AstValue::StructInstance(type_name, _type_args, field_exprs, pos)) => {
                 let mut semantic_fields: Vec<(String, SemanticExpr)> = Vec::new();
                 if let Some(struct_fields) = self.structs.get(type_name).cloned() {
                     // The struct's own generic parameters must be in scope when
@@ -1174,7 +1174,7 @@ Stmt::ExprStmt { expr, _pos } => Ok(SemanticStmt::ExprStmt {
                     for (fname, ftype) in &struct_fields {
                         let sem_ty = semantic_type_from_decl(ftype.clone(), &field_type_params);
                         if sem_ty == SemanticType::StrRef {
-                            return Err(sem_err!(0, "struct '{}' has a strref field '{}' — StrRef cannot be stored in struct fields because it does not outlive the struct", type_name, fname));
+                            return Err(sem_err!(*pos, "struct '{}' has a strref field '{}' — StrRef cannot be stored in struct fields because it does not outlive the struct", type_name, fname));
                         }
                     }
                     // Each provided field must exist on the struct, and its value's
@@ -1182,11 +1182,11 @@ Stmt::ExprStmt { expr, _pos } => Ok(SemanticStmt::ExprStmt {
                     for (fname, fexpr) in field_exprs {
                         let sem_expr = self.analyze_expr(fexpr)?;
                         match struct_fields.iter().find(|(decl_name, _)| decl_name == fname) {
-                            None => return Err(sem_err!(0, "unknown field '{}' in struct literal of type '{}'", fname, type_name)),
+                            None => return Err(sem_err!(*pos, "unknown field '{}' in struct literal of type '{}'", fname, type_name)),
                             Some((_, decl_ty)) => {
                                 let decl_sem = semantic_type_from_decl(decl_ty.clone(), &field_type_params);
                                 if !types_compatible(&decl_sem, &sem_expr.ty) {
-                                    return Err(sem_err!(0, "field '{}' expects type '{}' but got '{}'", fname, self::type_name(&decl_sem), self::type_name(&sem_expr.ty)));
+                                    return Err(sem_err!(*pos, "field '{}' expects type '{}' but got '{}'", fname, self::type_name(&decl_sem), self::type_name(&sem_expr.ty)));
                                 }
                             }
                         }
@@ -1195,7 +1195,7 @@ Stmt::ExprStmt { expr, _pos } => Ok(SemanticStmt::ExprStmt {
                     // Every declared field must be supplied.
                     for (decl_name, _) in &struct_fields {
                         if !field_exprs.iter().any(|(fname, _)| fname == decl_name) {
-                            return Err(sem_err!(0, "missing field '{}' in struct literal of type '{}'", decl_name, type_name));
+                            return Err(sem_err!(*pos, "missing field '{}' in struct literal of type '{}'", decl_name, type_name));
                         }
                     }
                 } else {
@@ -1320,7 +1320,7 @@ Expr::Unary(op, inner, pos) => {
                 })
             }
             Expr::Bin(lhs, op, op_pos, rhs) => self.analyze_binary(lhs, *op, *op_pos, rhs),
-            Expr::ArrayLit(elems) => {
+            Expr::ArrayLit(elems, pos) => {
                 // Consume any declared-element-type hint up front (#031a) so the
                 // element sub-analyses below don't inherit it.
                 let declared_elem = self.expected_array_elem.take();
@@ -1341,7 +1341,7 @@ Expr::Unary(op, inner, pos) => {
                 };
                 for (i, e) in semantic_elems.iter().enumerate().skip(check_from) {
                     if !types_compatible(&elem_ty, &e.ty) {
-                        return Err(sem_err!(0, "array element at index {} expects type '{}' but got '{}'", i, type_name(&elem_ty), type_name(&e.ty)));
+                        return Err(sem_err!(*pos, "array element at index {} expects type '{}' but got '{}'", i, type_name(&elem_ty), type_name(&e.ty)));
                     }
                 }
                 Ok(SemanticExpr {
@@ -2098,7 +2098,7 @@ fn semantic_type_from_value(value: &AstValue) -> SemanticType {
         AstValue::Bool(_) => SemanticType::Bool,
         AstValue::Char(_) => SemanticType::Char,
         AstValue::EnumVariant(enum_name, _) => SemanticType::Enum(enum_name.clone()),
-        AstValue::StructInstance(name, _, _) => SemanticType::Struct(name.clone()),
+        AstValue::StructInstance(name, _, _, _) => SemanticType::Struct(name.clone()),
         AstValue::Unknown => SemanticType::Unknown,
     }
 }
@@ -2120,7 +2120,7 @@ fn semantic_value_from_ast(value: &AstValue, enums: &HashMap<String, EnumInfo>) 
                 variant_id,
             }
         }
-        AstValue::StructInstance(_, _, _) => SemanticValue::Unknown,
+        AstValue::StructInstance(_, _, _, _) => SemanticValue::Unknown,
         AstValue::Unknown => SemanticValue::Unknown,
     }
 }

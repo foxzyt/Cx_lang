@@ -454,7 +454,7 @@ Expr::Call(name, args, _) => {
             print_expr(lhs, depth + 1);
             print_expr(rhs, depth + 1);
         }
-        Expr::ArrayLit(elems) => {
+        Expr::ArrayLit(elems, _) => {
             eprintln!("{}ArrayLit", pad);
             for e in elems {
                 print_expr(e, depth + 1);

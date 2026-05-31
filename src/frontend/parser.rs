@@ -21,7 +21,7 @@ fn expr_pos(expr: &Expr) -> usize {
         Expr::Call(_, _, pos) => *pos,
         Expr::Unary(_, _, pos) => *pos,
 Expr::Bin(_, _, pos, _) => *pos,
-        Expr::ArrayLit(_) => 0,
+        Expr::ArrayLit(_, pos) => *pos,
         Expr::Index(_, _, pos) => *pos,
         Expr::MethodCall(_, _, _, pos) => *pos,
         Expr::When(_, _, pos) => *pos,
@@ -194,7 +194,9 @@ where
                     .collect::<Vec<_>>(),
             )
             .then_ignore(just(Token::PunctBraceClose))
-            .map(|((name, type_args), fields)| Expr::Val(AstValue::StructInstance(name, type_args, fields)))
+            .map_with(|((name, type_args), fields), e: &mut ParseExtra<'a, '_, I>| {
+                Expr::Val(AstValue::StructInstance(name, type_args, fields, e.span().start))
+            })
             .boxed();
 
         let enum_variant = ident
@@ -231,7 +233,7 @@ where
                 just(Token::PunctBracketOpen),
                 just(Token::PunctBracketClose),
             )
-            .map(|elems| Expr::ArrayLit(elems));
+            .map_with(|elems, e: &mut ParseExtra<'a, '_, I>| Expr::ArrayLit(elems, e.span().start));
 
         let when_expr_arm = {
             let pattern = choice((
