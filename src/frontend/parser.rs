@@ -89,7 +89,23 @@ where
             Token::KeywordFalse     => Expr::Val(AstValue::Bool(false)),
         }
         .or(just(Token::QuestionMark)
-            .map_with(|_, _e: &mut ParseExtra<'a, '_, I>| Expr::Val(AstValue::Unknown)));
+            .map_with(|_, _e: &mut ParseExtra<'a, '_, I>| Expr::Val(AstValue::Unknown)))
+        // Tracker #039 / audit F6: `unknown` is a `when`-pattern keyword, not a
+        // value. Without this arm, writing it in value position (`b: bool =
+        // unknown`) failed deep in the statement parser and reported at the `:`,
+        // never naming `?`. Match it here and `validate`-emit a targeted error at
+        // the `unknown` span, recovering as the unknown literal so the diagnostic
+        // points at the right token instead of cascading. The emitted error still
+        // fails the parse (into_result returns Err whenever any error is emitted).
+        .or(just(Token::KeywordUnknown).validate(
+            |_, e: &mut ParseExtra<'a, '_, I>, emitter| {
+                emitter.emit(Rich::custom(
+                    e.span(),
+                    "`unknown` is a pattern keyword, not a value — use `?` for the unknown literal",
+                ));
+                Expr::Val(AstValue::Unknown)
+            },
+        ));
 
         let ident = select! { Token::Identifier(s) => s };
         let ident_with_pos = ident
