@@ -267,12 +267,17 @@ SemanticStmt::Decl { binding, name, ty, .. } => {
                 self.run_semantic_when(val, arms)?;
                 Ok(())
             }
-            SemanticStmt::IfElse { condition, then_body, else_ifs, else_body, .. } => {
+            SemanticStmt::IfElse { condition, then_body, else_ifs, else_body, pos } => {
                 let cond_val = self.eval_semantic_expr(condition)?;
                 let is_true = match &cond_val {
                     Value::Bool(b) => *b,
                     Value::TBool(0) => false,
                     Value::TBool(1) => true,
+                    // An unknown TBool condition can't choose a branch — error
+                    // instead of silently taking `else` (tracker #026).
+                    Value::TBool(2) | Value::Unknown(_) => {
+                        return Err(RuntimeError::UnknownCondition { pos: *pos });
+                    }
                     Value::Num(n) => *n != 0,
                     _ => false,
                 };
@@ -295,6 +300,10 @@ SemanticStmt::Decl { binding, name, ty, .. } => {
                         Value::Bool(b) => *b,
                         Value::TBool(0) => false,
                         Value::TBool(1) => true,
+                        // Unknown `else if` condition — same rule as `if` (#026).
+                        Value::TBool(2) | Value::Unknown(_) => {
+                            return Err(RuntimeError::UnknownCondition { pos: *pos });
+                        }
                         Value::Num(n) => *n != 0,
                         _ => false,
                     };

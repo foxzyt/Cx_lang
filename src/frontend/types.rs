@@ -91,6 +91,13 @@ pub enum RuntimeError {
     StaleHandle {
         pos: usize,
     },
+    /// An `if` condition evaluated to the TBool `unknown` state (tracker #026).
+    /// An unknown value cannot choose a branch — silently taking `else` would
+    /// throw away the third state TBool exists to express. The user is directed
+    /// to `when`, which handles true/false/unknown explicitly.
+    UnknownCondition {
+        pos: usize,
+    },
     // `index` is i64 because Cx permits negative indices and the diagnostic
     // should echo the actual value the user wrote; `length` is usize because an
     // array length is non-negative; `pos` preserves the source location of the

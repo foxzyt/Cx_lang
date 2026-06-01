@@ -198,6 +198,12 @@ pub(crate) fn runtime_error_message(err: &RuntimeError) -> (String, usize) {
             "stale handle access - handle was already dropped".to_string(),
             *pos,
         ),
+        RuntimeError::UnknownCondition { pos } => (
+            "`if` condition is unknown; an unknown TBool can't choose a branch — \
+             use `when` to handle true, false, and unknown explicitly"
+                .to_string(),
+            *pos,
+        ),
         RuntimeError::IndexOutOfBounds { pos, index, length } => (
             format!("array index {} out of bounds for array of length {}", index, length),
             *pos,
