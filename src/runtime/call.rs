@@ -69,7 +69,7 @@ impl RunTime {
                     for arg in args {
                         if let SemanticCallArg::Expr(e) = arg {
                             let v = self.eval_semantic_expr(e)?;
-                            self.print_value(&v);
+                            self.print_value(&v, pos)?;
                         }
                     }
                     return Ok(Value::Num(0));
@@ -80,7 +80,7 @@ impl RunTime {
                     for arg in args {
                         if let SemanticCallArg::Expr(e) = arg {
                             let v = self.eval_semantic_expr(e)?;
-                            self.print_value_inline(&v);
+                            self.print_value_inline(&v, pos)?;
                         }
                     }
                     return Ok(Value::Num(0));

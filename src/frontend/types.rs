@@ -91,6 +91,19 @@ pub enum RuntimeError {
     StaleHandle {
         pos: usize,
     },
+    /// A `{...}` segment in an interpolated string did not resolve to a bound
+    /// variable (tracker #038). Previously such a segment was silently emitted
+    /// as literal text (audit F2) — a fat-fingered name like `{toatl}` or a
+    /// non-variable expression like `{fib(i)}` would appear verbatim in output
+    /// instead of erroring. `is_identifier` distinguishes a mistyped/undefined
+    /// bare name (true) from a non-variable expression (false) so the message
+    /// gives the right hint. Full arbitrary-expression interpolation is a 0.3
+    /// feature; this is the guard against silent-wrong-output until then.
+    BadInterpolation {
+        pos: usize,
+        content: String,
+        is_identifier: bool,
+    },
     /// An `if` condition evaluated to the TBool `unknown` state (tracker #026).
     /// An unknown value cannot choose a branch — silently taking `else` would
     /// throw away the third state TBool exists to express. The user is directed

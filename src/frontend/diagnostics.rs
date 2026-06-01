@@ -208,6 +208,26 @@ pub(crate) fn runtime_error_message(err: &RuntimeError) -> (String, usize) {
             format!("array index {} out of bounds for array of length {}", index, length),
             *pos,
         ),
+        // Tracker #038: a `{...}` in an interpolated string that doesn't resolve
+        // to a bound variable. The hint differs by failure mode: a non-variable
+        // expression gets the "compute it into a variable first" workaround; a
+        // bare name that simply isn't in scope is flagged as undefined.
+        RuntimeError::BadInterpolation { pos, content, is_identifier } => (
+            if *is_identifier {
+                format!(
+                    "string interpolation: no variable `{}` in scope — \
+                     check the name, or declare it before this string",
+                    content
+                )
+            } else {
+                format!(
+                    "string interpolation supports bare variables only; \
+                     compute `{{{}}}` into a variable first",
+                    content
+                )
+            },
+            *pos,
+        ),
         RuntimeError::BreakSignal =>("unhandled 'break' outside of a loop -- this may be a compiler bug".to_string(), 0),
         RuntimeError::ContinueSignal => ("unhandled 'continue' outside of a loop -- this may be a compiler bug".to_string(), 0),
         RuntimeError::ReadOnlyLoopVar { pos, name } => (
