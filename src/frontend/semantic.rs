@@ -684,6 +684,9 @@ Stmt::ExprStmt { expr, _pos } => Ok(SemanticStmt::ExprStmt {
                         })
                     })
                     .collect::<Result<Vec<_>, SemanticError>>()?;
+                if !when_is_exhaustive(&semantic_arms) {
+                    return Err(sem_err!(*pos, "non-exhaustive `when`: add a `_` catch-all arm to handle the remaining cases"));
+                }
                 Ok(SemanticStmt::When {
                     expr: semantic_expr,
                     arms: semantic_arms,
@@ -1389,6 +1392,9 @@ Expr::Unary(op, inner, pos) => {
                         }
                     }
                     semantic_arms.push(SemanticWhenArm { pattern, body, pos: arm.pos });
+                }
+                if !when_is_exhaustive(&semantic_arms) {
+                    return Err(sem_err!(*pos, "non-exhaustive `when`: add a `_` catch-all arm to handle the remaining cases"));
                 }
                 Ok(SemanticExpr {
                     ty: result_ty,
@@ -2096,6 +2102,30 @@ fn check_semantic_num_fits(sem: &SemanticExpr, expected: &SemanticType, pos: usi
         check_num_range(expected, n, pos)?;
     }
     Ok(())
+}
+
+/// Whether a `when`'s arms make it exhaustive (#027, lenient / Option 2).
+/// Exhaustive iff it has a catch-all `_` arm — also produced by enum group /
+/// super-group patterns, which `analyze_when_pattern` lowers to `Catchall` — OR
+/// it is a TBool match covering all three states (true, false, unknown). Open
+/// domains (numeric / range / string) and bare enum-variant matches must supply
+/// a `_`. Full static enum exhaustiveness is deferred to 0.3.
+fn when_is_exhaustive(arms: &[SemanticWhenArm]) -> bool {
+    if arms.iter().any(|a| matches!(a.pattern, SemanticWhenPattern::Catchall)) {
+        return true;
+    }
+    let (mut has_true, mut has_false, mut has_unknown) = (false, false, false);
+    for a in arms {
+        if let SemanticWhenPattern::Literal(sv) = &a.pattern {
+            match sv {
+                SemanticValue::Bool(true) => has_true = true,
+                SemanticValue::Bool(false) => has_false = true,
+                SemanticValue::Unknown => has_unknown = true,
+                _ => {}
+            }
+        }
+    }
+    has_true && has_false && has_unknown
 }
 
 fn semantic_type_from_decl(ty: Type, type_params: &[String]) -> SemanticType {
