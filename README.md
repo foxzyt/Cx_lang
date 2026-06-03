@@ -62,12 +62,12 @@ cargo run -- --backend=validate examples/fibonacci.cx
 
 ## Current Verification Status
 
-As of the current `submain`:
+As of `submain` at `0c03555`:
 
 - **243 unit tests passing** (`cargo test`)
 - **418 unit tests passing** with the JIT enabled (`cargo test --features jit`)
-- **208 verification fixtures**
-- **JIT parity: 134 PASS / 74 SKIP / 0 PARITY_FAIL** across all 208 fixtures
+- **219 verification fixtures**
+- **JIT parity: 137 PASS / 82 SKIP / 0 PARITY_FAIL** across all 219 fixtures
 - **zero Clippy errors**
 
 A fixture is **SKIP** when it exercises a language feature the JIT does not lower to native code yet (the interpreter still runs it). **PARITY_FAIL** means the interpreter and JIT disagree on observable behavior — that number must stay zero.
@@ -114,7 +114,7 @@ print(is_large(200))           // true
 A note on the samples above:
 
 - Declarations with a value are written `name: T = value`. Bare `let x;` declares an **uninitialized** binding (assigned later); it does not take an initializer.
-- `when` is an **expression** — its matched arm is the block's value, so it can be returned directly. `if`/`else` is a control-flow **statement**; to produce a value, use `when`, a bare trailing expression (as in `is_large`), or an explicit `return`.
+- Both `if` and `when` are **expressions**: the chosen branch (or arm) is the value, so either can be returned or assigned directly. Use `when` for multi-way matching and `if` for a two-way choice — `is_large` above uses a bare trailing expression, the tersest form. `if` and `when` also work as plain statements when their value isn't used.
 
 ---
 
@@ -169,6 +169,25 @@ size: str = when 7 {
 }
 print(size)                    // small
 ```
+
+### `if` as an expression
+
+`if` produces a value, just like `when` — use it for a two-way choice as an implicit return, on the right of an assignment, or nested in a larger expression.
+
+```cx
+fnc: t64 grade(n: t64) {
+    if n >= 90 { 4 } else { 3 }
+}
+print(grade(95))               // 4
+```
+
+```cx
+limit: t64 = 100
+x: t64 = if limit > 50 { 10 } else { 20 }
+print(x)                       // 10
+```
+
+Two rules for the value form: it must have an `else` (a consumed `if` always produces a value), and each branch is a single expression — the same shape as a `when` arm. As a plain statement, where the value is not used, `if` needs no `else`.
 
 ### Three-state `bool` and the `?` unknown literal
 
@@ -295,12 +314,14 @@ All currently JIT-lowered fixtures match interpreter behavior (0 PARITY_FAIL). A
 
 ### JIT Parity Baseline
 
+As of `0c03555`:
+
 | Status | Count |
 |--------|-------|
-| PASS | 134 |
-| SKIP | 74 |
+| PASS | 137 |
+| SKIP | 82 |
 | PARITY_FAIL | 0 |
-| **Total fixtures** | **208** |
+| **Total fixtures** | **219** |
 
 (Authoritative totals from the parity harness. Run `cargo test --features jit jit_parity_by_feature -- --nocapture` for the live per-category breakdown.)
 
@@ -310,6 +331,7 @@ All currently JIT-lowered fixtures match interpreter behavior (0 PARITY_FAIL). A
 
 These features **work in the interpreter** but are **not yet lowered to the JIT** (they show up as parity SKIP):
 
+- `if`-expression lowering (the `if`/`else` *statement* form is lowered; the *expression* form is interpreter-only for now)
 - enum IR lowering and `EnumVariant` arms in `when`
 - `Result<T>` / `?` operator lowering
 - string interpolation lowering
