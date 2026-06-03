@@ -490,12 +490,35 @@ SemanticStmt::Decl { binding, name, ty, .. } => {
         for arm in arms {
             let matches = match &arm.pattern {
                 SemanticWhenPattern::Literal(sv) => {
-                    let pat_val = self.semantic_value_to_runtime(sv);
-                    match (&val, &pat_val) {
-                        (Value::Str(vo, vl), Value::Str(po, pl)) => {
-                            self.resolve_str(*vo, *vl) == self.resolve_str(*po, *pl)
+                    // #044: a bool `when` scrutinee can arrive in two equivalent
+                    // representations — `Value::Bool` / `Value::Unknown` (definite
+                    // or untyped-`?` values) or the canonical TBool wire value
+                    // `Value::TBool(0|1|2)` (typed `bool` declarations via the
+                    // coercion above, and TBool arithmetic in ops.rs). Match a
+                    // bool pattern against BOTH forms, mirroring #026's
+                    // `if`-condition handling, so e.g. a typed `b: bool = ?`
+                    // (stored as `TBool(2)`) fires the `unknown` arm instead of
+                    // silently falling through. TBool 0/1/2 == false/true/unknown
+                    // by the fixed ABI wire definition, so these are exact, not
+                    // lenient, matches. The true/false TBool arms are defensive:
+                    // definite values reach `when` as `Value::Bool` today, but a
+                    // future `TBool(0|1)`-producing path would otherwise mismatch
+                    // the same way `unknown` did. Once the `unknown` arm fires for
+                    // `TBool(2)`, #027's syntactic exhaustiveness is sound with no
+                    // checker change.
+                    match sv {
+                        SemanticValue::Bool(true) => matches!(&val, Value::Bool(true) | Value::TBool(1)),
+                        SemanticValue::Bool(false) => matches!(&val, Value::Bool(false) | Value::TBool(0)),
+                        SemanticValue::Unknown => matches!(&val, Value::Unknown(_) | Value::TBool(2)),
+                        _ => {
+                            let pat_val = self.semantic_value_to_runtime(sv);
+                            match (&val, &pat_val) {
+                                (Value::Str(vo, vl), Value::Str(po, pl)) => {
+                                    self.resolve_str(*vo, *vl) == self.resolve_str(*po, *pl)
+                                }
+                                _ => val == pat_val,
+                            }
                         }
-                        _ => val == pat_val
                     }
                 }
                 SemanticWhenPattern::Range(lo, hi, inclusive) => {
