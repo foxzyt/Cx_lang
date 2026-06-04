@@ -1728,7 +1728,8 @@ Expr::Unary(op, inner, pos) => {
                 | BuiltinKind::Println
                 | BuiltinKind::Printn
                 | BuiltinKind::Assert
-                | BuiltinKind::AssertEq => {
+                | BuiltinKind::AssertEq
+                | BuiltinKind::Len => {
                     let mut semantic_args = Vec::new();
                     for arg in args {
                         if let CallArg::Expr(expr) = arg {
@@ -1763,10 +1764,31 @@ Expr::Unary(op, inner, pos) => {
                             }
                         }
                     }
+                    // Tracker #021: `len` accepts a string or array only. The
+                    // registry doesn't type-check builtin args in general (a
+                    // general arg-typing system is a 0.3 candidate); this is a
+                    // targeted one-builtin check.
+                    if def.kind == BuiltinKind::Len {
+                        let arg_ty = match semantic_args.first() {
+                            Some(SemanticCallArg::Expr(e)) => Some(&e.ty),
+                            _ => None,
+                        };
+                        let ok = matches!(
+                            arg_ty,
+                            Some(SemanticType::Str)
+                                | Some(SemanticType::StrRef)
+                                | Some(SemanticType::Array(_, _))
+                        );
+                        if !ok {
+                            let got = arg_ty.map(type_name).unwrap_or_else(|| "no argument".to_string());
+                            return Err(sem_err!(pos, "`len` expects a string or array, got {}", got));
+                        }
+                    }
                     let ret_ty = match def.ret {
                         BuiltinRet::Str => SemanticType::Str,
                         BuiltinRet::Bool => SemanticType::Bool,
                         BuiltinRet::Void => SemanticType::Void,
+                        BuiltinRet::Int => SemanticType::I64,
                     };
                     return Ok(SemanticExpr {
                         ty: ret_ty,

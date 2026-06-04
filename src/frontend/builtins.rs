@@ -36,6 +36,7 @@ pub enum BuiltinKind {
     AssertEq,
     IsKnown,
     Exit,
+    Len,
 }
 
 /// Argument-count contract for a builtin. Descriptive: only `exit` currently
@@ -68,6 +69,9 @@ pub enum BuiltinRet {
     Void,
     Bool,
     Str,
+    /// A signed integer, mapped to `SemanticType::I64` (t64) at the call site —
+    /// the natural Cx integer (tracker #021, `len`).
+    Int,
 }
 
 /// How the Cranelift JIT lowering pass treats a builtin today.
@@ -118,6 +122,7 @@ pub const BUILTINS: &[BuiltinDef] = &[
     BuiltinDef { name: "assert_eq", kind: BuiltinKind::AssertEq, arity: Arity::Exact(2),    ret: BuiltinRet::Void, validator_reserved: true,  jit: JitStatus::Lowered },
     BuiltinDef { name: "is_known",  kind: BuiltinKind::IsKnown,  arity: Arity::Exact(1),    ret: BuiltinRet::Bool, validator_reserved: true,  jit: JitStatus::Unhandled },
     BuiltinDef { name: "exit",      kind: BuiltinKind::Exit,     arity: Arity::Range(0, 1), ret: BuiltinRet::Void, validator_reserved: true,  jit: JitStatus::Unhandled },
+    BuiltinDef { name: "len",       kind: BuiltinKind::Len,      arity: Arity::Exact(1),    ret: BuiltinRet::Int,  validator_reserved: true,  jit: JitStatus::GatedUnsupported },
 ];
 
 /// Look up a builtin by its Cx source name. Linear scan over ~9 entries.

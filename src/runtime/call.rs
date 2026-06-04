@@ -23,6 +23,23 @@ impl RunTime {
                     }
                 }
 
+                // len(x) — tracker #021. Byte length for a string (the stored
+                // arena-slice length, not char/grapheme count) and element count
+                // for an array. Returns t64. The semantic layer guarantees the
+                // arg is a string or array, so the final arm is defensive.
+                BuiltinKind::Len => {
+                    let val = match args.first() {
+                        Some(SemanticCallArg::Expr(e)) => self.eval_semantic_expr(e)?,
+                        _ => return Err(RuntimeError::TypeMismatch { pos, expected: Type::Str, got: Type::Void }),
+                    };
+                    let n: i128 = match &val {
+                        Value::Str(_, len) => *len as i128,
+                        Value::Array(elems) => elems.len() as i128,
+                        _ => return Err(RuntimeError::TypeMismatch { pos, expected: Type::Str, got: type_of_value(&val) }),
+                    };
+                    return Ok(Value::Num(n));
+                }
+
                 // exit(code) / exit() — request process termination. Returns the
                 // Exit control-flow signal (NOT a process::exit call here); the
                 // top-level loop / --test loop translates it to a real exit so
