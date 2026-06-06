@@ -1016,17 +1016,21 @@ Stmt::ExprStmt { expr, _pos } => Ok(SemanticStmt::ExprStmt {
             .collect::<Result<Vec<_>, _>>()?;
 
         let semantic_ret_expr = if let Some(expr) = ret_expr {
-            let mut expr = self.analyze_expr(expr)?;
-            if expr.ty == SemanticType::StrRef {
-                return Err(sem_err!(pos, "cannot return a StrRef — it does not outlive its origin scope"));
-            }
-            if let Some(expected) = &self.current_ret_ty {
-                if !types_compatible(expected, &expr.ty) {
-                    return Err(sem_err!(pos, "return type mismatch: expected {}, got {}", type_name(expected), type_name(&expr.ty)));
+            match self.current_ret_ty.clone() {
+                // CR#3: the trailing-return chokepoint — same checks as a typed
+                // declaration (incl. the #028 width check the trailing path
+                // previously skipped, silently wrapping `fnc: t8 { 300 }` to 44).
+                Some(expected) => Some(self.analyze_returned_expr(expr, &expected, pos)?),
+                // Void function with a trailing expression: no declared width to
+                // check against, value discarded — analyze for errors only.
+                None => {
+                    let sem = self.analyze_expr(expr)?;
+                    if sem.ty == SemanticType::StrRef {
+                        return Err(sem_err!(pos, "cannot return a StrRef — it does not outlive its origin scope"));
+                    }
+                    Some(sem)
                 }
-                expr = insert_cast_if_needed(expr, expected);
             }
-            Some(expr)
         } else {
             if ret_ty.is_some() && !contains_return_stmt(body) {
                 return Err(sem_err!(pos, "missing return value, expected {}", type_name(&semantic_type_from_decl(ret_ty.clone().unwrap(), type_params))));
@@ -1062,17 +1066,11 @@ Stmt::ExprStmt { expr, _pos } => Ok(SemanticStmt::ExprStmt {
         }
 
         let expr = match (expr, self.current_ret_ty.clone()) {
-            (Some(expr), Some(expected)) => {
-                check_literal_fits(expr, &expected, pos)?;
-                let expr = self.analyze_expr(expr)?;
-                if expr.ty == SemanticType::StrRef {
-                    return Err(sem_err!(pos, "cannot return a StrRef — it does not outlive its origin scope"));
-                }
-                if !types_compatible(&expected, &expr.ty) {
-                    return Err(sem_err!(pos, "return type mismatch: expected {}, got {}", type_name(&expected), type_name(&expr.ty)));
-                }
-                Some(insert_cast_if_needed(expr, &expected))
-            }
+            // CR#3: explicit `return expr` routes through the same chokepoint as
+            // the trailing path. (It already range-checked a bare literal via
+            // check_literal_fits; the helper preserves that and ADDS the
+            // array-element check it lacked — `return [1, 2, 300]` now rejects.)
+            (Some(expr), Some(expected)) => Some(self.analyze_returned_expr(expr, &expected, pos)?),
             (None, None) => None,
             (None, Some(expected)) => {
                 return Err(sem_err!(pos, "missing return value, expected {}", type_name(&expected)));
@@ -1959,6 +1957,30 @@ Expr::Unary(op, inner, pos) => {
         } else {
             self.analyze_expr(expr)
         }
+    }
+
+    // Analyze a returned expression against the declared return type, running the
+    // SAME sequence a typed declaration runs (tracker CR#3): the array-element
+    // hint (CR#2), the bare-literal width check (#028/#037, both signs), the
+    // type-compatibility gate, then the (widening / in-range) cast. This is the
+    // single chokepoint both return forms route through — explicit `return expr`
+    // and the trailing-expression path (bare trailing expr, the #046 if-promotion,
+    // and `when`-as-return) — so a return is no longer a place where an
+    // out-of-range literal dodges the width check and silently wraps.
+    //
+    // Note: literals nested inside `if`/`when` BRANCHES (e.g. `{ if c { 300 } … }`)
+    // are not caught here — that gap is general (declarations wrap them too) and is
+    // tracked separately (CR#4); it is not return-specific.
+    fn analyze_returned_expr(&mut self, expr: &Expr, expected: &SemanticType, pos: usize) -> Result<SemanticExpr, SemanticError> {
+        let sem = self.analyze_expr_with_elem_hint(expr, expected)?;
+        if sem.ty == SemanticType::StrRef {
+            return Err(sem_err!(pos, "cannot return a StrRef — it does not outlive its origin scope"));
+        }
+        check_semantic_num_fits(&sem, expected, pos)?;
+        if !types_compatible(expected, &sem.ty) {
+            return Err(sem_err!(pos, "return type mismatch: expected {}, got {}", type_name(expected), type_name(&sem.ty)));
+        }
+        Ok(insert_cast_if_needed(sem, expected))
     }
 
     fn analyze_binary(
