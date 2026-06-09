@@ -506,7 +506,7 @@ impl Analyzer {
                     return Err(sem_err!(*pos_type, "cannot assign a StrRef to a variable — use an owned str instead"));
                 }
 
-                check_literal_fits(expr, &declared_ty, *pos_type)?;
+                check_semantic_num_fits(&semantic_expr, &declared_ty, *pos_type)?;
 
                 if !types_compatible(&declared_ty, &semantic_expr.ty) {
                     return Err(type_mismatch_error(
@@ -1067,8 +1067,8 @@ Stmt::ExprStmt { expr, _pos } => Ok(SemanticStmt::ExprStmt {
 
         let expr = match (expr, self.current_ret_ty.clone()) {
             // CR#3: explicit `return expr` routes through the same chokepoint as
-            // the trailing path. (It already range-checked a bare literal via
-            // check_literal_fits; the helper preserves that and ADDS the
+            // the trailing path. (It already range-checked a bare literal via the
+            // shared width check; the helper preserves that and ADDS the
             // array-element check it lacked — `return [1, 2, 300]` now rejects.)
             (Some(expr), Some(expected)) => Some(self.analyze_returned_expr(expr, &expected, pos)?),
             (None, None) => None,
@@ -1213,7 +1213,7 @@ Stmt::ExprStmt { expr, _pos } => Ok(SemanticStmt::ExprStmt {
                                 // range-check at the declared width, mirroring
                                 // `x: [N: t8] = [...]`.
                                 let sem_expr = self.analyze_expr_with_elem_hint(fexpr, &decl_sem)?;
-                                check_literal_fits(fexpr, &decl_sem, *pos)?;
+                                check_semantic_num_fits(&sem_expr, &decl_sem, *pos)?;
                                 if !types_compatible(&decl_sem, &sem_expr.ty) {
                                     return Err(sem_err!(*pos, "field '{}' expects type '{}' but got '{}'", fname, self::type_name(&decl_sem), self::type_name(&sem_expr.ty)));
                                 }
@@ -1968,9 +1968,10 @@ Expr::Unary(op, inner, pos) => {
     // and `when`-as-return) — so a return is no longer a place where an
     // out-of-range literal dodges the width check and silently wraps.
     //
-    // Note: literals nested inside `if`/`when` BRANCHES (e.g. `{ if c { 300 } … }`)
-    // are not caught here — that gap is general (declarations wrap them too) and is
-    // tracked separately (CR#4); it is not return-specific.
+    // CR#4 update: literals nested inside `if`/`when` BRANCHES (e.g. `if c { 300 }`)
+    // ARE now caught — `check_semantic_num_fits` descends into each branch tail, so
+    // the return path inherits branch-tail range-checking through this chokepoint,
+    // the same as a declaration or struct field.
     fn analyze_returned_expr(&mut self, expr: &Expr, expected: &SemanticType, pos: usize) -> Result<SemanticExpr, SemanticError> {
         let sem = self.analyze_expr_with_elem_hint(expr, expected)?;
         if sem.ty == SemanticType::StrRef {
@@ -2213,42 +2214,58 @@ fn check_num_range(ty: &SemanticType, n: i128, pos: usize) -> Result<(), Semanti
     Ok(())
 }
 
-/// If `expr` is an integer literal — bare `Num(n)` or a negated literal
-/// `Unary(Minus, Num(n))` — range-check its VALUE against the declared type
-/// `expected` (#028 + #037). The sign is folded first and the signed result is
-/// checked, so the check is value-aware: `Num(128)` is out of range for t8 but
-/// `-Num(128)` = -128 is the valid minimum. `n` is a positive `Num` (≤ i128::MAX
-/// — the lexer rejects larger), so `-n` never overflows.
-fn check_literal_fits(expr: &Expr, expected: &SemanticType, pos: usize) -> Result<(), SemanticError> {
-    let value = match expr {
-        Expr::Val(AstValue::Num(n)) => Some(*n),
-        Expr::Unary(Op::Minus, inner, _) => match inner.as_ref() {
-            Expr::Val(AstValue::Num(n)) => Some(-*n),
-            _ => None,
-        },
-        _ => None,
-    };
-    if let Some(n) = value {
-        check_num_range(expected, n, pos)?;
+/// Range-check an already-analyzed expression's integer-literal value against the
+/// declared type `expected` (#028 + #037), descending into branch tails (CR#4).
+/// This is the single width-check entry point for every site that has a
+/// `SemanticExpr` in scope: declaration, struct field, field assignment, array
+/// element, call argument, and return.
+///
+/// Direct forms: a bare integer literal analyzes to `Value(Num(_))`; a negated one
+/// to `Unary { Minus, Value(Num(_)) }` (the analyzer does not constant-fold). The
+/// sign is folded first and the signed result checked, so the check is value-aware:
+/// `Num(128)` is out of range for t8 but `-Num(128)` = -128 is the valid minimum.
+/// `n` is a positive `Num` (≤ i128::MAX — the lexer rejects larger), so `-n` never
+/// overflows.
+///
+/// Branch-producing forms (CR#4): an `if`/`when` used as an expression carries its
+/// value in the TAIL of each branch (its last `ExprStmt`, per the interpreter's
+/// "block value is the trailing expression" rule in `eval.rs`). Every tail is
+/// range-checked through this same function, so `x: t8 = if c { 300 } else { 5 }`
+/// rejects the 300 exactly as a bare `x: t8 = 300` would — uniformly, at all six
+/// sites. Non-literal tails (`a + b`, a call) are not folded and so not checked
+/// here, matching the bare-literal-only policy; non-literal narrowing is tracked
+/// separately in the design queue.
+fn check_semantic_num_fits(sem: &SemanticExpr, expected: &SemanticType, pos: usize) -> Result<(), SemanticError> {
+    match &sem.kind {
+        SemanticExprKind::Value(SemanticValue::Num(n)) => check_num_range(expected, *n, pos)?,
+        SemanticExprKind::Unary { op: Op::Minus, expr, .. } => {
+            if let SemanticExprKind::Value(SemanticValue::Num(n)) = &expr.kind {
+                check_num_range(expected, -*n, pos)?;
+            }
+        }
+        SemanticExprKind::If { then_body, else_body, .. } => {
+            check_branch_tail_fits(then_body, expected, pos)?;
+            check_branch_tail_fits(else_body, expected, pos)?;
+        }
+        SemanticExprKind::When { arms, .. } => {
+            for arm in arms {
+                check_branch_tail_fits(&arm.body, expected, pos)?;
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
 
-/// Same as [`check_literal_fits`] but for an already-analyzed expression — used
-/// where only the `SemanticExpr` is in scope (field assignment, array elements,
-/// call arguments). A bare integer literal analyzes to `Value(Num(_))`; a negated
-/// one to `Unary { Minus, Value(Num(_)) }` (the analyzer does not constant-fold).
-fn check_semantic_num_fits(sem: &SemanticExpr, expected: &SemanticType, pos: usize) -> Result<(), SemanticError> {
-    let value = match &sem.kind {
-        SemanticExprKind::Value(SemanticValue::Num(n)) => Some(*n),
-        SemanticExprKind::Unary { op: Op::Minus, expr, .. } => match &expr.kind {
-            SemanticExprKind::Value(SemanticValue::Num(n)) => Some(-*n),
-            _ => None,
-        },
-        _ => None,
-    };
-    if let Some(n) = value {
-        check_num_range(expected, n, pos)?;
+/// Range-check the value a branch body produces: its trailing `ExprStmt` (the
+/// interpreter takes the last statement's expression as the block value — see the
+/// `If`/`when` arms in `eval.rs`). Recurses through [`check_semantic_num_fits`] so a
+/// nested tail — `if c { if d { 300 } else { 5 } } else { 7 }` — is covered too. A
+/// branch whose last statement is not a value-producing expression (or an empty
+/// body) contributes no literal to check.
+fn check_branch_tail_fits(body: &[SemanticStmt], expected: &SemanticType, pos: usize) -> Result<(), SemanticError> {
+    if let Some(SemanticStmt::ExprStmt { expr, .. }) = body.last() {
+        check_semantic_num_fits(expr, expected, pos)?;
     }
     Ok(())
 }

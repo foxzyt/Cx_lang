@@ -1,4 +1,4 @@
 // CR#3: explicit `return` of an out-of-range literal rejects (this path already
-// did via check_literal_fits; pinned here now that it routes the shared chokepoint).
+// range-checked bare literals; pinned here now that it routes the shared chokepoint).
 fnc: t8 f() { return 300 }
 print(f())
