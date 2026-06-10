@@ -2205,21 +2205,15 @@ fn semantic_param_placeholder(param: &ParamKind) -> SemanticParam {
 /// a semantic error in both backends, rather than wrapping in the interpreter and
 /// being rejected at JIT lowering. Non-integer types pass through.
 fn check_num_range(ty: &SemanticType, n: i128, pos: usize) -> Result<(), SemanticError> {
-    let bounds: Option<(i128, i128, &str)> = match ty {
-        SemanticType::I8 => Some((i8::MIN as i128, i8::MAX as i128, "t8")),
-        SemanticType::I16 => Some((i16::MIN as i128, i16::MAX as i128, "t16")),
-        SemanticType::I32 => Some((i32::MIN as i128, i32::MAX as i128, "t32")),
-        SemanticType::I64 => Some((i64::MIN as i128, i64::MAX as i128, "t64")),
-        SemanticType::I128 => Some((i128::MIN, i128::MAX, "t128")),
-        _ => None,
-    };
-
-    if let Some((min, max, name)) = bounds {
-        if n < min || n > max {
+    // Width bounds come from the one facts table (tracker D1.1); non-integer
+    // types have no width and pass through.
+    if let Some(width) = ty.int_width() {
+        let f = width.facts();
+        if n < f.min || n > f.max {
             return Err(sem_err!(
                 pos,
                 "integer literal {} out of range for {} (valid range: {}..{})",
-                n, name, min, max
+                n, f.name, f.min, f.max
             ));
         }
     }

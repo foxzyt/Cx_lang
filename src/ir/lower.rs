@@ -2096,14 +2096,15 @@ fn lower_expr(
 /// Returns the inclusive `[min, max]` range of values that fit in `ty` as a
 /// signed integer, or `None` if `ty` is not an integer type.
 fn ir_int_range(ty: &IrType) -> Option<(i128, i128)> {
+    // Integer-width bounds come from the one facts table (tracker D1.1); Bool's
+    // `(0, 1)` is not a `tN` width fact and stays a local arm (int_facts scope note).
+    if let Some(width) = ty.int_width() {
+        let f = width.facts();
+        return Some((f.min, f.max));
+    }
     match ty {
-        IrType::I8   => Some((i8::MIN  as i128, i8::MAX  as i128)),
-        IrType::I16  => Some((i16::MIN as i128, i16::MAX as i128)),
-        IrType::I32  => Some((i32::MIN as i128, i32::MAX as i128)),
-        IrType::I64  => Some((i64::MIN as i128, i64::MAX as i128)),
-        IrType::I128 => Some((i128::MIN, i128::MAX)),
         IrType::Bool => Some((0, 1)),
-        _            => None,
+        _ => None,
     }
 }
 
