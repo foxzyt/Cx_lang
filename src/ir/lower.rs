@@ -2228,6 +2228,24 @@ fn lower_binary(
             };
             ensure_type_match("binary lhs", ty.clone(), lhs.ty)?;
             ensure_type_match("binary rhs", ty.clone(), rhs.ty)?;
+            // Gate-1a: integer division needs the INT_MIN/-1 overflow guard —
+            // Cranelift `sdiv` traps on it; R4 rules it wraps to INT_MIN. Branch
+            // around the faulting divide (a `select` would still execute it).
+            // Float division and the other ops fall through unchanged, so their
+            // emitted IR is byte-identical.
+            if matches!(op, Op::Div) {
+                if let Some(width) = ty.int_width() {
+                    return emit_guarded_idiv(
+                        dst,
+                        ty.clone(),
+                        width.facts().min,
+                        lhs.value,
+                        rhs.value,
+                        ctx,
+                        active,
+                    );
+                }
+            }
             let op = match op {
                 Op::Plus => BinaryOp::Add,
                 Op::Minus => BinaryOp::Sub,
@@ -2371,6 +2389,112 @@ fn lower_logical(
     ctx.seal_block(sc_active)?;
 
     Ok(LoweredValue { value: result_param, ty: IrType::Bool })
+}
+
+/// Emit integer division with an INT_MIN/-1 overflow guard (tracker Gate-1a).
+///
+/// Cranelift `sdiv` traps in hardware on `INT_MIN / -1` (signed overflow). R4
+/// ruled this case wraps to `INT_MIN` (it is overflow; the wrap freeze covers
+/// it). A `select` would still execute the faulting `sdiv` before choosing, so
+/// this is a BRANCH that skips the divide on the overflow path — the divide is
+/// emitted only in the `divide` block, reached on every input EXCEPT INT_MIN/-1,
+/// exactly mirroring the interpreter's `if b == -1 { a.wrapping_neg() }` special
+/// case (runtime/ops.rs:93). `MIN` is sourced per-width from the int-facts leaf.
+///
+///   [decision]  is_min = Eq(dividend, MIN);  Branch(is_min, check_neg1, divide)
+///       |    \
+///  [check_neg1] \  is_neg1 = Eq(divisor, -1); Branch(is_neg1, min_blk, divide)
+///     |     \    \
+/// [min_blk] [divide]   min_blk: Jump merge(MIN);  divide: sdiv; Jump merge(q)
+///       \    /
+///     [merge(result)]  — receives MIN or the quotient via a block parameter
+///
+/// `divisor == 0` is NOT handled here — it stays trapping (Gate-1b adds the clean
+/// error path). This commit is the trap-free overflow guard only.
+fn emit_guarded_idiv(
+    dst: ValueId,
+    ty: IrType,
+    min: i128,
+    dividend: ValueId,
+    divisor: ValueId,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<LoweredValue, LoweringError> {
+    let incoming = active.bindings.clone();
+
+    // Decision block (current `active`): is_min = (dividend == MIN).
+    let min_const = ctx.fresh_value();
+    active.emit(IrInst::ConstInt { dst: min_const, ty: ty.clone(), value: min })?;
+    let is_min = ctx.fresh_value();
+    active.emit(IrInst::Compare {
+        dst: is_min,
+        op: CompareOp::Eq,
+        lhs: dividend,
+        rhs: min_const,
+    })?;
+
+    let mut check_neg1 = ctx.start_block(vec![], incoming.clone());
+    let check_neg1_id = check_neg1.id();
+    let mut min_blk = ctx.start_block(vec![], incoming.clone());
+    let min_blk_id = min_blk.id();
+    let mut divide = ctx.start_block(vec![], incoming.clone());
+    let divide_id = divide.id();
+
+    let result_param = ctx.fresh_value();
+    let merge_block = ctx.start_block(
+        vec![BlockParam { value: result_param, ty: ty.clone(), read_only: false }],
+        incoming,
+    );
+    let merge_id = merge_block.id();
+
+    active.terminate(IrTerminator::Branch {
+        cond: is_min,
+        then_block: check_neg1_id,
+        then_args: vec![],
+        else_block: divide_id,
+        else_args: vec![],
+    })?;
+    let old_active = std::mem::replace(active, merge_block);
+    ctx.seal_block(old_active)?;
+
+    // check_neg1: reached only when dividend == MIN. is_neg1 = (divisor == -1).
+    let neg1_const = ctx.fresh_value();
+    check_neg1.emit(IrInst::ConstInt { dst: neg1_const, ty: ty.clone(), value: -1 })?;
+    let is_neg1 = ctx.fresh_value();
+    check_neg1.emit(IrInst::Compare {
+        dst: is_neg1,
+        op: CompareOp::Eq,
+        lhs: divisor,
+        rhs: neg1_const,
+    })?;
+    check_neg1.terminate(IrTerminator::Branch {
+        cond: is_neg1,
+        then_block: min_blk_id,
+        then_args: vec![],
+        else_block: divide_id,
+        else_args: vec![],
+    })?;
+    ctx.seal_block(check_neg1)?;
+
+    // min_blk: INT_MIN / -1 → MIN, without dividing. Re-emit MIN so the value is
+    // block-local (no cross-block SSA reliance).
+    let min_result = ctx.fresh_value();
+    min_blk.emit(IrInst::ConstInt { dst: min_result, ty: ty.clone(), value: min })?;
+    min_blk.terminate(IrTerminator::Jump { target: merge_id, args: vec![min_result] })?;
+    ctx.seal_block(min_blk)?;
+
+    // divide: the actual sdiv — never reached for INT_MIN/-1.
+    divide.emit(IrInst::Binary {
+        dst,
+        op: BinaryOp::Div,
+        ty: ty.clone(),
+        lhs: dividend,
+        rhs: divisor,
+    })?;
+    divide.terminate(IrTerminator::Jump { target: merge_id, args: vec![dst] })?;
+    ctx.seal_block(divide)?;
+
+    Ok(LoweredValue { value: result_param, ty })
 }
 
 /// Lower a `when` statement (chained-decision CFG modeled on lower_logical).
