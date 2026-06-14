@@ -307,6 +307,40 @@ extern "C" fn host_fmod(a: f64, b: f64) -> f64 {
     a % b
 }
 
+/// Backend-private symbol name for the clean-exit trap host helper (Gate-1b0).
+const JIT_TRAP_SYMBOL: &str = "cx_trap";
+
+/// Process exit code for a JIT runtime trap. Reuses the documented
+/// [`JitExitCode::JIT_RUNTIME_FAILURE`] convention (126). Deliberately NOT 127
+/// ([`JitExitCode::UNSUPPORTED_CONSTRUCT`] / `JIT_SKIP_EXIT_CODE`), so the parity
+/// harness can never misclassify a runtime trap as a codegen SKIP, and NOT 0, so
+/// expected-fail fixtures see a clean rejection.
+#[cfg(feature = "jit")]
+const JIT_TRAP_EXIT_CODE: i32 = 126;
+
+/// Runtime intrinsic: the clean-exit path for `IrTerminator::Trap` (Gate-1b0).
+///
+/// Before this, `Trap` lowered to a bare Cranelift `trap` (`ud2`). Because
+/// `main` is invoked by a raw transmute+call with no host exception handler
+/// (see `execute`), that hardware trap was unhandled and the process died with
+/// STATUS_STACK_OVERFLOW (0xC00000FD) instead of the documented clean exit — so
+/// every failing `assert`/`assert_eq` and unmatched `when` crashed the JIT.
+///
+/// Routing `Trap` through this host call (the `cx_printn` import mechanism, not
+/// platform exception handling) gives a clean, deterministic process exit. The
+/// message goes to stderr (never stdout) so output-verified fixtures are
+/// unaffected; exact-message parity with the interpreter is not required (the
+/// parity harness only checks for a non-zero exit on expected-fail fixtures).
+#[cfg(feature = "jit")]
+extern "C" fn cx_trap() -> ! {
+    use std::io::Write;
+    let _ = writeln!(
+        std::io::stderr(),
+        "cx: runtime trap (assertion failed or non-exhaustive `when`)"
+    );
+    std::process::exit(JIT_TRAP_EXIT_CODE);
+}
+
 pub struct HostBoundary;
 
 impl HostBoundary {
@@ -355,6 +389,7 @@ impl HostBoundary {
         jit_builder.symbol("cx_printn", cx_printn as *const u8);
         jit_builder.symbol("cx_print_bool", cx_print_bool as *const u8);
         jit_builder.symbol(JIT_F64_REM_SYMBOL, host_fmod as *const u8);
+        jit_builder.symbol(JIT_TRAP_SYMBOL, cx_trap as *const u8);
         let mut module = JITModule::new(jit_builder);
 
         // Pass 1: declare every user-defined function AND runtime intrinsics into
@@ -408,6 +443,19 @@ impl HostBoundary {
                     detail: e.to_string(),
                 })?;
             func_id_map.insert(JIT_F64_REM_SYMBOL.to_string(), id);
+        }
+
+        // Pre-declare cx_trap() -> ! (Gate-1b0): the clean-exit path for Trap.
+        // No params, no returns — it never returns (process::exit).
+        {
+            let call_conv = module.target_config().default_call_conv;
+            let sig = cranelift_codegen::ir::Signature::new(call_conv);
+            let id = module
+                .declare_function(JIT_TRAP_SYMBOL, Linkage::Import, &sig)
+                .map_err(|e| JitExecutionError::CodegenFailure {
+                    detail: e.to_string(),
+                })?;
+            func_id_map.insert(JIT_TRAP_SYMBOL.to_string(), id);
         }
 
         for ir_func in &ir.functions {
@@ -1086,9 +1134,21 @@ fn compile_ir_function(
             }
             IrTerminator::Trap => {
                 use cranelift_codegen::ir::TrapCode;
-                // User trap code 1 = assertion failure.
-                // TrapCode::unwrap_user panics at compile time if the code is 0 or reserved;
-                // code 1 is always valid (reserved range starts at 251).
+                // Gate-1b0: route every Trap (assert/assert_eq failure,
+                // non-exhaustive `when`) through the cx_trap host callback so it
+                // exits cleanly (code 126) instead of a bare Cranelift `trap`,
+                // which stack-overflowed because no host exception handler wraps
+                // `main_fn()`. cx_trap is `-> !` (process::exit), so it never
+                // returns; the trailing `trap` below is an unreachable terminator
+                // that satisfies Cranelift's block-termination rule and can never
+                // fire (the process has already exited).
+                let cx_trap_id = *func_id_map.get(JIT_TRAP_SYMBOL).ok_or_else(|| {
+                    JitExecutionError::CodegenFailure {
+                        detail: "cx_trap intrinsic not declared in func_id_map".to_string(),
+                    }
+                })?;
+                let func_ref = module.declare_func_in_func(cx_trap_id, builder.func);
+                builder.ins().call(func_ref, &[]);
                 builder.ins().trap(TrapCode::unwrap_user(1));
             }
         }
