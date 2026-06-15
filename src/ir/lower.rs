@@ -3087,6 +3087,90 @@ fn resolve_field_ptr(
     Ok((field_ptr, field_ir_ty))
 }
 
+/// Emit an array bounds check (tracker Gate-2b): trap cleanly via `cx_trap`
+/// (exit 126, Gate-1b0) when `idx` is outside `[0, count)`, matching the
+/// interpreter's `IndexOutOfBounds` error. On return `*active` is the in-bounds
+/// continuation block — the caller emits the element address/access there.
+///
+/// `idx` is a signed I64, and the IR has only signed compares, so a single
+/// `idx >= count` would NOT catch a negative index. Two checks, nested so either
+/// routes to the one trap block:
+///
+///   [decision]  idx < 0 ?      → trap : check_hi
+///   [check_hi]  idx >= count ? → trap : continue
+///   [trap] cx_trap            [continue] caller emits PtrAdd + load/store
+///
+/// Decision is sealed before `continue` is filled (the Gate-1b seal-order rule):
+/// `idx` and the array base are defined in the decision block and resolve in the
+/// dominated continuation only once it is sealed.
+fn emit_bounds_check(
+    idx: ValueId,
+    count: usize,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<(), LoweringError> {
+    let incoming = active.bindings.clone();
+
+    // Decision block (current `active`): idx < 0 ?
+    let zero = ctx.fresh_value();
+    active.emit(IrInst::ConstInt { dst: zero, ty: IrType::I64, value: 0 })?;
+    let idx_neg = ctx.fresh_value();
+    active.emit(IrInst::Compare {
+        dst: idx_neg,
+        op: CompareOp::Lt,
+        lhs: idx,
+        rhs: zero,
+    })?;
+
+    let mut trap_blk = ctx.start_block(vec![], incoming.clone());
+    let trap_blk_id = trap_blk.id();
+    let mut check_hi = ctx.start_block(vec![], incoming.clone());
+    let check_hi_id = check_hi.id();
+    let cont = ctx.start_block(vec![], incoming.clone());
+    let cont_id = cont.id();
+
+    // Seal the decision block first, then fill the dependent blocks.
+    active.terminate(IrTerminator::Branch {
+        cond: idx_neg,
+        then_block: trap_blk_id,
+        then_args: vec![],
+        else_block: check_hi_id,
+        else_args: vec![],
+    })?;
+    let old_active = std::mem::replace(active, cont);
+    ctx.seal_block(old_active)?;
+
+    // trap: clean cx_trap exit (shared with Gate-1's guards).
+    trap_blk.terminate(IrTerminator::Trap)?;
+    ctx.seal_block(trap_blk)?;
+
+    // check_hi: idx >= count ? → trap : continue.
+    let count_const = ctx.fresh_value();
+    check_hi.emit(IrInst::ConstInt {
+        dst: count_const,
+        ty: IrType::I64,
+        value: count as i128,
+    })?;
+    let idx_ge = ctx.fresh_value();
+    check_hi.emit(IrInst::Compare {
+        dst: idx_ge,
+        op: CompareOp::Ge,
+        lhs: idx,
+        rhs: count_const,
+    })?;
+    check_hi.terminate(IrTerminator::Branch {
+        cond: idx_ge,
+        then_block: trap_blk_id,
+        then_args: vec![],
+        else_block: cont_id,
+        else_args: vec![],
+    })?;
+    ctx.seal_block(check_hi)?;
+
+    // `*active` is now the `continue` block; the caller emits the access there.
+    Ok(())
+}
+
 // Array element write lowering strategy
 //
 // An array element write `arr:[i] = value` where `arr: Array(N, ElemTy)` is
@@ -3161,6 +3245,10 @@ fn resolve_array_element_ptr(
         })?;
         cast_dst
     };
+
+    // 3b. Bounds-check the index before computing its address (Gate-2b).
+    // OOB traps cleanly via cx_trap; `*active` becomes the in-bounds block.
+    emit_bounds_check(idx_i64, count, ctx, active)?;
 
     // 4. Compute byte_offset = idx_i64 * stride.
     let stride_val = ctx.fresh_value();
@@ -3420,6 +3508,10 @@ fn lower_index(
         })?;
         cast_dst
     };
+
+    // 2b. Bounds-check the index before computing its address (Gate-2b).
+    // OOB traps cleanly via cx_trap; `*active` becomes the in-bounds block.
+    emit_bounds_check(idx_i64, count, ctx, active)?;
 
     // 3. Compute byte_offset = idx_i64 * stride.
     let stride_val = ctx.fresh_value();
