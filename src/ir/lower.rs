@@ -2043,7 +2043,7 @@ fn lower_expr(
                 align: layout_info.layout.alignment,
             })?;
 
-            for (field_idx, (canonical_name, _field_ty)) in layout_info.fields.iter().enumerate() {
+            for (field_idx, (canonical_name, field_ir_ty)) in layout_info.fields.iter().enumerate() {
                 let field_offset = layout_info.layout.field_offsets[field_idx];
 
                 let field_expr = fields
@@ -2070,9 +2070,28 @@ fn lower_expr(
                     fp
                 };
 
+                // Narrow the field value to the field's width before storing
+                // (tracker Gate-2a — same root as lower_array_lit). A scalar
+                // sub-64-bit field receives an i64-typed value; without this the
+                // Store overruns the field slot. The cast is a no-op for fields
+                // whose value already matches the slot width (arrays/structs are
+                // Ptr-typed both sides; t64 scalars are i64 both sides).
+                let store_value = if lowered_field.ty != *field_ir_ty {
+                    let narrowed = ctx.fresh_value();
+                    active.emit(IrInst::Cast {
+                        dst: narrowed,
+                        from: lowered_field.ty.clone(),
+                        to: field_ir_ty.clone(),
+                        value: lowered_field.value,
+                    })?;
+                    narrowed
+                } else {
+                    lowered_field.value
+                };
+
                 active.emit(IrInst::Store {
                     ptr: field_ptr,
-                    value: lowered_field.value,
+                    value: store_value,
                 })?;
             }
 
@@ -3281,9 +3300,30 @@ fn lower_array_lit(
             fp
         };
 
+        // Narrow the element to the array's element width before storing
+        // (tracker Gate-2a). `IrInst::Store` carries no width — it stores at the
+        // value's type. The element expression lowers at its computed width
+        // (i64 for an integer literal), so without this an i64 store into a
+        // sub-64-bit slot overruns by up to 7 bytes, corrupting adjacent stack.
+        // The cast truncates to the element's low bytes (the correct value); the
+        // read path sign-extends on load. A no-op when widths already match
+        // (i64 elements, t64 arrays).
+        let store_value = if lowered_elem.ty != elem_ir_ty {
+            let narrowed = ctx.fresh_value();
+            active.emit(IrInst::Cast {
+                dst: narrowed,
+                from: lowered_elem.ty.clone(),
+                to: elem_ir_ty.clone(),
+                value: lowered_elem.value,
+            })?;
+            narrowed
+        } else {
+            lowered_elem.value
+        };
+
         active.emit(IrInst::Store {
             ptr: elem_ptr,
-            value: lowered_elem.value,
+            value: store_value,
         })?;
     }
 
