@@ -2100,12 +2100,14 @@ fn lower_expr(
         SemanticExprKind::When { expr: scrutinee, arms, .. } => {
             lower_when_expr(scrutinee, arms, &expr.ty, ctx, active)
         },
-        // Tracker #046: `if`-expression lowering is not implemented yet — the JIT
-        // cleanly SKIPs these fixtures (the interpreter is the reference). When
-        // the backend lowers it, this stub is replaced; its `when`-expression
-        // lowering must replicate #046's else-required + #026 unknown-condition
-        // error, or the SKIP becomes a PARITY_FAIL (forward constraint).
-        SemanticExprKind::If { .. } => { unsupported!("If") },
+        // Tracker D2.1 (#046): if-expression lowering — a two-branch value-
+        // producing `when`. #046's else-required rule is enforced at semantic
+        // time (a missing else is rejected pre-lowering), and #026's unknown
+        // condition is unreachable here (an unknown value SKIPs at lower_value
+        // before any if), so the condition always lowers to a definite Bool.
+        SemanticExprKind::If { condition, then_body, else_body, .. } => {
+            lower_if_expr(condition, then_body, else_body, &expr.ty, ctx, active)
+        },
         SemanticExprKind::ResultOk { .. } => { unsupported!("ResultOk") },
         SemanticExprKind::ResultErr { .. } => { unsupported!("ResultErr") },
         SemanticExprKind::Try { .. } => { unsupported!("Try") },
@@ -2847,7 +2849,15 @@ fn lower_when_expr(
     ctx: &mut LoweringCtx,
     active: &mut ActiveBlock,
 ) -> Result<LoweredValue, LoweringError> {
-    let result_ir_ty = lower_type(result_ty)?;
+    // Bare-literal arm tails type the when-expr as the unresolved `Numeric`
+    // placeholder; resolve it to the default integer width like lower_binary /
+    // lower_if_expr do (D2.1), so an enclosing typed context narrows the result.
+    // Inert for concrete-typed when-exprs (the `else` is the prior behavior).
+    let result_ir_ty = if *result_ty == SemanticType::Numeric {
+        ctx.target.numeric_literal_ir_type()
+    } else {
+        lower_type(result_ty)?
+    };
     let incoming = active.bindings.clone();
     let scrutinee_val = lower_expr(scrutinee, ctx, active)?;
 
@@ -2867,57 +2877,15 @@ fn lower_when_expr(
     // built in `current` (a local), starting from what was originally `*active`.
     let mut current = std::mem::replace(active, merge_block);
 
-    // Helper to lower one arm body and Jump to merge with its value.
-    // The arm body's leading stmts (all but the last) lower via the void path;
-    // the trailing ExprStmt is lowered as an expression to capture its value.
-    // If the body diverges before producing the trailing value, no merge edge
-    // is added — that arm just doesn't contribute to the merge.
+    // Each arm body lowers to a value via the shared `lower_branch_value`
+    // (extracted in D2.1 so if-expr branches reuse the same merge machinery —
+    // leading stmts via the void path, trailing ExprStmt as the value, Jump to
+    // merge with `ensure_type_match`). This thin wrapper keeps the per-arm call
+    // sites unchanged, so the `when`-expr emitted IR is byte-identical.
     let lower_arm_body =
-        |ctx: &mut LoweringCtx,
-         mut body_active: ActiveBlock,
-         arm: &SemanticWhenArm|
+        |ctx: &mut LoweringCtx, body_active: ActiveBlock, arm: &SemanticWhenArm|
          -> Result<(), LoweringError> {
-            if arm.body.is_empty() {
-                return Err(LoweringError::InternalInvariantViolation {
-                    detail: "when expression arm body is empty".to_string(),
-                });
-            }
-            let last_idx = arm.body.len() - 1;
-            // Lower leading stmts in-place into body_active.
-            for stmt in &arm.body[..last_idx] {
-                // Use a minimal lowering spec — when arms in expression position
-                // shouldn't contain Return statements; if they do, this errors.
-                let inline_spec = FunctionLoweringSpec {
-                    name: "<when-arm>".to_string(),
-                    return_ty: None,
-                    allow_return_stmt: false,
-                };
-                let result = lower_stmt(stmt, ctx, body_active, &inline_spec, None)?;
-                body_active = match result {
-                    Some(active) => active,
-                    None => return Ok(()), // diverged — no merge edge
-                };
-            }
-            // Lower the trailing expression to capture the arm's value.
-            let trailing_expr = match &arm.body[last_idx] {
-                SemanticStmt::ExprStmt { expr, .. } => expr,
-                other => {
-                    return Err(LoweringError::UnsupportedSemanticConstruct {
-                        construct: format!(
-                            "when expression arm must end in an expression, got {:?}",
-                            std::mem::discriminant(other)
-                        ),
-                    });
-                }
-            };
-            let arm_value = lower_expr(trailing_expr, ctx, &mut body_active)?;
-            ensure_type_match("when arm result", result_ir_ty.clone(), arm_value.ty)?;
-            body_active.terminate(IrTerminator::Jump {
-                target: merge_id,
-                args: vec![arm_value.value],
-            })?;
-            ctx.seal_block(body_active)?;
-            Ok(())
+            lower_branch_value(&arm.body, &result_ir_ty, merge_id, body_active, ctx)
         };
 
     for arm in arms.iter() {
@@ -2966,6 +2934,131 @@ fn lower_when_expr(
         value: result_param,
         ty: result_ir_ty,
     })
+}
+
+/// Lower a value-producing branch body — a `when`-expr arm or an if-expr branch
+/// (tracker D2.1) — and `Jump` to `merge_id` with its value. Leading statements
+/// lower via the void path; the trailing `ExprStmt` is the branch value, type-
+/// checked against `result_ir_ty`. If the body diverges before the trailing
+/// expression (a leading stmt that never returns control), no merge edge is
+/// added — that branch simply contributes nothing to the merge.
+fn lower_branch_value(
+    body: &[SemanticStmt],
+    result_ir_ty: &IrType,
+    merge_id: crate::ir::types::BlockId,
+    mut body_active: ActiveBlock,
+    ctx: &mut LoweringCtx,
+) -> Result<(), LoweringError> {
+    if body.is_empty() {
+        return Err(LoweringError::InternalInvariantViolation {
+            detail: "value-producing branch body is empty".to_string(),
+        });
+    }
+    let last_idx = body.len() - 1;
+    // Lower leading stmts in-place. Minimal spec — a value-producing branch
+    // shouldn't contain a Return statement; if it does, this errors (→ SKIP).
+    for stmt in &body[..last_idx] {
+        let inline_spec = FunctionLoweringSpec {
+            name: "<branch>".to_string(),
+            return_ty: None,
+            allow_return_stmt: false,
+        };
+        let result = lower_stmt(stmt, ctx, body_active, &inline_spec, None)?;
+        body_active = match result {
+            Some(active) => active,
+            None => return Ok(()), // diverged — no merge edge
+        };
+    }
+    let trailing_expr = match &body[last_idx] {
+        SemanticStmt::ExprStmt { expr, .. } => expr,
+        other => {
+            return Err(LoweringError::UnsupportedSemanticConstruct {
+                construct: format!(
+                    "value-producing branch must end in an expression, got {:?}",
+                    std::mem::discriminant(other)
+                ),
+            });
+        }
+    };
+    let value = lower_expr(trailing_expr, ctx, &mut body_active)?;
+    ensure_type_match("branch result", result_ir_ty.clone(), value.ty)?;
+    body_active.terminate(IrTerminator::Jump {
+        target: merge_id,
+        args: vec![value.value],
+    })?;
+    ctx.seal_block(body_active)?;
+    Ok(())
+}
+
+/// Lower an `if`-EXPRESSION to a value (tracker D2.1, #046). Structurally a
+/// two-branch value-producing `when`: branch on the definite condition, each
+/// branch produces its trailing-expression value, both merging through one
+/// result block parameter — the same machinery `lower_when_expr` uses, via the
+/// shared `lower_branch_value`.
+///
+///   [decision]  Branch(cond, then_block, else_block)
+///   [then] lower_branch_value(then_body) → Jump merge(v)
+///   [else] lower_branch_value(else_body) → Jump merge(v)
+///   [merge(result)]
+///
+/// `else if` is a nested `If` in `else_body`, handled by recursion through
+/// `lower_branch_value`'s trailing-expr lowering. The #026 unknown-condition
+/// case is unreachable here — an unknown value SKIPs at `lower_value` before any
+/// if (audit D2.1) — so the condition always lowers to a definite Bool.
+fn lower_if_expr(
+    condition: &SemanticExpr,
+    then_body: &[SemanticStmt],
+    else_body: &[SemanticStmt],
+    result_ty: &SemanticType,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<LoweredValue, LoweringError> {
+    // #046 types the if-expr as its then-branch's trailing type, which for a
+    // bare integer literal (`if c { 100 } else { 5 }`) is the unresolved
+    // `Numeric` placeholder. Resolve it to the target's default integer width
+    // (I64 on 64-bit) — the same rule lower_binary uses — so the merge param is
+    // concrete; an enclosing typed context narrows the I64 result as usual.
+    let result_ir_ty = if *result_ty == SemanticType::Numeric {
+        ctx.target.numeric_literal_ir_type()
+    } else {
+        lower_type(result_ty)?
+    };
+    let incoming = active.bindings.clone();
+
+    // Lower the condition in the decision block (current `active`).
+    let cond = lower_expr(condition, ctx, active)?;
+
+    // Merge block carries the single result block parameter.
+    let result_param = ctx.fresh_value();
+    let merge_block = ctx.start_block(
+        vec![BlockParam { value: result_param, ty: result_ir_ty.clone(), read_only: false }],
+        incoming.clone(),
+    );
+    let merge_id = merge_block.id();
+
+    // then / else branch blocks.
+    let then_block = ctx.start_block(vec![], incoming.clone());
+    let then_id = then_block.id();
+    let else_block = ctx.start_block(vec![], incoming.clone());
+    let else_id = else_block.id();
+
+    // Terminate + seal the decision block FIRST (seal-order rule): the branch
+    // bodies read `cond`/other values defined in the decision block.
+    active.terminate(IrTerminator::Branch {
+        cond: cond.value,
+        then_block: then_id,
+        then_args: vec![],
+        else_block: else_id,
+        else_args: vec![],
+    })?;
+    let old_active = std::mem::replace(active, merge_block);
+    ctx.seal_block(old_active)?;
+
+    // Lower each branch to a value merging into the result param.
+    lower_branch_value(then_body, &result_ir_ty, merge_id, then_block, ctx)?;
+    lower_branch_value(else_body, &result_ir_ty, merge_id, else_block, ctx)?;
+
+    Ok(LoweredValue { value: result_param, ty: result_ir_ty })
 }
 
 // Struct field access lowering strategy

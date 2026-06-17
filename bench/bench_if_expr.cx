@@ -1,6 +1,6 @@
-// perf-rider: INTERPRETER-ONLY — if-as-expression (#046) in a hot loop.
-// If-expr does not lower yet (the #046 SKIP class); measured on one backend,
-// still regression-tracked. Becomes two-backend when D1.4 lands.
+// perf-rider: if-as-expression (#046) in a hot loop. Two-backend as of D2.1 —
+// the JIT now lowers if-expressions (lower_if_expr), so the runner picks it up
+// on both backends; its first JIT median is recorded in BASELINE.md.
 acc: t64 = 0
 i: t64 = 0
 while (i < 700000) {

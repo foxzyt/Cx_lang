@@ -96,10 +96,14 @@ workaround (5 ops/iter) and ran 1.5M iters; session 2 runs the natural form
 
 ## Surface notes
 
-- Two programs are interpreter-only by design (`bench_str_concat` — Str has
-  no IR; `bench_if_expr` — the #046 SKIP class). The runner autodetects JIT
-  support per program (exit-127 sentinel), so these flip to two-backend
-  automatically when their surface starts lowering.
+- One program is interpreter-only by design (`bench_str_concat` — Str has no
+  IR). The runner autodetects JIT support per program (exit-127 sentinel), so
+  programs flip to two-backend automatically when their surface starts lowering.
 - `bench_array_loop` lowers as of D1.1b (was a typed-local workaround).
+- `bench_if_expr` lowers as of **D2.1** (was the #046 SKIP class). First JIT
+  baseline (release, 7 runs): interp median **817 ms** (683..909) vs JIT median
+  **19 ms** (17..20) — the JIT is startup-dominated; the interp runs 700k
+  if-expr iterations. This is a new baseline, not a regression check (no prior
+  JIT number — the path was SKIP before D2.1).
 - Debug-vs-release output screen: all 8 programs produce identical stdout and
   exit codes on debug and release, both backends.
