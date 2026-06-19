@@ -480,6 +480,9 @@ fn lower_program_inner(program: &SemanticProgram, trace: bool) -> Result<IrModul
             // executable semantics and produce no IR, so skip them here rather
             // than routing them into the synthetic-main statement sequence.
             SemanticStmt::StructDef { .. } => {}
+            // Enum definitions carry no runtime data — the tag is the variant_id
+            // in each enum value / pattern node (D2.2). No IR, like StructDef.
+            SemanticStmt::EnumDef { .. } => {}
             // Impl-block methods are emitted as IrFunctions under mangled names.
             // The captured `method_alias_params` carry the BindingIds the body's
             // VarRef/DotAccess nodes reference, so re-prepending them lets
@@ -1017,7 +1020,9 @@ fn lower_stmt(
         SemanticStmt::FuncDef(_) => Err(LoweringError::UnsupportedSemanticConstruct {
             construct: "nested FuncDef".to_string(),
         }),
-        SemanticStmt::EnumDef { .. } => { unsupported!("EnumDef") },
+        // Enum definitions carry no runtime data (the tag is the variant_id in
+        // each value/pattern node, D2.2) — no IR, like StructDef below.
+        SemanticStmt::EnumDef { .. } => Ok(Some(current)),
 SemanticStmt::Block { .. } => { unsupported!("Block") },
         SemanticStmt::WhileIn { .. } => { unsupported!("WhileIn") },
         SemanticStmt::While { cond, body, .. } => {
@@ -2196,9 +2201,29 @@ fn lower_value(
         SemanticValue::Char(_) => Err(LoweringError::UnsupportedSemanticType {
             ty: "Char".to_string(),
         }),
-        SemanticValue::EnumVariant { .. } => Err(LoweringError::UnsupportedSemanticType {
-            ty: "Enum".to_string(),
-        }),
+        // Construct a tag-only enum value as its tag constant (D2.2). The tag is
+        // the declaration-order `variant_id` carried in the semantic node — the
+        // same value the match arm compares against. `ty` is the enum's IR type
+        // (I8, from lower_type above).
+        SemanticValue::EnumVariant { enum_name, variant_name, variant_id, .. } => {
+            let tag = match variant_id {
+                Some(id) => id.0,
+                None => {
+                    return Err(LoweringError::UnsupportedSemanticConstruct {
+                        construct: format!(
+                            "enum variant '{}::{}' has no resolved tag (variant_id)",
+                            enum_name, variant_name
+                        ),
+                    })
+                }
+            };
+            active.emit(IrInst::ConstInt {
+                dst,
+                ty: ty.clone(),
+                value: tag as i128,
+            })?;
+            Ok(LoweredValue { value: dst, ty })
+        }
     }
 }
 
@@ -2812,13 +2837,46 @@ fn emit_when_arm_match(
             ctx.seal_block(lo_pass)?;
             Ok(no_match)
         }
-        SemanticWhenPattern::EnumVariant { enum_name, variant_name, .. } => {
-            Err(LoweringError::UnsupportedSemanticConstruct {
-                construct: format!(
-                    "EnumVariant when arm '{}::{}' — blocked on Enum IR lowering (separate work)",
-                    enum_name, variant_name
-                ),
-            })
+        SemanticWhenPattern::EnumVariant { enum_name, variant_name, variant_id, .. } => {
+            // Match the scrutinee's tag against this variant's tag (D2.2) — the
+            // same `variant_id` the construct emits. Mirrors the Literal arm:
+            // ConstInt(tag) → Compare(Eq) → Branch. The scrutinee is already the
+            // enum's I8 tag.
+            let tag = match variant_id {
+                Some(id) => id.0,
+                None => {
+                    return Err(LoweringError::UnsupportedSemanticConstruct {
+                        construct: format!(
+                            "enum variant '{}::{}' has no resolved tag (variant_id)",
+                            enum_name, variant_name
+                        ),
+                    })
+                }
+            };
+            let pat_value = ctx.fresh_value();
+            current.emit(IrInst::ConstInt {
+                dst: pat_value,
+                ty: scrutinee_val.ty.clone(),
+                value: tag as i128,
+            })?;
+            let cmp_dst = ctx.fresh_value();
+            current.emit(IrInst::Compare {
+                dst: cmp_dst,
+                op: CompareOp::Eq,
+                lhs: scrutinee_val.value,
+                rhs: pat_value,
+            })?;
+            let next_block = ctx.start_block(vec![], incoming.clone());
+            let next_id = next_block.id();
+            current.terminate(IrTerminator::Branch {
+                cond: cmp_dst,
+                then_block: body_id,
+                then_args: vec![],
+                else_block: next_id,
+                else_args: vec![],
+            })?;
+            ctx.seal_block(current)?;
+            Ok(next_block)
         }
         SemanticWhenPattern::Catchall => {
             // Catchall is caller-handled; it must never be routed through here.
@@ -3660,7 +3718,9 @@ fn lower_type(ty: &SemanticType) -> Result<IrType, LoweringError> {
         SemanticType::Container => { unsupported_type!("Container") },
         SemanticType::Str => { unsupported_type!("Str") },
         SemanticType::Char => { unsupported_type!("Char") },
-        SemanticType::Enum(_) => { unsupported_type!("Enum") },
+        // Tag-only enums (no payloads in 0.3) erase to the u8 tag's IR type
+        // (D2.2). Exhaustiveness is enforced at semantic time, not in the IR.
+        SemanticType::Enum(_) => Ok(IrType::I8),
         SemanticType::TypeParam(_) => { unsupported_type!("TypeParam") },
         SemanticType::Struct(_) => Ok(IrType::Ptr),
         SemanticType::Array(_, _) => Ok(IrType::Ptr),
