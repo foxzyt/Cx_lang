@@ -772,6 +772,35 @@ fn lower_stmt(
         SemanticStmt::TypedAssign {
             binding, ty, expr, ..
         } => {
+            // D2.x-A1: a bool-typed `?` constructs the three-state-bool unknown
+            // wire value (TBool 2, #044), mirroring the interpreter's
+            // assignment-site coercion `(Type::Bool, Value::Unknown) => TBool(2)`
+            // (runtime/exec.rs). The discriminator is the *declared* target type
+            // — the `?` value itself is always SemanticType::Unknown — so the
+            // construct lives here, not at lower_value, which keeps rejecting
+            // numeric / untyped / expression-position `?` (R5: Path B stays SKIP).
+            // TBool is materialised as ConstInt(I8, 2) + Cast (the IR validator
+            // restricts ConstInt to non-TBool integer types), the same wire
+            // encoding the `unknown` when-arm match uses.
+            if matches!(&expr.kind, SemanticExprKind::Value(SemanticValue::Unknown))
+                && lower_type(ty)? == IrType::Bool
+            {
+                let byte = ctx.fresh_value();
+                current.emit(IrInst::ConstInt { dst: byte, ty: IrType::I8, value: 2 })?;
+                let unknown = ctx.fresh_value();
+                current.emit(IrInst::Cast {
+                    dst: unknown,
+                    from: IrType::I8,
+                    to: IrType::TBool,
+                    value: byte,
+                })?;
+                let dst = ctx.fresh_value();
+                current.emit(IrInst::SsaBind { dst, ty: IrType::TBool, src: unknown })?;
+                current
+                    .bindings
+                    .insert(*binding, LoweredValue { value: dst, ty: IrType::TBool });
+                return Ok(Some(current));
+            }
             let lowered = lower_expr(expr, ctx, &mut current)?;
             let target_ty = lower_type(ty)?;
             ensure_type_match("typed assignment", target_ty.clone(), lowered.ty)?;
@@ -1157,6 +1186,10 @@ fn lower_if_chain(
     loop_ctx: Option<&LoopContext>,
 ) -> Result<Vec<ActiveBlock>, LoweringError> {
     let cond = lower_expr(condition, ctx, &mut decision_block)?;
+    // D2.x-A1: an unknown (TBool) condition traps (cx_trap) — the interpreter's
+    // UnknownCondition (#026). No-op for a definite Bool; narrows a definite
+    // TBool to Bool so the ensure check below and the Branch see a Bool.
+    let cond = guard_unknown_condition(cond, ctx, &mut decision_block)?;
     ensure_type_match("if condition", IrType::Bool, cond.ty.clone())?;
 
     let then_active = ctx.start_block(vec![], incoming.clone());
@@ -1728,8 +1761,17 @@ fn lower_expr(
                 Ok(lowered)
             } else {
                 let ty = lower_type(&expr.ty)?;
-                ensure_type_match("var ref", ty, lowered.ty.clone())?;
-                Ok(lowered)
+                // D2.x-A1: a `bool`-typed reference may read a binding stored as
+                // TBool — a `bool = ?` unknown. Bool and TBool are the two- and
+                // three-state forms of the same semantic `bool`; accept the stored
+                // TBool so the when / if consumer sees the three-state value (it
+                // would otherwise mismatch and SKIP here, before the match/guard).
+                if ty == IrType::Bool && lowered.ty == IrType::TBool {
+                    Ok(lowered)
+                } else {
+                    ensure_type_match("var ref", ty, lowered.ty.clone())?;
+                    Ok(lowered)
+                }
             }
         }
         SemanticExprKind::Binary { lhs, op, rhs, .. } => {
@@ -1953,6 +1995,13 @@ fn lower_expr(
             Ok(LoweredValue { value: dst, ty: lowered.ty })
         }
         Op::Not => {
+            // D2.x-A1 safety valve: `!` on a three-state bool yields TBool in the
+            // interpreter (runtime/ops.rs); deferred to D2.x-A2. Refuse cleanly
+            // rather than comparing the TBool against a Bool zero below (operand-
+            // type mismatch / miscompile). REMOVE in A2.
+            if lowered.ty == IrType::TBool {
+                unsupported!("logical NOT on three-state bool (TBool) — deferred to D2.x-A2");
+            }
             // Emit a Bool zero, then compare for equality:
             //   dst = (lowered == 0)
             // Because Bool is canonically 0/1, this flips the value.
@@ -2107,9 +2156,10 @@ fn lower_expr(
         },
         // Tracker D2.1 (#046): if-expression lowering — a two-branch value-
         // producing `when`. #046's else-required rule is enforced at semantic
-        // time (a missing else is rejected pre-lowering), and #026's unknown
-        // condition is unreachable here (an unknown value SKIPs at lower_value
-        // before any if), so the condition always lowers to a definite Bool.
+        // time (a missing else is rejected pre-lowering). As of D2.x-A1 a bool
+        // `?` lowers (TBool), so an unknown condition IS reachable here; it is
+        // trapped via `guard_unknown_condition` (cx_trap), reproducing #026's
+        // UnknownCondition. A definite condition lowers to a Bool as before.
         SemanticExprKind::If { condition, then_body, else_body, .. } => {
             lower_if_expr(condition, then_body, else_body, &expr.ty, ctx, active)
         },
@@ -2312,6 +2362,17 @@ fn lower_binary(
             Ok(LoweredValue { value: dst, ty })
         }
         Op::EqEq | Op::NotEq | Op::Lt | Op::LtEq | Op::Gt | Op::GtEq => {
+            // D2.x-A1 safety valve: `==` / `!=` on a three-state bool yields TBool
+            // (unknown) in the interpreter (runtime/ops.rs), which the IR Compare
+            // cannot produce (it yields a definite Bool — the dual-rep seam). The
+            // operand-match check below PASSES for TBool == TBool (both equal), so
+            // without this guard the comparison would silently miscompile. Refuse
+            // until Path B / the seam lowers three-valued equality.
+            if lhs.ty == IrType::TBool || rhs.ty == IrType::TBool {
+                unsupported!(
+                    "equality/comparison on three-state bool (TBool) — deferred to D2.x Path B"
+                );
+            }
             ensure_type_match("compare lhs/rhs", lhs.ty, rhs.ty)?;
             let result_ty = lower_type(result_ty)?;
             if result_ty != IrType::Bool {
@@ -2374,6 +2435,14 @@ fn lower_logical(
 
     // Evaluate the left operand in the current (decision) block.
     let lhs_val = lower_expr(lhs, ctx, active)?;
+    // D2.x-A1 safety valve: three-valued `&&` / `||` on a TBool operand (Kleene
+    // logic) is deferred to D2.x-A2. Refuse cleanly (SKIP) rather than letting
+    // the definite-Bool short-circuit CFG below silently miscompile the unknown.
+    // REMOVE in A2, which lowers TBool logical ops. (The rhs-only-TBool case is
+    // caught by the `logical rhs` ensure_type_match further down.)
+    if lhs_val.ty == IrType::TBool {
+        unsupported!("logical &&/|| on three-state bool (TBool) — deferred to D2.x-A2");
+    }
     ensure_type_match("logical lhs", IrType::Bool, lhs_val.ty.clone())?;
 
     // Block that evaluates the right operand (reached when short-circuit does not fire).
@@ -2757,7 +2826,35 @@ fn emit_when_arm_match(
 ) -> Result<ActiveBlock, LoweringError> {
     match pattern {
         SemanticWhenPattern::Literal(value) => {
-            let pat_value = if matches!(value, SemanticValue::Unknown) {
+            let pat_value = if scrutinee_val.ty == IrType::TBool {
+                // D2.x-A1: a three-state TBool scrutinee (a `bool = ?` unknown)
+                // compares against TBool wire constants — false=0, true=1,
+                // unknown=2 — each materialised as ConstInt(I8) + Cast→TBool
+                // (the validator restricts ConstInt to non-TBool types, and
+                // Compare requires matching operand types). This mirrors the
+                // interpreter matching bool patterns against a TBool value
+                // (runtime/exec.rs). A definite-Bool scrutinee keeps the path
+                // below byte-for-byte (true/false via lower_value; unknown via
+                // I8 + Cast→Bool), so t20 / t144 / every other `when` are unmoved.
+                let wire: i128 = match value {
+                    SemanticValue::Bool(false) => 0,
+                    SemanticValue::Bool(true) => 1,
+                    SemanticValue::Unknown => 2,
+                    _ => unsupported!(
+                        "non-bool when-pattern against a three-state bool scrutinee"
+                    ),
+                };
+                let byte = ctx.fresh_value();
+                current.emit(IrInst::ConstInt { dst: byte, ty: IrType::I8, value: wire })?;
+                let wire_const = ctx.fresh_value();
+                current.emit(IrInst::Cast {
+                    dst: wire_const,
+                    from: IrType::I8,
+                    to: IrType::TBool,
+                    value: byte,
+                })?;
+                wire_const
+            } else if matches!(value, SemanticValue::Unknown) {
                 // TBool wire-value match — see SCOPE BOUNDARY at lower_when_stmt doc.
                 let unknown_byte = ctx.fresh_value();
                 current.emit(IrInst::ConstInt {
@@ -3063,6 +3160,72 @@ fn lower_branch_value(
 /// `lower_branch_value`'s trailing-expr lowering. The #026 unknown-condition
 /// case is unreachable here — an unknown value SKIPs at `lower_value` before any
 /// if (audit D2.1) — so the condition always lowers to a definite Bool.
+/// If `cond` is a three-state TBool, trap (`cx_trap`) when its wire value is the
+/// unknown state (2) — the interpreter's `UnknownCondition` for an `if` /
+/// `if`-expression (#026 / #046) — then narrow the now-definite 0/1 value to
+/// Bool for the branch (the IR validator requires `Branch` conditions to be
+/// Bool). A definite Bool condition is returned unchanged with **no** emitted IR,
+/// so every existing `if` lowers byte-identically. Modeled on `emit_bounds_check`
+/// (trap-branch + continue block, seal-decision-first).
+fn guard_unknown_condition(
+    cond: LoweredValue,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<LoweredValue, LoweringError> {
+    if cond.ty != IrType::TBool {
+        return Ok(cond);
+    }
+    let incoming = active.bindings.clone();
+
+    // Decision block (current `active`): is the condition the unknown wire (2)?
+    let unknown_byte = ctx.fresh_value();
+    active.emit(IrInst::ConstInt { dst: unknown_byte, ty: IrType::I8, value: 2 })?;
+    let unknown_const = ctx.fresh_value();
+    active.emit(IrInst::Cast {
+        dst: unknown_const,
+        from: IrType::I8,
+        to: IrType::TBool,
+        value: unknown_byte,
+    })?;
+    let is_unknown = ctx.fresh_value();
+    active.emit(IrInst::Compare {
+        dst: is_unknown,
+        op: CompareOp::Eq,
+        lhs: cond.value,
+        rhs: unknown_const,
+    })?;
+
+    let mut trap_blk = ctx.start_block(vec![], incoming.clone());
+    let trap_id = trap_blk.id();
+    let cont = ctx.start_block(vec![], incoming);
+    let cont_id = cont.id();
+
+    // Seal the decision block first (seal-order rule): `cont` reads `cond` from it.
+    active.terminate(IrTerminator::Branch {
+        cond: is_unknown,
+        then_block: trap_id,
+        then_args: vec![],
+        else_block: cont_id,
+        else_args: vec![],
+    })?;
+    let old_active = std::mem::replace(active, cont);
+    ctx.seal_block(old_active)?;
+
+    // trap: clean cx_trap exit (shared with the Gate-1 / Gate-2 guards).
+    trap_blk.terminate(IrTerminator::Trap)?;
+    ctx.seal_block(trap_blk)?;
+
+    // continue: the value is now known 0/1 — narrow TBool → Bool for the branch.
+    let cond_bool = ctx.fresh_value();
+    active.emit(IrInst::Cast {
+        dst: cond_bool,
+        from: IrType::TBool,
+        to: IrType::Bool,
+        value: cond.value,
+    })?;
+    Ok(LoweredValue { value: cond_bool, ty: IrType::Bool })
+}
+
 fn lower_if_expr(
     condition: &SemanticExpr,
     then_body: &[SemanticStmt],
@@ -3085,6 +3248,9 @@ fn lower_if_expr(
 
     // Lower the condition in the decision block (current `active`).
     let cond = lower_expr(condition, ctx, active)?;
+    // D2.x-A1: an unknown (TBool) condition traps (cx_trap) — #046 reuses #026.
+    // No-op for a definite Bool condition; narrows a definite TBool to Bool.
+    let cond = guard_unknown_condition(cond, ctx, active)?;
 
     // Merge block carries the single result block parameter.
     let result_param = ctx.fresh_value();
