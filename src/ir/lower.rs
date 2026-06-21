@@ -803,16 +803,25 @@ fn lower_stmt(
             }
             let lowered = lower_expr(expr, ctx, &mut current)?;
             let target_ty = lower_type(ty)?;
-            ensure_type_match("typed assignment", target_ty.clone(), lowered.ty)?;
+            // D2.x-A2: a `bool` target may receive a three-state TBool value (a
+            // Kleene `&&`/`||`/`!` result, e.g. `z: bool = x && y`). Bind it as
+            // TBool — the same Bool/TBool relationship A1 gave VarRef and the
+            // when-scrutinee. Definite-Bool assignments are unaffected.
+            let bind_ty = if target_ty == IrType::Bool && lowered.ty == IrType::TBool {
+                IrType::TBool
+            } else {
+                ensure_type_match("typed assignment", target_ty.clone(), lowered.ty)?;
+                target_ty
+            };
             let dst = ctx.fresh_value();
             current.emit(IrInst::SsaBind {
                 dst,
-                ty: target_ty.clone(),
+                ty: bind_ty.clone(),
                 src: lowered.value,
             })?;
             current
                 .bindings
-                .insert(*binding, LoweredValue { value: dst, ty: target_ty });
+                .insert(*binding, LoweredValue { value: dst, ty: bind_ty });
             Ok(Some(current))
         }
         SemanticStmt::ExprStmt { expr, .. } => {
@@ -1995,12 +2004,11 @@ fn lower_expr(
             Ok(LoweredValue { value: dst, ty: lowered.ty })
         }
         Op::Not => {
-            // D2.x-A1 safety valve: `!` on a three-state bool yields TBool in the
-            // interpreter (runtime/ops.rs); deferred to D2.x-A2. Refuse cleanly
-            // rather than comparing the TBool against a Bool zero below (operand-
-            // type mismatch / miscompile). REMOVE in A2.
+            // D2.x-A2: `!` on a three-state TBool negates per Kleene (!0=1, !1=0,
+            // !2=2) on the I8 wire (runtime/ops.rs:256). Definite Bool keeps the
+            // compare-against-zero path below.
             if lowered.ty == IrType::TBool {
-                unsupported!("logical NOT on three-state bool (TBool) — deferred to D2.x-A2");
+                return emit_kleene_not(lowered.value, ctx, active);
             }
             // Emit a Bool zero, then compare for equality:
             //   dst = (lowered == 0)
@@ -2405,6 +2413,181 @@ fn lower_binary(
     }
 }
 
+/// Whether `expr` lowers to a three-state TBool value (vs a definite Bool),
+/// determined structurally WITHOUT emitting IR — so `lower_logical` can route a
+/// TBool operand to the Kleene path before committing to the definite-Bool
+/// short-circuit CFG (which lowers rhs eagerly into its own block and would
+/// reject a TBool there). TBool arises only from a `bool = ?` binding (read via
+/// VarRef) or a Kleene `&&`/`||`/`!` over a TBool operand, so those are the only
+/// shapes that propagate it.
+fn expr_lowers_to_tbool(expr: &SemanticExpr, active: &ActiveBlock) -> bool {
+    match &expr.kind {
+        SemanticExprKind::VarRef { binding, .. } => active
+            .bindings
+            .get(binding)
+            .is_some_and(|v| v.ty == IrType::TBool),
+        SemanticExprKind::Unary { op: Op::Not, expr: inner, .. } => {
+            expr_lowers_to_tbool(inner, active)
+        }
+        SemanticExprKind::Binary { lhs, op: Op::And | Op::Or, rhs, .. } => {
+            expr_lowers_to_tbool(lhs, active) || expr_lowers_to_tbool(rhs, active)
+        }
+        _ => false,
+    }
+}
+
+/// Emit the three-valued (Kleene) result of `a <op> b` on the I8 wire encoding
+/// (false=0, true=1, unknown=2), matching the interpreter's tables exactly
+/// (runtime/ops.rs:212/230). `op` is `And` or `Or`; `a`/`b` are operand wire
+/// values (TBool, or a Bool promoted as wire). Returns a TBool. No `Select` IR
+/// exists, so each result is selected by a small compare/branch/merge CFG.
+///
+/// AND: `0` if either operand is `0`; else `1` if both are `1`; else `2`.
+///   With `p = a*b` (operands ∈ {0,1,2}): `p==0` ⟺ a factor is `0`; `p==1` ⟺
+///   both are `1`. So `result = (p==0)?0 : (p==1)?1 : 2`.
+/// OR:  `1` if either operand is `1`; else `0` if both are `0` (`a+b==0`); else `2`.
+fn emit_kleene_and_or(
+    op: Op,
+    a: ValueId,
+    b: ValueId,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<LoweredValue, LoweringError> {
+    let incoming = active.bindings.clone();
+    let c0 = ctx.fresh_value();
+    active.emit(IrInst::ConstInt { dst: c0, ty: IrType::I8, value: 0 })?;
+    let c1 = ctx.fresh_value();
+    active.emit(IrInst::ConstInt { dst: c1, ty: IrType::I8, value: 1 })?;
+    let c2 = ctx.fresh_value();
+    active.emit(IrInst::ConstInt { dst: c2, ty: IrType::I8, value: 2 })?;
+
+    let result_param = ctx.fresh_value();
+    let merge = ctx.start_block(
+        vec![BlockParam { value: result_param, ty: IrType::I8, read_only: false }],
+        incoming.clone(),
+    );
+    let merge_id = merge.id();
+
+    match op {
+        Op::And => {
+            let p = ctx.fresh_value();
+            active.emit(IrInst::Binary { dst: p, op: BinaryOp::Mul, ty: IrType::I8, lhs: a, rhs: b })?;
+            let is_p0 = ctx.fresh_value();
+            active.emit(IrInst::Compare { dst: is_p0, op: CompareOp::Eq, lhs: p, rhs: c0 })?;
+            let mut check1 = ctx.start_block(vec![], incoming.clone());
+            let check1_id = check1.id();
+            // p==0 → 0; else fall to the p==1 check. Seal decision first (the
+            // sub-blocks read `p` / the consts defined here).
+            active.terminate(IrTerminator::Branch {
+                cond: is_p0,
+                then_block: merge_id, then_args: vec![c0],
+                else_block: check1_id, else_args: vec![],
+            })?;
+            let old = std::mem::replace(active, merge);
+            ctx.seal_block(old)?;
+            let is_p1 = ctx.fresh_value();
+            check1.emit(IrInst::Compare { dst: is_p1, op: CompareOp::Eq, lhs: p, rhs: c1 })?;
+            let mut leaf2 = ctx.start_block(vec![], incoming.clone());
+            let leaf2_id = leaf2.id();
+            check1.terminate(IrTerminator::Branch {
+                cond: is_p1,
+                then_block: merge_id, then_args: vec![c1],
+                else_block: leaf2_id, else_args: vec![],
+            })?;
+            ctx.seal_block(check1)?;
+            leaf2.terminate(IrTerminator::Jump { target: merge_id, args: vec![c2] })?;
+            ctx.seal_block(leaf2)?;
+        }
+        Op::Or => {
+            let is_a1 = ctx.fresh_value();
+            active.emit(IrInst::Compare { dst: is_a1, op: CompareOp::Eq, lhs: a, rhs: c1 })?;
+            let mut chk_b1 = ctx.start_block(vec![], incoming.clone());
+            let chk_b1_id = chk_b1.id();
+            active.terminate(IrTerminator::Branch {
+                cond: is_a1,
+                then_block: merge_id, then_args: vec![c1],
+                else_block: chk_b1_id, else_args: vec![],
+            })?;
+            let old = std::mem::replace(active, merge);
+            ctx.seal_block(old)?;
+            let is_b1 = ctx.fresh_value();
+            chk_b1.emit(IrInst::Compare { dst: is_b1, op: CompareOp::Eq, lhs: b, rhs: c1 })?;
+            let mut chk_both0 = ctx.start_block(vec![], incoming.clone());
+            let chk_both0_id = chk_both0.id();
+            chk_b1.terminate(IrTerminator::Branch {
+                cond: is_b1,
+                then_block: merge_id, then_args: vec![c1],
+                else_block: chk_both0_id, else_args: vec![],
+            })?;
+            ctx.seal_block(chk_b1)?;
+            let sum = ctx.fresh_value();
+            chk_both0.emit(IrInst::Binary { dst: sum, op: BinaryOp::Add, ty: IrType::I8, lhs: a, rhs: b })?;
+            let is_sum0 = ctx.fresh_value();
+            chk_both0.emit(IrInst::Compare { dst: is_sum0, op: CompareOp::Eq, lhs: sum, rhs: c0 })?;
+            let mut leaf2 = ctx.start_block(vec![], incoming.clone());
+            let leaf2_id = leaf2.id();
+            chk_both0.terminate(IrTerminator::Branch {
+                cond: is_sum0,
+                then_block: merge_id, then_args: vec![c0],
+                else_block: leaf2_id, else_args: vec![],
+            })?;
+            ctx.seal_block(chk_both0)?;
+            leaf2.terminate(IrTerminator::Jump { target: merge_id, args: vec![c2] })?;
+            ctx.seal_block(leaf2)?;
+        }
+        _ => unreachable!("emit_kleene_and_or only handles And/Or"),
+    }
+
+    // active is now the merge block; narrow the I8 wire result to TBool.
+    let res = ctx.fresh_value();
+    active.emit(IrInst::Cast { dst: res, from: IrType::I8, to: IrType::TBool, value: result_param })?;
+    Ok(LoweredValue { value: res, ty: IrType::TBool })
+}
+
+/// Emit the three-valued (Kleene) `!a` on the I8 wire encoding: `!0=1`, `!1=0`,
+/// `!2=2` (runtime/ops.rs:256). Unknown negates to unknown; a definite `0`/`1`
+/// flips via `1 - a`. Returns a TBool.
+fn emit_kleene_not(
+    a: ValueId,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<LoweredValue, LoweringError> {
+    let incoming = active.bindings.clone();
+    let c1 = ctx.fresh_value();
+    active.emit(IrInst::ConstInt { dst: c1, ty: IrType::I8, value: 1 })?;
+    let c2 = ctx.fresh_value();
+    active.emit(IrInst::ConstInt { dst: c2, ty: IrType::I8, value: 2 })?;
+    let is_a2 = ctx.fresh_value();
+    active.emit(IrInst::Compare { dst: is_a2, op: CompareOp::Eq, lhs: a, rhs: c2 })?;
+
+    let result_param = ctx.fresh_value();
+    let merge = ctx.start_block(
+        vec![BlockParam { value: result_param, ty: IrType::I8, read_only: false }],
+        incoming.clone(),
+    );
+    let merge_id = merge.id();
+    let mut not_def = ctx.start_block(vec![], incoming);
+    let not_def_id = not_def.id();
+
+    // unknown (2) negates to unknown; else flip via 1 - a (a is 0 or 1 here).
+    active.terminate(IrTerminator::Branch {
+        cond: is_a2,
+        then_block: merge_id, then_args: vec![c2],
+        else_block: not_def_id, else_args: vec![],
+    })?;
+    let old = std::mem::replace(active, merge);
+    ctx.seal_block(old)?;
+
+    let flipped = ctx.fresh_value();
+    not_def.emit(IrInst::Binary { dst: flipped, op: BinaryOp::Sub, ty: IrType::I8, lhs: c1, rhs: a })?;
+    not_def.terminate(IrTerminator::Jump { target: merge_id, args: vec![flipped] })?;
+    ctx.seal_block(not_def)?;
+
+    let res = ctx.fresh_value();
+    active.emit(IrInst::Cast { dst: res, from: IrType::I8, to: IrType::TBool, value: result_param })?;
+    Ok(LoweredValue { value: res, ty: IrType::TBool })
+}
+
 // Logical AND/OR short-circuit lowering
 //
 // `a && b` and `a || b` cannot be lowered as eager binary instructions
@@ -2435,13 +2618,18 @@ fn lower_logical(
 
     // Evaluate the left operand in the current (decision) block.
     let lhs_val = lower_expr(lhs, ctx, active)?;
-    // D2.x-A1 safety valve: three-valued `&&` / `||` on a TBool operand (Kleene
-    // logic) is deferred to D2.x-A2. Refuse cleanly (SKIP) rather than letting
-    // the definite-Bool short-circuit CFG below silently miscompile the unknown.
-    // REMOVE in A2, which lowers TBool logical ops. (The rhs-only-TBool case is
-    // caught by the `logical rhs` ensure_type_match further down.)
-    if lhs_val.ty == IrType::TBool {
-        unsupported!("logical &&/|| on three-state bool (TBool) — deferred to D2.x-A2");
+    // D2.x-A2: three-valued (Kleene) logic when EITHER operand is a three-state
+    // TBool. Compute eagerly on the I8 wire encoding, matching the interpreter's
+    // tables (runtime/ops.rs); both operands are treated as wire values, so a
+    // Bool operand (`? && false`, `false && ?`) works as 0/1. The rhs type is
+    // detected structurally (`expr_lowers_to_tbool`) WITHOUT lowering it, because
+    // the definite-Bool short-circuit path below lowers rhs eagerly into its own
+    // block and would reject a TBool there. Definite-Bool `&&`/`||` is untouched
+    // (neither operand is TBool → falls through). The `==`/`!=` TBool refusal
+    // stays in lower_binary — that's the seam's Path-B guard, not A2's.
+    if lhs_val.ty == IrType::TBool || expr_lowers_to_tbool(rhs, active) {
+        let rhs_val = lower_expr(rhs, ctx, active)?;
+        return emit_kleene_and_or(op, lhs_val.value, rhs_val.value, ctx, active);
     }
     ensure_type_match("logical lhs", IrType::Bool, lhs_val.ty.clone())?;
 
