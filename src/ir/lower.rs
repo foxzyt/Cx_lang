@@ -1748,6 +1748,36 @@ fn finalize_active_block(
     ctx.seal_block(active)
 }
 
+/// Fold `len(x)` to its constant integer length when `x` has a compile-time-
+/// known length (tracker D2.3a) — no string representation needed. `len("…")`
+/// folds to the UTF-8 byte count (`str::len`, matching the interpreter's stored
+/// arena-slice length — bytes, not chars/graphemes; e.g. `len("é")` == 2, per
+/// runtime/call.rs #021). `len(<array>)` folds to the declared element count from
+/// the `Array(count, _)` type (the same count the bounds check and array layout
+/// read). `len` returns t64, so the folded constant is I64. Returns `None` when
+/// the length is not statically known (a dynamic string / strref), leaving the
+/// caller's `is_cx_builtin` path to SKIP it cleanly.
+fn try_fold_len(
+    args: &[SemanticCallArg],
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<Option<LoweredValue>, LoweringError> {
+    let arg = match args.first() {
+        Some(SemanticCallArg::Expr(e)) => e,
+        _ => return Ok(None),
+    };
+    let n: i128 = match &arg.kind {
+        SemanticExprKind::Value(SemanticValue::Str(s)) => s.len() as i128,
+        _ => match &arg.ty {
+            SemanticType::Array(count, _) => *count as i128,
+            _ => return Ok(None),
+        },
+    };
+    let dst = ctx.fresh_value();
+    active.emit(IrInst::ConstInt { dst, ty: IrType::I64, value: n })?;
+    Ok(Some(LoweredValue { value: dst, ty: IrType::I64 }))
+}
+
 fn lower_expr(
     expr: &SemanticExpr,
     ctx: &mut LoweringCtx,
@@ -1870,6 +1900,15 @@ fn lower_expr(
         //    the caller as a LoweredValue so it can flow into assignments,
         //    return statements, and sub-expressions.
         SemanticExprKind::Call { callee, function: _, args } => {
+            // D2.3a: fold `len()` on a compile-time-known operand to its constant
+            // integer length — no string representation needed. A `len` whose
+            // length is not statically known (a dynamic string, which doesn't
+            // lower anyway) returns None and falls through to the SKIP below.
+            if callee == "len" {
+                if let Some(folded) = try_fold_len(args, ctx, active)? {
+                    return Ok(folded);
+                }
+            }
             // Remaining unimplemented builtin intrinsics (read, input) are not in the
             // signature_table.  Intercept them before the lookup so the error is
             // structured and actionable rather than the generic UnresolvedSemanticArtifact
