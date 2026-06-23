@@ -288,6 +288,27 @@ extern "C" fn cx_print_bool(b: i8) {
     let _ = writeln!(stdout, "{}", if b != 0 { "true" } else { "false" });
 }
 
+/// Runtime intrinsic: print a string to stdout followed by a newline (D2.3b).
+///
+/// Exported as `cx_print_str`. JIT code calls it via
+/// `Call { callee: "cx_print_str", args: [descriptor_ptr] }` for a `str` argument
+/// to print/println. The argument is the address of a static
+/// `{byte_ptr: i64, byte_len: i64}` descriptor (string rep (a), storage (ii));
+/// this reads both fields and writes the raw bytes followed by a newline,
+/// matching the interpreter's `print_value` for a string byte-for-byte (no
+/// quotes, no escaping). The descriptor and its bytes are leaked `&'static` at
+/// lowering, so the address is valid for the process lifetime (JIT-only).
+extern "C" fn cx_print_str(descriptor: *const i64) {
+    use std::io::{self, Write};
+    // SAFETY: `descriptor` points at a leaked `&'static [i64; 2]` whose first
+    // slot is the (also leaked) byte pointer and second is the byte length.
+    let (ptr, len) = unsafe { (*descriptor as *const u8, *descriptor.add(1) as usize) };
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    let mut stdout = io::stdout().lock();
+    let _ = stdout.write_all(bytes);
+    let _ = stdout.write_all(b"\n");
+}
+
 /// Backend-private symbol name for the F64 remainder host helper.
 ///
 /// Using a mangled name (double-underscore prefix) keeps it out of the user-visible namespace.
@@ -388,6 +409,7 @@ impl HostBoundary {
             JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
         jit_builder.symbol("cx_printn", cx_printn as *const u8);
         jit_builder.symbol("cx_print_bool", cx_print_bool as *const u8);
+        jit_builder.symbol("cx_print_str", cx_print_str as *const u8);
         jit_builder.symbol(JIT_F64_REM_SYMBOL, host_fmod as *const u8);
         jit_builder.symbol(JIT_TRAP_SYMBOL, cx_trap as *const u8);
         let mut module = JITModule::new(jit_builder);
@@ -425,6 +447,22 @@ impl HostBoundary {
                     detail: e.to_string(),
                 })?;
             func_id_map.insert("cx_print_bool".to_string(), id);
+        }
+
+        // cx_print_str(ptr) — Str routes here; the single argument is the address
+        // of the static {byte_ptr, byte_len} descriptor (D2.3b). Ptr lowers to
+        // cranelift types::I64.
+        {
+            use cranelift_codegen::ir::{types, AbiParam};
+            let call_conv = module.target_config().default_call_conv;
+            let mut sig = cranelift_codegen::ir::Signature::new(call_conv);
+            sig.params.push(AbiParam::new(types::I64));
+            let id = module
+                .declare_function("cx_print_str", Linkage::Import, &sig)
+                .map_err(|e| JitExecutionError::CodegenFailure {
+                    detail: e.to_string(),
+                })?;
+            func_id_map.insert("cx_print_str".to_string(), id);
         }
 
         // Pre-declare __cx_fmod(f64, f64) -> f64 for F64 Rem lowering.
@@ -986,6 +1024,12 @@ fn compile_ir_function(
                 IrInst::Cast { dst, from, to, value } => {
                     // Reject Ptr and Void — neither has a meaningful scalar cast path.
                     match (from, to) {
+                        // D2.3b: I64 ↔ Ptr is a no-op reinterpret — both map to
+                        // cranelift `types::I64`, so this materializes a baked
+                        // string-descriptor address as a Ptr (string rep (a)). It
+                        // falls through to the `from_cl == to_cl` alias path below.
+                        // All other Ptr casts stay unsupported (no scalar equivalent).
+                        (IrType::I64, IrType::Ptr) | (IrType::Ptr, IrType::I64) => {}
                         (IrType::Ptr, _) | (_, IrType::Ptr) => {
                             return Err(JitExecutionError::UnsupportedConstruct {
                                 construct: format!(
@@ -1556,8 +1600,9 @@ mod jit_tests {
 
     #[test]
     fn jit_unsupported_inst_returns_error() {
-        // Cast from Ptr is explicitly unsupported and must return UnsupportedConstruct.
-        // Ptr casts have no scalar equivalent in Cx and are rejected at the JIT boundary.
+        // Cast from Ptr to a non-I64 type is unsupported and must return
+        // UnsupportedConstruct. (I64 ↔ Ptr is a no-op reinterpret allowed since
+        // D2.3b; Ptr ↔ narrower/other types have no scalar equivalent.)
         let module = IrModule {
             debug_name: "test_unsupported".to_string(),
             functions: vec![IrFunction {
@@ -1572,7 +1617,7 @@ mod jit_tests {
                         IrInst::Cast {
                             dst: ValueId(1),
                             from: IrType::Ptr,
-                            to: IrType::I64,
+                            to: IrType::I32,
                             value: ValueId(0),
                         },
                     ],

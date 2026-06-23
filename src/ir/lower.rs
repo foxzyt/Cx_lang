@@ -2292,9 +2292,33 @@ fn lower_value(
         SemanticValue::Unknown => Err(LoweringError::UnsupportedSemanticType {
             ty: "Unknown".to_string(),
         }),
-        SemanticValue::Str(_) => Err(LoweringError::UnsupportedSemanticType {
-            ty: "Str".to_string(),
-        }),
+        SemanticValue::Str(s) => {
+            // D2.3b: lower a static string literal (rep (a), storage (ii)).
+            // Interpolation (`{…}`) is print-time (tracker D2.3d); defer any
+            // brace-containing literal so it stays SKIP rather than printing raw
+            // and diverging from the interpreter's expansion.
+            if s.contains('{') {
+                return Err(LoweringError::UnsupportedSemanticConstruct {
+                    construct: "string interpolation '{...}' not yet lowered (tracker D2.3d)"
+                        .to_string(),
+                });
+            }
+            // Leak the bytes and a {byte_ptr, byte_len} descriptor (two i64 slots)
+            // to `&'static` in the host, then materialize the descriptor's address
+            // as a Ptr via ConstInt(I64) + a no-op Cast(I64->Ptr). The baked
+            // address is process-specific and JIT-only — the accepted non-AOT
+            // tradeoff (R6); the bytes outlive the program, so a returned string
+            // descriptor never dangles (no stack-lifetime trap).
+            let bytes: &'static [u8] = s.clone().into_bytes().leak();
+            let descriptor: &'static [i64] =
+                vec![bytes.as_ptr() as usize as i64, bytes.len() as i64].leak();
+            let desc_addr = descriptor.as_ptr() as usize as i128;
+            let addr = ctx.fresh_value();
+            active.emit(IrInst::ConstInt { dst: addr, ty: IrType::I64, value: desc_addr })?;
+            let ptr = ctx.fresh_value();
+            active.emit(IrInst::Cast { dst: ptr, from: IrType::I64, to: IrType::Ptr, value: addr })?;
+            Ok(LoweredValue { value: ptr, ty: IrType::Ptr })
+        }
         SemanticValue::Char(_) => Err(LoweringError::UnsupportedSemanticType {
             ty: "Char".to_string(),
         }),
@@ -2369,6 +2393,12 @@ fn lower_binary(
             } else {
                 lower_type(result_ty)?
             };
+            // D2.3b: `str + str` is concatenation (result lowers to Ptr). Refuse
+            // cleanly so it SKIPs on the concat — constant-folding literal concat
+            // is tracker D2.3c, not this commit (which only lowers the construct).
+            if ty == IrType::Ptr {
+                unsupported!("string concatenation not yet lowered (tracker D2.3c)");
+            }
             ensure_type_match("binary lhs", ty.clone(), lhs.ty)?;
             ensure_type_match("binary rhs", ty.clone(), rhs.ty)?;
             // Integer division and modulo route through the guard helper —
@@ -2419,6 +2449,12 @@ fn lower_binary(
                 unsupported!(
                     "equality/comparison on three-state bool (TBool) — deferred to D2.x Path B"
                 );
+            }
+            // D2.3b: comparing strings (or composites) lowers operands to Ptr; a
+            // raw Compare would be a POINTER compare, not content equality. Refuse
+            // — string content comparison is tracker D2.3c (cx_str_eq).
+            if lhs.ty == IrType::Ptr || rhs.ty == IrType::Ptr {
+                unsupported!("string/composite comparison not yet lowered (tracker D2.3c)");
             }
             ensure_type_match("compare lhs/rhs", lhs.ty, rhs.ty)?;
             let result_ty = lower_type(result_ty)?;
@@ -4109,7 +4145,10 @@ fn lower_type(ty: &SemanticType) -> Result<IrType, LoweringError> {
         SemanticType::Handle(_) => { unsupported_type!("Handle") },
         SemanticType::StrRef => { unsupported_type!("StrRef") },
         SemanticType::Container => { unsupported_type!("Container") },
-        SemanticType::Str => { unsupported_type!("Str") },
+        // D2.3b: a `str` is rep (a) — a Ptr to a static {ptr, len} descriptor.
+        // Reuses the struct/array Ptr convention for bindings, params, and
+        // returns. (StrRef stays unsupported — borrowed views are a later step.)
+        SemanticType::Str => Ok(IrType::Ptr),
         SemanticType::Char => { unsupported_type!("Char") },
         // Tag-only enums (no payloads in 0.3) erase to the u8 tag's IR type
         // (D2.2). Exhaustiveness is enforced at semantic time, not in the IR.
@@ -4283,6 +4322,20 @@ fn lower_print_stmt(
             });
         }
     };
+    // D2.3b: string print — pass the descriptor Ptr to cx_print_str, which reads
+    // (byte ptr, len) from it and writes the bytes + newline (matching the
+    // interpreter's print/println for a string, byte-for-byte). Interpolation
+    // (`{…}`) literals already SKIP at the construct (tracker D2.3d).
+    if matches!(arg_expr.ty, SemanticType::Str) {
+        let arg = lower_expr(arg_expr, ctx, &mut current)?;
+        current.emit(IrInst::Call {
+            dst: None,
+            callee: "cx_print_str".to_string(),
+            args: vec![arg.value],
+            return_ty: None,
+        })?;
+        return Ok(Some(current));
+    }
     let arg = lower_expr(arg_expr, ctx, &mut current)?;
     let (routed_value, callee) = route_print_arg(arg.value, arg.ty.clone(), ctx, &mut current)?
         .ok_or_else(|| LoweringError::UnsupportedSemanticConstruct {
