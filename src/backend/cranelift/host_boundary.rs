@@ -309,6 +309,26 @@ extern "C" fn cx_print_str(descriptor: *const i64) {
     let _ = stdout.write_all(b"\n");
 }
 
+/// Runtime intrinsic: content equality of two strings (D2.3c).
+///
+/// Exported as `cx_str_eq`. JIT code calls it via
+/// `Call { callee: "cx_str_eq", args: [a_descriptor, b_descriptor], return_ty: Bool }`
+/// for `str == str` / `str != str` / `assert_eq` on strings. Each argument is the
+/// address of a static `{byte_ptr: i64, byte_len: i64}` descriptor; this returns
+/// 1 iff the lengths match and the bytes are equal (length-check then memcmp),
+/// matching the interpreter's content equality. Returns an i8 Bool (0/1).
+extern "C" fn cx_str_eq(a: *const i64, b: *const i64) -> i8 {
+    // SAFETY: both args are leaked `&'static` descriptors (see cx_print_str).
+    let (pa, la) = unsafe { (*a as *const u8, *a.add(1) as usize) };
+    let (pb, lb) = unsafe { (*b as *const u8, *b.add(1) as usize) };
+    if la != lb {
+        return 0;
+    }
+    let sa = unsafe { std::slice::from_raw_parts(pa, la) };
+    let sb = unsafe { std::slice::from_raw_parts(pb, lb) };
+    i8::from(sa == sb)
+}
+
 /// Backend-private symbol name for the F64 remainder host helper.
 ///
 /// Using a mangled name (double-underscore prefix) keeps it out of the user-visible namespace.
@@ -410,6 +430,7 @@ impl HostBoundary {
         jit_builder.symbol("cx_printn", cx_printn as *const u8);
         jit_builder.symbol("cx_print_bool", cx_print_bool as *const u8);
         jit_builder.symbol("cx_print_str", cx_print_str as *const u8);
+        jit_builder.symbol("cx_str_eq", cx_str_eq as *const u8);
         jit_builder.symbol(JIT_F64_REM_SYMBOL, host_fmod as *const u8);
         jit_builder.symbol(JIT_TRAP_SYMBOL, cx_trap as *const u8);
         let mut module = JITModule::new(jit_builder);
@@ -463,6 +484,23 @@ impl HostBoundary {
                     detail: e.to_string(),
                 })?;
             func_id_map.insert("cx_print_str".to_string(), id);
+        }
+
+        // cx_str_eq(a_descriptor, b_descriptor) -> Bool(I8) — string content
+        // equality (D2.3c): two descriptor-address params, an i8 (0/1) result.
+        {
+            use cranelift_codegen::ir::{types, AbiParam};
+            let call_conv = module.target_config().default_call_conv;
+            let mut sig = cranelift_codegen::ir::Signature::new(call_conv);
+            sig.params.push(AbiParam::new(types::I64));
+            sig.params.push(AbiParam::new(types::I64));
+            sig.returns.push(AbiParam::new(types::I8));
+            let id = module
+                .declare_function("cx_str_eq", Linkage::Import, &sig)
+                .map_err(|e| JitExecutionError::CodegenFailure {
+                    detail: e.to_string(),
+                })?;
+            func_id_map.insert("cx_str_eq".to_string(), id);
         }
 
         // Pre-declare __cx_fmod(f64, f64) -> f64 for F64 Rem lowering.
