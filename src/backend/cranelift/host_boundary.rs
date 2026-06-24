@@ -329,6 +329,43 @@ extern "C" fn cx_str_eq(a: *const i64, b: *const i64) -> i8 {
     i8::from(sa == sb)
 }
 
+// D2.3d inline (no-newline) print intrinsics for print-time string interpolation.
+// The interpolation lowering emits a sequence of these (literal chunks + resolved
+// values) followed by ONE `cx_print_newline`, matching the interpreter's
+// single-newline `print`. The existing newline-adding intrinsics are unchanged —
+// normal (non-interpolated) print keeps using them.
+
+extern "C" fn cx_print_str_inline(descriptor: *const i64) {
+    use std::io::{self, Write};
+    // SAFETY: leaked `&'static` descriptor (see cx_print_str).
+    let (ptr, len) = unsafe { (*descriptor as *const u8, *descriptor.add(1) as usize) };
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    let _ = io::stdout().lock().write_all(bytes);
+}
+
+extern "C" fn cx_printn_inline(n: i64) {
+    use std::io::{self, Write};
+    let _ = write!(io::stdout().lock(), "{n}");
+}
+
+extern "C" fn cx_print_bool_inline(b: i8) {
+    use std::io::{self, Write};
+    let _ = write!(io::stdout().lock(), "{}", if b != 0 { "true" } else { "false" });
+}
+
+/// f64 rendered via Rust's `Display` (`x.to_string()`), matching the
+/// interpreter's `value_to_string(Float)` byte-for-byte (3.14 -> "3.14",
+/// 2.0 -> "2").
+extern "C" fn cx_print_f64_inline(x: f64) {
+    use std::io::{self, Write};
+    let _ = write!(io::stdout().lock(), "{x}");
+}
+
+extern "C" fn cx_print_newline() {
+    use std::io::{self, Write};
+    let _ = io::stdout().lock().write_all(b"\n");
+}
+
 /// Backend-private symbol name for the F64 remainder host helper.
 ///
 /// Using a mangled name (double-underscore prefix) keeps it out of the user-visible namespace.
@@ -431,6 +468,11 @@ impl HostBoundary {
         jit_builder.symbol("cx_print_bool", cx_print_bool as *const u8);
         jit_builder.symbol("cx_print_str", cx_print_str as *const u8);
         jit_builder.symbol("cx_str_eq", cx_str_eq as *const u8);
+        jit_builder.symbol("cx_print_str_inline", cx_print_str_inline as *const u8);
+        jit_builder.symbol("cx_printn_inline", cx_printn_inline as *const u8);
+        jit_builder.symbol("cx_print_bool_inline", cx_print_bool_inline as *const u8);
+        jit_builder.symbol("cx_print_f64_inline", cx_print_f64_inline as *const u8);
+        jit_builder.symbol("cx_print_newline", cx_print_newline as *const u8);
         jit_builder.symbol(JIT_F64_REM_SYMBOL, host_fmod as *const u8);
         jit_builder.symbol(JIT_TRAP_SYMBOL, cx_trap as *const u8);
         let mut module = JITModule::new(jit_builder);
@@ -501,6 +543,47 @@ impl HostBoundary {
                     detail: e.to_string(),
                 })?;
             func_id_map.insert("cx_str_eq".to_string(), id);
+        }
+
+        // D2.3d no-newline inline print intrinsics for string interpolation.
+        {
+            use cranelift_codegen::ir::{types, AbiParam};
+            let call_conv = module.target_config().default_call_conv;
+            // single-I64-param, void: descriptor-ptr (str) and integer prints.
+            for name in ["cx_print_str_inline", "cx_printn_inline"] {
+                let mut sig = cranelift_codegen::ir::Signature::new(call_conv);
+                sig.params.push(AbiParam::new(types::I64));
+                let id = module
+                    .declare_function(name, Linkage::Import, &sig)
+                    .map_err(|e| JitExecutionError::CodegenFailure { detail: e.to_string() })?;
+                func_id_map.insert(name.to_string(), id);
+            }
+            // cx_print_bool_inline(i8)
+            {
+                let mut sig = cranelift_codegen::ir::Signature::new(call_conv);
+                sig.params.push(AbiParam::new(types::I8));
+                let id = module
+                    .declare_function("cx_print_bool_inline", Linkage::Import, &sig)
+                    .map_err(|e| JitExecutionError::CodegenFailure { detail: e.to_string() })?;
+                func_id_map.insert("cx_print_bool_inline".to_string(), id);
+            }
+            // cx_print_f64_inline(f64)
+            {
+                let mut sig = cranelift_codegen::ir::Signature::new(call_conv);
+                sig.params.push(AbiParam::new(types::F64));
+                let id = module
+                    .declare_function("cx_print_f64_inline", Linkage::Import, &sig)
+                    .map_err(|e| JitExecutionError::CodegenFailure { detail: e.to_string() })?;
+                func_id_map.insert("cx_print_f64_inline".to_string(), id);
+            }
+            // cx_print_newline() — no params, void.
+            {
+                let sig = cranelift_codegen::ir::Signature::new(call_conv);
+                let id = module
+                    .declare_function("cx_print_newline", Linkage::Import, &sig)
+                    .map_err(|e| JitExecutionError::CodegenFailure { detail: e.to_string() })?;
+                func_id_map.insert("cx_print_newline".to_string(), id);
+            }
         }
 
         // Pre-declare __cx_fmod(f64, f64) -> f64 for F64 Rem lowering.

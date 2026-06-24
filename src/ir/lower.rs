@@ -323,6 +323,11 @@ struct LoweringCtx {
     struct_table: HashMap<String, StructLayoutInfo>,
     trace: bool,
     target: TargetConfig,
+    /// D2.3d flat name→binding map for print-time string interpolation: every
+    /// `Decl`/`TypedAssign`/`For`/`ConstDecl` name in the current function (+ its
+    /// params), last-wins. See `lower_interpolated_print` for the FILED
+    /// scope-limitation note.
+    binding_names: HashMap<String, BindingId>,
 }
 
 struct ActiveBlock {
@@ -360,6 +365,7 @@ impl LoweringCtx {
             struct_table,
             trace,
             target,
+            binding_names: HashMap::new(),
         }
     }
 
@@ -551,6 +557,10 @@ fn lower_top_level_main(stmts: &[&SemanticStmt], signature_table: &HashMap<Strin
         allow_return_stmt: false,
     };
     let mut ctx = LoweringCtx::new(signature_table.clone(), struct_table.clone(), trace, target);
+    // D2.3d: flat name→binding map for print-time string interpolation.
+    for &stmt in stmts {
+        collect_binding_names_stmt(stmt, &mut ctx.binding_names);
+    }
     let entry = ctx.start_block(vec![], HashMap::new());
     let current = lower_stmt_sequence(
         stmts.iter().copied(),
@@ -622,6 +632,13 @@ fn lower_semantic_function(
         }
     }
 
+    // D2.3d: flat name→binding map (function body + params) for interpolation.
+    for stmt in &function.body {
+        collect_binding_names_stmt(stmt, &mut ctx.binding_names);
+    }
+    for param in &function.params {
+        ctx.binding_names.insert(param.name.clone(), param.binding);
+    }
     let spec = FunctionLoweringSpec {
         name: function.name.clone(),
         return_ty: return_ty.clone(),
@@ -4382,6 +4399,211 @@ fn lower_printn_stmt(
 /// integer widths (I8/I16/I32) and Bool/TBool are widened to I64 at the boundary
 /// via `widen_to_i64_for_print`.  F64, I128, Ptr, Str, and composite types
 /// produce a structured error.
+/// D2.3d: collect one statement's binding NAME → BindingId pairs (recursing into
+/// nested bodies) into the flat interpolation map. Last-wins for repeats.
+fn collect_binding_names_stmt(stmt: &SemanticStmt, map: &mut HashMap<String, BindingId>) {
+    match stmt {
+        SemanticStmt::Decl { binding, name, .. }
+        | SemanticStmt::TypedAssign { binding, name, .. }
+        | SemanticStmt::ConstDecl { binding, name, .. } => {
+            map.insert(name.clone(), *binding);
+        }
+        SemanticStmt::For { binding, var, body, .. } => {
+            map.insert(var.clone(), *binding);
+            for s in body {
+                collect_binding_names_stmt(s, map);
+            }
+        }
+        SemanticStmt::Block { stmts, .. }
+        | SemanticStmt::While { body: stmts, .. }
+        | SemanticStmt::Loop { body: stmts, .. }
+        | SemanticStmt::WhileIn { body: stmts, .. } => {
+            for s in stmts {
+                collect_binding_names_stmt(s, map);
+            }
+        }
+        SemanticStmt::IfElse { then_body, else_ifs, else_body, .. } => {
+            for s in then_body {
+                collect_binding_names_stmt(s, map);
+            }
+            for (_, b) in else_ifs {
+                for s in b {
+                    collect_binding_names_stmt(s, map);
+                }
+            }
+            if let Some(b) = else_body {
+                for s in b {
+                    collect_binding_names_stmt(s, map);
+                }
+            }
+        }
+        SemanticStmt::When { arms, .. } => {
+            for arm in arms {
+                for s in &arm.body {
+                    collect_binding_names_stmt(s, map);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// D2.3d: a `{...}` segment is a bare-variable reference iff its trimmed content
+/// is a non-empty identifier — mirrors runtime/print.rs `is_bare_identifier` (#038).
+fn is_bare_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_alphanumeric() || c == '_')
+}
+
+enum InterpPiece {
+    Lit(String),
+    Ref(String),
+}
+
+/// D2.3d: split an interpolated literal into literal-text and `{identifier}`
+/// pieces, mirroring runtime/print.rs `expand_interpolation` exactly (#038: bare
+/// identifiers only; an unclosed `{` is a literal brace). Returns `None` if a
+/// closed `{...}` is NOT a bare identifier — the interpreter raises
+/// BadInterpolation there, so the JIT SKIPs rather than mis-rendering.
+fn parse_interpolation(s: &str) -> Option<Vec<InterpPiece>> {
+    let mut pieces = Vec::new();
+    let mut lit = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '{' {
+            let mut name = String::new();
+            let mut closed = false;
+            for inner in chars.by_ref() {
+                if inner == '}' {
+                    closed = true;
+                    break;
+                }
+                name.push(inner);
+            }
+            if closed {
+                let trimmed = name.trim();
+                if is_bare_identifier(trimmed) {
+                    if !lit.is_empty() {
+                        pieces.push(InterpPiece::Lit(std::mem::take(&mut lit)));
+                    }
+                    pieces.push(InterpPiece::Ref(trimmed.to_string()));
+                } else {
+                    return None;
+                }
+            } else {
+                lit.push('{');
+                lit.push_str(&name);
+            }
+        } else {
+            lit.push(c);
+        }
+    }
+    if !lit.is_empty() {
+        pieces.push(InterpPiece::Lit(lit));
+    }
+    Some(pieces)
+}
+
+/// D2.3d: pick the no-newline inline print intrinsic for an interpolated value by
+/// its IR type, widening narrow ints to I64 (mirrors `route_print_arg`).
+fn interp_value_print(
+    val: &LoweredValue,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<(ValueId, &'static str), LoweringError> {
+    match val.ty {
+        IrType::I64 => Ok((val.value, "cx_printn_inline")),
+        IrType::I8 | IrType::I16 | IrType::I32 => {
+            let dst = ctx.fresh_value();
+            active.emit(IrInst::Cast {
+                dst,
+                from: val.ty.clone(),
+                to: IrType::I64,
+                value: val.value,
+            })?;
+            Ok((dst, "cx_printn_inline"))
+        }
+        IrType::Bool | IrType::TBool => Ok((val.value, "cx_print_bool_inline")),
+        IrType::F64 => Ok((val.value, "cx_print_f64_inline")),
+        // A Ptr in interpolation is a str descriptor (the only Ptr value a bare
+        // identifier resolves to in practice; composites aren't interpolated).
+        IrType::Ptr => Ok((val.value, "cx_print_str_inline")),
+        _ => Err(LoweringError::UnsupportedSemanticConstruct {
+            construct: format!("string interpolation of unsupported type {:?}", val.ty),
+        }),
+    }
+}
+
+/// D2.3d: lower `print("…{x}…")` as a print SEQUENCE — print-time interpolation,
+/// NO new string built (R6 untouched). Each literal chunk and each resolved `{x}`
+/// prints via a no-newline inline intrinsic; one `cx_print_newline` closes the
+/// line (matching the interpreter's single-newline `print`).
+///
+/// FILED LIMITATION (D2.3d flat map): `{x}` resolves via the function-wide
+/// `binding_names` map (last-wins). This DIVERGES from the interpreter's
+/// scope-correct resolution on two corners — (1) a shadowed name interpolated
+/// after the inner block exits (resolves the inner binding; the interpreter sees
+/// the outer), and (2) use-before-declaration (the interpreter errors #038; the
+/// map resolves a later declaration). No fixture exercises these; it is the
+/// accepted tradeoff tied to the OPEN interpolation-scoping question (a future
+/// scope-threaded map or semantic pre-resolution closes it). A shadowing /
+/// use-before-decl interpolation bug belongs on THIS note, not a fresh mystery.
+fn lower_interpolated_print(
+    s: &str,
+    ctx: &mut LoweringCtx,
+    mut current: ActiveBlock,
+) -> Result<Option<ActiveBlock>, LoweringError> {
+    let pieces = parse_interpolation(s).ok_or_else(|| {
+        LoweringError::UnsupportedSemanticConstruct {
+            construct: "string interpolation with a non-identifier `{...}` not supported"
+                .to_string(),
+        }
+    })?;
+    for piece in &pieces {
+        match piece {
+            InterpPiece::Lit(text) => {
+                let desc = construct_static_str(text, ctx, &mut current)?;
+                current.emit(IrInst::Call {
+                    dst: None,
+                    callee: "cx_print_str_inline".to_string(),
+                    args: vec![desc.value],
+                    return_ty: None,
+                })?;
+            }
+            InterpPiece::Ref(name) => {
+                let binding = ctx.binding_names.get(name).copied().ok_or_else(|| {
+                    LoweringError::UnsupportedSemanticConstruct {
+                        construct: format!("string interpolation: `{}` not resolvable at lowering", name),
+                    }
+                })?;
+                let val = current.bindings.get(&binding).cloned().ok_or_else(|| {
+                    LoweringError::UnsupportedSemanticConstruct {
+                        construct: format!("string interpolation: `{}` not in scope at this print", name),
+                    }
+                })?;
+                let (arg_val, callee) = interp_value_print(&val, ctx, &mut current)?;
+                current.emit(IrInst::Call {
+                    dst: None,
+                    callee: callee.to_string(),
+                    args: vec![arg_val],
+                    return_ty: None,
+                })?;
+            }
+        }
+    }
+    current.emit(IrInst::Call {
+        dst: None,
+        callee: "cx_print_newline".to_string(),
+        args: vec![],
+        return_ty: None,
+    })?;
+    Ok(Some(current))
+}
+
 fn lower_print_stmt(
     builtin_name: &str,
     args: &[SemanticCallArg],
@@ -4401,6 +4623,34 @@ fn lower_print_stmt(
             });
         }
     };
+    // D2.3d: print-time string interpolation — a str LITERAL containing `{…}`
+    // decomposes into a print sequence (literal chunks + resolved `{x}` values +
+    // one trailing newline), building NO new string (R6 untouched). A non-literal
+    // str arg can't hold `{…}` in a lowerable program (the construct would SKIP),
+    // so it falls through to the plain cx_print_str path below.
+    if let SemanticExprKind::Value(SemanticValue::Str(s)) = &arg_expr.kind {
+        if s.contains('{') {
+            return lower_interpolated_print(s, ctx, current);
+        }
+    }
+    // D2.3d: bare f64 print (f64 wasn't routable before) — inline render via
+    // `x.to_string()` + one trailing newline, matching the interpreter's print.
+    if matches!(arg_expr.ty, SemanticType::F64) {
+        let arg = lower_expr(arg_expr, ctx, &mut current)?;
+        current.emit(IrInst::Call {
+            dst: None,
+            callee: "cx_print_f64_inline".to_string(),
+            args: vec![arg.value],
+            return_ty: None,
+        })?;
+        current.emit(IrInst::Call {
+            dst: None,
+            callee: "cx_print_newline".to_string(),
+            args: vec![],
+            return_ty: None,
+        })?;
+        return Ok(Some(current));
+    }
     // D2.3b: string print — pass the descriptor Ptr to cx_print_str, which reads
     // (byte ptr, len) from it and writes the bytes + newline (matching the
     // interpreter's print/println for a string, byte-for-byte). Interpolation
@@ -7875,11 +8125,11 @@ mod tests {
     }
 
     #[test]
-    fn print_f64_arg_returns_unsupported_construct() {
-        // print with an F64 argument must return UnsupportedSemanticConstruct.
-        // Post-widening contract: I8/I16/I32 sign-extend to I64 via Cast and
-        // succeed; Bool/TBool route to cx_print_bool. F64, I128, Str, and
-        // composites are the still-unsupported set the lowering must reject.
+    fn print_f64_arg_lowers_to_inline_plus_newline() {
+        // D2.3d: print with an F64 argument now lowers to cx_print_f64_inline +
+        // cx_print_newline (f64 was previously the still-unsupported set's first
+        // member; I8/I16/I32 still sign-extend to I64; Bool/TBool route to
+        // cx_print_bool).
         let program = SemanticProgram {
             stmts: vec![builtin_stmt(
                 "print",
@@ -7887,15 +8137,26 @@ mod tests {
             )],
             enums: vec![],
         };
-        let err = lower_program(&program).expect_err("lowering should fail for F64 print arg");
+        let module = lower_program(&program).expect("F64 print should lower (D2.3d)");
+        let callees: Vec<&str> = module
+            .functions
+            .iter()
+            .flat_map(|f| f.blocks.iter())
+            .flat_map(|b| b.insts.iter())
+            .filter_map(|inst| match inst {
+                IrInst::Call { callee, .. } => Some(callee.as_str()),
+                _ => None,
+            })
+            .collect();
         assert!(
-            matches!(
-                &err,
-                LoweringError::UnsupportedSemanticConstruct { construct }
-                if construct.contains("F64")
-            ),
-            "expected UnsupportedSemanticConstruct mentioning F64, got: {:?}",
-            err
+            callees.contains(&"cx_print_f64_inline"),
+            "expected a cx_print_f64_inline call, got {:?}",
+            callees
+        );
+        assert!(
+            callees.contains(&"cx_print_newline"),
+            "expected a trailing cx_print_newline call, got {:?}",
+            callees
         );
     }
 
