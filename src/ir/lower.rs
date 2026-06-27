@@ -2231,7 +2231,10 @@ fn lower_expr(
         // operator (Try) is D2.4b — still SKIP.
         SemanticExprKind::ResultOk { expr } => lower_result_construct(0, expr, ctx, active),
         SemanticExprKind::ResultErr { expr } => lower_result_construct(1, expr, ctx, active),
-        SemanticExprKind::Try { .. } => { unsupported!("Try") },
+        // D2.4b: `expr?` unwraps the Ok payload (continuing) or early-returns the
+        // whole Err Result. `expr.ty` is the unwrapped Ok type T (semantic.rs sets
+        // it); `inner` is the Result<T> operand.
+        SemanticExprKind::Try { expr: inner, .. } => lower_try(inner, &expr.ty, ctx, active),
     }
 }
 
@@ -3644,6 +3647,80 @@ fn lower_if_expr(
     lower_branch_value(else_body, &result_ir_ty, merge_id, else_block, ctx)?;
 
     Ok(LoweredValue { value: result_param, ty: result_ir_ty })
+}
+
+/// D2.4b: lower `expr?` (the Try operator) on a packed-i128 Result. Unpack the
+/// operand (D2.4a `result_unpack`), then branch on the tag: Ok continues with the
+/// payload narrowed back to T (reverse of the construct's widen), Err early-returns
+/// the WHOLE original Result i128, byte-identical, from the enclosing function.
+///
+/// The semantic analyser guarantees `?` only appears inside a Result-returning
+/// function and that the operand is a Result<T> (semantic.rs rejects t85/t86), so
+/// the Err early-return of the i128 is type-correct without consulting the return
+/// type here, and `inner` always lowers to an i128.
+///
+/// `EarlyReturn` reuses the plain `Return` terminator — zero overlap with the
+/// unknown-`?`/TBool machinery (the unknown arc is independent, audit-confirmed).
+fn lower_try(
+    inner_expr: &SemanticExpr,
+    result_ty: &SemanticType,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<LoweredValue, LoweringError> {
+    // Word-payload fence (R7): unwrapping a NESTED Result (T is itself a Result,
+    // so lower_type(T) == I128) exceeds the word payload — stays SKIP, exactly as
+    // the D2.4a construct does. Scalar/str `?` is the target.
+    let t_ir = lower_type(result_ty)?;
+    if matches!(t_ir, IrType::I128) {
+        return Err(LoweringError::UnsupportedSemanticConstruct {
+            construct: "? on a nested Result (word-payload limit, R7-deferred)".to_string(),
+        });
+    }
+
+    // Lower the Result operand and unpack it into (tag, payload word).
+    let result = lower_expr(inner_expr, ctx, active)?;
+    let (tag, payload) = result_unpack(result.value, ctx, active)?;
+
+    // Ok payload narrowed back to T (i64 word -> T). Identity when T is already I64.
+    let unwrapped = if t_ir == IrType::I64 {
+        payload
+    } else {
+        let dst = ctx.fresh_value();
+        active.emit(IrInst::Cast { dst, from: IrType::I64, to: t_ir.clone(), value: payload })?;
+        dst
+    };
+
+    // is_ok = (tag == 0).
+    let zero = ctx.fresh_value();
+    active.emit(IrInst::ConstInt { dst: zero, ty: IrType::I64, value: 0 })?;
+    let is_ok = ctx.fresh_value();
+    active.emit(IrInst::Compare { dst: is_ok, op: CompareOp::Eq, lhs: tag, rhs: zero })?;
+
+    let incoming = active.bindings.clone();
+    let cont_block = ctx.start_block(vec![], incoming.clone());
+    let cont_id = cont_block.id();
+    let mut err_block = ctx.start_block(vec![], incoming);
+    let err_id = err_block.id();
+
+    // Seal the decision block first: the Err block reads `result.value` and the
+    // continuation reads `unwrapped`, both defined here (they dominate both edges).
+    active.terminate(IrTerminator::Branch {
+        cond: is_ok,
+        then_block: cont_id,
+        then_args: vec![],
+        else_block: err_id,
+        else_args: vec![],
+    })?;
+    let old = std::mem::replace(active, cont_block);
+    ctx.seal_block(old)?;
+
+    // Err: early-return the whole original Result i128, unchanged.
+    err_block.terminate(IrTerminator::Return { value: Some(result.value) })?;
+    ctx.seal_block(err_block)?;
+
+    // Ok: `active` is now the continuation; the `?`-expression's value is the
+    // unwrapped payload at type T.
+    Ok(LoweredValue { value: unwrapped, ty: t_ir })
 }
 
 // Struct field access lowering strategy
