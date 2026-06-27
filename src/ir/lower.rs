@@ -2227,8 +2227,10 @@ fn lower_expr(
         SemanticExprKind::If { condition, then_body, else_body, .. } => {
             lower_if_expr(condition, then_body, else_body, &expr.ty, ctx, active)
         },
-        SemanticExprKind::ResultOk { .. } => { unsupported!("ResultOk") },
-        SemanticExprKind::ResultErr { .. } => { unsupported!("ResultErr") },
+        // D2.4a: `Ok(x)` = tag 0, `Err("...")` = tag 1 (packed-i128). The `?`
+        // operator (Try) is D2.4b — still SKIP.
+        SemanticExprKind::ResultOk { expr } => lower_result_construct(0, expr, ctx, active),
+        SemanticExprKind::ResultErr { expr } => lower_result_construct(1, expr, ctx, active),
         SemanticExprKind::Try { .. } => { unsupported!("Try") },
     }
 }
@@ -4252,7 +4254,13 @@ fn lower_type(ty: &SemanticType) -> Result<IrType, LoweringError> {
         SemanticType::TypeParam(_) => { unsupported_type!("TypeParam") },
         SemanticType::Struct(_) => Ok(IrType::Ptr),
         SemanticType::Array(_, _) => Ok(IrType::Ptr),
-        SemanticType::Result(_) => { unsupported_type!("Result") },
+        // D2.4a: a `Result<T>` (Ok(T) | Err(str)) is a packed i128 — tag in the
+        // high 64 (Ok=0/Err=1), payload word in the low 64. Single SSA value,
+        // returnable, heap-free. WORD-PAYLOAD-ONLY: the payload is a scalar or a
+        // static Ptr (Err-str). This rep does NOT generalize to nested/large
+        // payloads — `Result<Result<T>>` (R7-deferred) needs a different rep and
+        // SKIPs at the construct's `widen_payload_to_i64` (do not force it here).
+        SemanticType::Result(_) => Ok(IrType::I128),
         // Void is not a storable type — it is only valid in return position,
         // where `lower_return_type` canonicalises it to `None`.  Letting Void
         // leak into params, block params, locals, or SSA values would violate
@@ -4604,6 +4612,222 @@ fn lower_interpolated_print(
     Ok(Some(current))
 }
 
+/// D2.4a: widen a Result payload to the i64 word slot. Scalars sign/zero-extend
+/// via the existing Cast; a Ptr (Err-str descriptor) reinterprets to i64. An
+/// I128 payload (nested Result) is REFUSED — the word-payload rep can't hold it
+/// (R7-deferred); this is the SKIP that fences `Result<Result<T>>`.
+fn widen_payload_to_i64(
+    payload: &LoweredValue,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<ValueId, LoweringError> {
+    match payload.ty {
+        IrType::I64 => Ok(payload.value),
+        IrType::I8 | IrType::I16 | IrType::I32 | IrType::Ptr => {
+            let dst = ctx.fresh_value();
+            active.emit(IrInst::Cast {
+                dst,
+                from: payload.ty.clone(),
+                to: IrType::I64,
+                value: payload.value,
+            })?;
+            Ok(dst)
+        }
+        _ => Err(LoweringError::UnsupportedSemanticConstruct {
+            construct: format!(
+                "Result payload type {:?} exceeds the word-payload slot (nested/large Result is R7-deferred)",
+                payload.ty
+            ),
+        }),
+    }
+}
+
+/// D2.4a: pack a Result tag + payload word into the i128 rep via a MEMORY
+/// round-trip — store payload @0 and tag @8 into a 16-byte slot, then `Load`
+/// the i128. The raw-byte store/load is exactly why a NEGATIVE Ok payload can't
+/// corrupt the tag: its sign bits stay in the payload's 8 bytes, never reaching
+/// the tag's. (Arithmetic packing would `sextend` them into the tag — the bug
+/// this rep avoids.)
+fn result_pack(
+    tag: i128,
+    payload_i64: ValueId,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<LoweredValue, LoweringError> {
+    let slot = ctx.fresh_value();
+    active.emit(IrInst::Alloca { dst: slot, size: 16, align: 16 })?;
+    active.emit(IrInst::Store { ptr: slot, value: payload_i64 })?;
+    let tag_val = ctx.fresh_value();
+    active.emit(IrInst::ConstInt { dst: tag_val, ty: IrType::I64, value: tag })?;
+    let slot8 = ctx.fresh_value();
+    active.emit(IrInst::PtrOffset { dst: slot8, base: slot, offset: 8 })?;
+    active.emit(IrInst::Store { ptr: slot8, value: tag_val })?;
+    let result = ctx.fresh_value();
+    active.emit(IrInst::Load { dst: result, ty: IrType::I128, ptr: slot })?;
+    Ok(LoweredValue { value: result, ty: IrType::I128 })
+}
+
+/// D2.4a: lower `Ok(x)` (tag 0) / `Err("...")` (tag 1) — lower the payload, widen
+/// to the i64 word, pack. Err's str payload is the static D2.3 descriptor Ptr, so
+/// nothing runtime-allocated escapes (R7-clean).
+fn lower_result_construct(
+    tag: i128,
+    payload_expr: &SemanticExpr,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<LoweredValue, LoweringError> {
+    let payload = lower_expr(payload_expr, ctx, active)?;
+    let payload_i64 = widen_payload_to_i64(&payload, ctx, active)?;
+    result_pack(tag, payload_i64, ctx, active)
+}
+
+/// D2.4a: unpack a Result i128 into (tag, payload_word). Payload is the low half
+/// (`Cast I128->I64` = truncate). Tag is the high half, read from its OWN 8 bytes
+/// (store the i128, `Load i64@8`) — so a negative payload's sign bits never reach
+/// the tag.
+fn result_unpack(
+    result: ValueId,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<(ValueId, ValueId), LoweringError> {
+    let payload = ctx.fresh_value();
+    active.emit(IrInst::Cast {
+        dst: payload,
+        from: IrType::I128,
+        to: IrType::I64,
+        value: result,
+    })?;
+    let slot = ctx.fresh_value();
+    active.emit(IrInst::Alloca { dst: slot, size: 16, align: 16 })?;
+    active.emit(IrInst::Store { ptr: slot, value: result })?;
+    let slot8 = ctx.fresh_value();
+    active.emit(IrInst::PtrOffset { dst: slot8, base: slot, offset: 8 })?;
+    let tag = ctx.fresh_value();
+    active.emit(IrInst::Load { dst: tag, ty: IrType::I64, ptr: slot8 })?;
+    Ok((tag, payload))
+}
+
+/// D2.4a: print a static literal chunk inline (no newline) — `construct_static_str`
+/// + `cx_print_str_inline`, reused from the D2.3/D2.3d print machinery.
+fn emit_inline_str(
+    text: &str,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<(), LoweringError> {
+    let desc = construct_static_str(text, ctx, active)?;
+    active.emit(IrInst::Call {
+        dst: None,
+        callee: "cx_print_str_inline".to_string(),
+        args: vec![desc.value],
+        return_ty: None,
+    })?;
+    Ok(())
+}
+
+/// D2.4a: print the Ok payload (the i64 word) by the `Result<T>` Ok type — an
+/// integer T prints via `cx_printn_inline` (the widened word carries the signed
+/// value); a str T reinterprets the word to a descriptor Ptr.
+fn emit_ok_payload(
+    payload: ValueId,
+    ok_ty: &SemanticType,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<(), LoweringError> {
+    match lower_type(ok_ty)? {
+        IrType::I8 | IrType::I16 | IrType::I32 | IrType::I64 => {
+            active.emit(IrInst::Call {
+                dst: None,
+                callee: "cx_printn_inline".to_string(),
+                args: vec![payload],
+                return_ty: None,
+            })?;
+        }
+        IrType::Ptr => {
+            let p = ctx.fresh_value();
+            active.emit(IrInst::Cast { dst: p, from: IrType::I64, to: IrType::Ptr, value: payload })?;
+            active.emit(IrInst::Call {
+                dst: None,
+                callee: "cx_print_str_inline".to_string(),
+                args: vec![p],
+                return_ty: None,
+            })?;
+        }
+        other => {
+            return Err(LoweringError::UnsupportedSemanticConstruct {
+                construct: format!("print of Result<{other:?}> Ok payload not yet supported"),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// D2.4a: print(Result) as a tag-branch print SEQUENCE (no new string built —
+/// R6-style). Unpack → branch on tag; Ok → `Ok(` + payload-by-type + `)`; Err →
+/// `Err(` + the str payload + `)`; one trailing `cx_print_newline`. Matches the
+/// interpreter's `Ok(15)` / `Err(cannot be zero)` byte-for-byte.
+fn lower_result_print(
+    arg_expr: &SemanticExpr,
+    ok_ty: &SemanticType,
+    ctx: &mut LoweringCtx,
+    mut current: ActiveBlock,
+) -> Result<Option<ActiveBlock>, LoweringError> {
+    let result = lower_expr(arg_expr, ctx, &mut current)?;
+    let (tag, payload) = result_unpack(result.value, ctx, &mut current)?;
+    let zero = ctx.fresh_value();
+    current.emit(IrInst::ConstInt { dst: zero, ty: IrType::I64, value: 0 })?;
+    let is_ok = ctx.fresh_value();
+    current.emit(IrInst::Compare { dst: is_ok, op: CompareOp::Eq, lhs: tag, rhs: zero })?;
+
+    let incoming = current.bindings.clone();
+    let mut ok_block = ctx.start_block(vec![], incoming.clone());
+    let ok_id = ok_block.id();
+    let mut err_block = ctx.start_block(vec![], incoming.clone());
+    let err_id = err_block.id();
+    let merge = ctx.start_block(vec![], incoming);
+    let merge_id = merge.id();
+
+    // Seal the decision block first (Ok/Err read `payload` from it).
+    current.terminate(IrTerminator::Branch {
+        cond: is_ok,
+        then_block: ok_id,
+        then_args: vec![],
+        else_block: err_id,
+        else_args: vec![],
+    })?;
+    let old = std::mem::replace(&mut current, merge);
+    ctx.seal_block(old)?;
+
+    // Ok( payload )
+    emit_inline_str("Ok(", ctx, &mut ok_block)?;
+    emit_ok_payload(payload, ok_ty, ctx, &mut ok_block)?;
+    emit_inline_str(")", ctx, &mut ok_block)?;
+    ok_block.terminate(IrTerminator::Jump { target: merge_id, args: vec![] })?;
+    ctx.seal_block(ok_block)?;
+
+    // Err( <str> ) — the Err payload is always a str descriptor Ptr.
+    emit_inline_str("Err(", ctx, &mut err_block)?;
+    let err_ptr = ctx.fresh_value();
+    err_block.emit(IrInst::Cast { dst: err_ptr, from: IrType::I64, to: IrType::Ptr, value: payload })?;
+    err_block.emit(IrInst::Call {
+        dst: None,
+        callee: "cx_print_str_inline".to_string(),
+        args: vec![err_ptr],
+        return_ty: None,
+    })?;
+    emit_inline_str(")", ctx, &mut err_block)?;
+    err_block.terminate(IrTerminator::Jump { target: merge_id, args: vec![] })?;
+    ctx.seal_block(err_block)?;
+
+    // merge: one trailing newline.
+    current.emit(IrInst::Call {
+        dst: None,
+        callee: "cx_print_newline".to_string(),
+        args: vec![],
+        return_ty: None,
+    })?;
+    Ok(Some(current))
+}
+
 fn lower_print_stmt(
     builtin_name: &str,
     args: &[SemanticCallArg],
@@ -4623,6 +4847,11 @@ fn lower_print_stmt(
             });
         }
     };
+    // D2.4a: print(Result) — unpack the packed-i128 and print a tag-branch
+    // sequence (`Ok(..)` / `Err(..)`), no new string built.
+    if let SemanticType::Result(ok_ty) = &arg_expr.ty {
+        return lower_result_print(arg_expr, ok_ty, ctx, current);
+    }
     // D2.3d: print-time string interpolation — a str LITERAL containing `{…}`
     // decomposes into a print sequence (literal chunks + resolved `{x}` values +
     // one trailing newline), building NO new string (R6 untouched). A non-literal

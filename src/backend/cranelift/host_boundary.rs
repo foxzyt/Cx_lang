@@ -451,6 +451,14 @@ impl HostBoundary {
             .map_err(|e| JitExecutionError::CodegenFailure {
                 detail: e.to_string(),
             })?;
+        // D2.4a: the packed-i128 Result rep is returned by value from functions.
+        // Cranelift's x64 ABI rejects i128 args/returns unless this extension is
+        // enabled (cranelift-codegen x64/abi.rs).
+        flag_builder
+            .set("enable_llvm_abi_extensions", "true")
+            .map_err(|e| JitExecutionError::CodegenFailure {
+                detail: e.to_string(),
+            })?;
         let flags = settings::Flags::new(flag_builder);
         let isa = cranelift_native::builder()
             .map_err(|s| JitExecutionError::CodegenFailure {
