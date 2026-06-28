@@ -204,8 +204,25 @@ SemanticStmt::Decl { binding, name, ty, .. } => {
                 }
                 Ok(())
             }
-            SemanticStmt::Break { .. } => Err(RuntimeError::BreakSignal),
-            SemanticStmt::Continue { .. } => Err(RuntimeError::ContinueSignal),
+            // labeled-breaks (a): unlabeled break/continue are unchanged. A
+            // *labeled* jump parsed and passed semantic validation, but execution
+            // is wired in commit (b); raise a clean uncaught error (the loops below
+            // only catch the plain Break/ContinueSignal) rather than mis-breaking
+            // the innermost loop. Replaced by label-aware signals in (b).
+            SemanticStmt::Break { label, pos } => match label {
+                Some(name) => Err(RuntimeError::AssertionFailed {
+                    msg: format!("labeled break '{name} cannot execute yet — labeled-break execution lands in commit (b)"),
+                    pos: *pos,
+                }),
+                None => Err(RuntimeError::BreakSignal),
+            },
+            SemanticStmt::Continue { label, pos } => match label {
+                Some(name) => Err(RuntimeError::AssertionFailed {
+                    msg: format!("labeled continue '{name} cannot execute yet — labeled-break execution lands in commit (b)"),
+                    pos: *pos,
+                }),
+                None => Err(RuntimeError::ContinueSignal),
+            },
             SemanticStmt::FuncDef(sem_func) => {
                 self.semantic_funcs.insert(sem_func.name.clone(), Arc::new(sem_func.clone()));
                 Ok(())

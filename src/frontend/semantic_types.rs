@@ -371,9 +371,13 @@ ExprStmt {
         pos: usize,
     },
     Break {
+        // labeled-breaks (a): the target loop label, or None for an unlabeled
+        // break. Validated semantically here; execution is wired in commit (b).
+        label: Option<String>,
         pos: usize,
     },
     Continue {
+        label: Option<String>,
         pos: usize,
     },
     IfElse {

@@ -50,6 +50,12 @@ pub struct Analyzer {
     current_ret_ty: Option<SemanticType>,
     current_type_params: Vec<String>,
     in_function: bool,
+    /// labeled-breaks (a): stack of the labels of currently-enclosing labeled
+    /// loops. Pushed on entering a labeled loop (after a duplicate check), popped
+    /// on exit. `break 'L`/`continue 'L` resolve `'L` against this stack; a label
+    /// not present rejects cleanly ("no enclosing loop labeled 'L"). Unlabeled
+    /// loops push nothing and unlabeled break/continue never consult it.
+    loop_labels: Vec<String>,
     funcs: HashMap<String, FunctionInfo>,
     enums: HashMap<String, EnumInfo>,
     structs: HashMap<String, Vec<(String, Type)>>,
@@ -77,6 +83,7 @@ impl Analyzer {
             current_ret_ty: None,
             current_type_params: vec![],
             in_function: false,
+            loop_labels: vec![],
             funcs: HashMap::new(),
             enums: HashMap::new(),
             structs: HashMap::new(),
@@ -253,6 +260,40 @@ impl Analyzer {
         };
         self.enum_defs.push(semantic_enum.clone());
         semantic_enum
+    }
+
+    /// labeled-breaks (a): enter a possibly-labeled loop. A labeled loop whose
+    /// label is already active in an enclosing loop rejects (duplicate). Returns
+    /// whether a label was pushed, so the caller pops it after the body.
+    fn enter_loop_label(&mut self, label: &Option<String>, pos: usize) -> Result<bool, SemanticError> {
+        if let Some(name) = label {
+            if self.loop_labels.iter().any(|l| l == name) {
+                return Err(sem_err!(pos, "duplicate loop label '{} — already used by an enclosing loop", name));
+            }
+            self.loop_labels.push(name.clone());
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// labeled-breaks (a): pop a label pushed by [`Analyzer::enter_loop_label`].
+    fn exit_loop_label(&mut self, pushed: bool) {
+        if pushed {
+            self.loop_labels.pop();
+        }
+    }
+
+    /// labeled-breaks (a): validate a labeled `break`/`continue` target. Unlabeled
+    /// jumps are unchanged (Ok); a labeled jump with no enclosing loop of that
+    /// label rejects cleanly.
+    fn check_jump_label(&self, label: &Option<String>, kw: &str, pos: usize) -> Result<(), SemanticError> {
+        if let Some(name) = label {
+            if !self.loop_labels.iter().any(|l| l == name) {
+                return Err(sem_err!(pos, "{} to label '{} but no enclosing loop has that label", kw, name));
+            }
+        }
+        Ok(())
     }
 
     fn analyze_stmt(&mut self, stmt: &Stmt) -> Result<SemanticStmt, SemanticError> {
@@ -726,6 +767,7 @@ Stmt::ExprStmt { expr, _pos } => Ok(SemanticStmt::ExprStmt {
                 })
             }
             Stmt::WhileIn {
+                label,
                 arr,
                 start_slot,
                 range_start,
@@ -738,10 +780,11 @@ Stmt::ExprStmt { expr, _pos } => Ok(SemanticStmt::ExprStmt {
             } => {
                 let sem_start = self.analyze_expr(range_start)?;
                 let sem_end = self.analyze_expr(range_end)?;
+                let pushed = self.enter_loop_label(label, *pos)?;
                 let sem_body = body
                     .iter()
                     .map(|s| self.analyze_stmt(s))
-                    .collect::<Result<Vec<_>, _>>()?;
+                    .collect::<Result<Vec<_>, _>>();
                 let sem_chains = then_chains
                     .iter()
                     .map(|chain| {
@@ -761,7 +804,10 @@ Stmt::ExprStmt { expr, _pos } => Ok(SemanticStmt::ExprStmt {
                             body: cb,
                         })
                     })
-                    .collect::<Result<Vec<_>, SemanticError>>()?;
+                    .collect::<Result<Vec<_>, SemanticError>>();
+                self.exit_loop_label(pushed);
+                let sem_body = sem_body?;
+                let sem_chains = sem_chains?;
                 let sem_result = match result {
                     Some(e) => Some(self.analyze_expr(e)?),
                     None => None,
@@ -778,36 +824,49 @@ Stmt::ExprStmt { expr, _pos } => Ok(SemanticStmt::ExprStmt {
                     pos: *pos,
                 })
             }
-            Stmt::While { cond, body, pos } => {
+            Stmt::While { label, cond, body, pos } => {
                 let semantic_cond = self.analyze_expr(cond)?;
                 if matches!(semantic_cond.ty, SemanticType::Unknown) {
                     return Err(sem_err!(*pos, "Unknown value cannot be used as a loop condition -- control-critical context"));
                 }
+                let pushed = self.enter_loop_label(label, *pos)?;
                 let semantic_body = body
                     .iter()
                     .map(|stmt| self.analyze_stmt(stmt))
-                    .collect::<Result<Vec<_>, _>>()?;
+                    .collect::<Result<Vec<_>, _>>();
+                self.exit_loop_label(pushed);
                 Ok(SemanticStmt::While {
                     cond: semantic_cond,
-                    body: semantic_body,
+                    body: semantic_body?,
                     pos: *pos,
                 })
             }
             Stmt::For {
+                label,
                 var,
                 start,
                 end,
                 inclusive,
                 body,
                 pos,
-            } => self.analyze_for(var, start, end, *inclusive, body, *pos),
-            Stmt::Loop { body, pos } => Ok(SemanticStmt::Loop {
-                body: body
+            } => {
+                let pushed = self.enter_loop_label(label, *pos)?;
+                let result = self.analyze_for(var, start, end, *inclusive, body, *pos);
+                self.exit_loop_label(pushed);
+                result
+            }
+            Stmt::Loop { label, body, pos } => {
+                let pushed = self.enter_loop_label(label, *pos)?;
+                let semantic_body = body
                     .iter()
                     .map(|stmt| self.analyze_stmt(stmt))
-                    .collect::<Result<Vec<_>, _>>()?,
-                pos: *pos,
-            }),
+                    .collect::<Result<Vec<_>, _>>();
+                self.exit_loop_label(pushed);
+                Ok(SemanticStmt::Loop {
+                    body: semantic_body?,
+                    pos: *pos,
+                })
+            }
             Stmt::ImportBlock { imports, pos: _ } => {
                 // Rule 1: position enforced by parser
 
@@ -828,8 +887,14 @@ Stmt::ExprStmt { expr, _pos } => Ok(SemanticStmt::ExprStmt {
 
                 Ok(SemanticStmt::Noop)
             }
-            Stmt::Break { pos } => Ok(SemanticStmt::Break { pos: *pos }),
-            Stmt::Continue { pos } => Ok(SemanticStmt::Continue { pos: *pos }),
+            Stmt::Break { label, pos } => {
+                self.check_jump_label(label, "break", *pos)?;
+                Ok(SemanticStmt::Break { label: label.clone(), pos: *pos })
+            }
+            Stmt::Continue { label, pos } => {
+                self.check_jump_label(label, "continue", *pos)?;
+                Ok(SemanticStmt::Continue { label: label.clone(), pos: *pos })
+            }
             Stmt::CompoundAssign {
                 target,
                 op,
@@ -2417,19 +2482,19 @@ fn normalize_enum_stmt(stmt: Stmt, enums: &std::collections::HashSet<String>) ->
             ret_expr,
         },
         Stmt::Block { stmts, _pos } => Stmt::Block { stmts: normalize_enum_stmts(stmts, enums), _pos },
-        Stmt::While { cond, body, pos } => Stmt::While { cond, body: normalize_enum_stmts(body, enums), pos },
-        Stmt::For { var, start, end, inclusive, body, pos } => Stmt::For {
-            var, start, end, inclusive, pos, body: normalize_enum_stmts(body, enums),
+        Stmt::While { label, cond, body, pos } => Stmt::While { label, cond, body: normalize_enum_stmts(body, enums), pos },
+        Stmt::For { label, var, start, end, inclusive, body, pos } => Stmt::For {
+            label, var, start, end, inclusive, pos, body: normalize_enum_stmts(body, enums),
         },
-        Stmt::Loop { body, pos } => Stmt::Loop { body: normalize_enum_stmts(body, enums), pos },
+        Stmt::Loop { label, body, pos } => Stmt::Loop { label, body: normalize_enum_stmts(body, enums), pos },
         Stmt::IfElse { condition, then_body, else_ifs, else_body, pos } => Stmt::IfElse {
             condition, pos,
             then_body: normalize_enum_stmts(then_body, enums),
             else_ifs: else_ifs.into_iter().map(|(c, b)| (c, normalize_enum_stmts(b, enums))).collect(),
             else_body: else_body.map(|b| normalize_enum_stmts(b, enums)),
         },
-        Stmt::WhileIn { arr, start_slot, range_start, range_end, inclusive, body, then_chains, result, pos } => Stmt::WhileIn {
-            arr, start_slot, range_start, range_end, inclusive, result, pos,
+        Stmt::WhileIn { label, arr, start_slot, range_start, range_end, inclusive, body, then_chains, result, pos } => Stmt::WhileIn {
+            label, arr, start_slot, range_start, range_end, inclusive, result, pos,
             body: normalize_enum_stmts(body, enums),
             then_chains: then_chains.into_iter().map(|c| WhileInChain {
                 body: normalize_enum_stmts(c.body, enums),

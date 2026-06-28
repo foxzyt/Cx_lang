@@ -1098,7 +1098,15 @@ SemanticStmt::Block { .. } => { unsupported!("Block") },
         None => Ok(None),
     };
 },
-        SemanticStmt::Break { .. } => {
+        SemanticStmt::Break { label, .. } => {
+    // labeled-breaks (a): a labeled break parsed + passed semantic validation, but
+    // execution lands in commit (b). SKIP it (unsupported) so the JIT never
+    // mis-targets the innermost loop's exit. Unlabeled break is unchanged below.
+    if label.is_some() {
+        return Err(LoweringError::UnsupportedSemanticConstruct {
+            construct: "labeled break (execution wired in labeled-breaks b)".to_string(),
+        });
+    }
     let ctx_ref = loop_ctx.ok_or_else(|| LoweringError::UnsupportedSemanticConstruct {
         construct: "break outside of loop".to_string(),
     })?;
@@ -1118,7 +1126,13 @@ SemanticStmt::Block { .. } => { unsupported!("Block") },
     ctx.seal_block(current)?;
     return Ok(None);
 },
-        SemanticStmt::Continue { .. } => {
+        SemanticStmt::Continue { label, .. } => {
+    // labeled-breaks (a): labeled continue SKIPs until execution lands in (b).
+    if label.is_some() {
+        return Err(LoweringError::UnsupportedSemanticConstruct {
+            construct: "labeled continue (execution wired in labeled-breaks b)".to_string(),
+        });
+    }
     let ctx_ref = loop_ctx.ok_or_else(|| LoweringError::UnsupportedSemanticConstruct {
         construct: "continue outside of loop".to_string(),
     })?;
@@ -7262,7 +7276,7 @@ mod tests {
                 start: int_expr(0, SemanticType::I64),
                 end: int_expr(10, SemanticType::I64),
                 inclusive: false,
-                body: vec![SemanticStmt::Break { pos: 0 }],
+                body: vec![SemanticStmt::Break { label: None, pos: 0 }],
                 pos: 0,
             }],
             enums: vec![],
@@ -7279,7 +7293,7 @@ mod tests {
                 start: int_expr(0, SemanticType::I64),
                 end: int_expr(10, SemanticType::I64),
                 inclusive: false,
-                body: vec![SemanticStmt::Continue { pos: 0 }],
+                body: vec![SemanticStmt::Continue { label: None, pos: 0 }],
                 pos: 0,
             }],
             enums: vec![],
