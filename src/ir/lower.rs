@@ -339,10 +339,30 @@ struct ActiveBlock {
 
 #[derive(Clone, Debug)]
 struct LoopContext {
+    /// labeled-breaks (b): this loop's own label, or None. `break 'L`/`continue 'L`
+    /// walk the loop stack for the context whose label matches; unlabeled jumps
+    /// take the innermost (top of stack).
+    label: Option<String>,
     header_id: BlockId,
     exit_id: BlockId,
     ordered_bindings: Vec<BindingId>,
     exit_ordered_bindings: Vec<BindingId>,
+}
+
+/// labeled-breaks (b): resolve which enclosing loop a break/continue targets in
+/// the loop-context stack (innermost last). Unlabeled jumps take the innermost
+/// loop (top of stack); a labeled jump walks outward to the nearest enclosing loop
+/// whose label matches. The semantic layer guarantees a labeled jump always has a
+/// matching enclosing loop, so `None` for a labeled jump can't arise from a valid
+/// program; `None` for an unlabeled jump means "break/continue outside any loop".
+fn find_target_loop<'a>(stack: &'a [LoopContext], label: &Option<String>) -> Option<&'a LoopContext> {
+    match label {
+        None => stack.last(),
+        Some(target) => stack
+            .iter()
+            .rev()
+            .find(|c| c.label.as_deref() == Some(target.as_str())),
+    }
 }
 
 struct FunctionLoweringSpec {
@@ -567,7 +587,7 @@ fn lower_top_level_main(stmts: &[&SemanticStmt], signature_table: &HashMap<Strin
         &mut ctx,
         Some(entry),
         &spec,
-        None,
+        &[],
     )?;
     if let Some(active) = current {
         finalize_active_block(&mut ctx, active, IrTerminator::Return { value: None })?;
@@ -650,7 +670,7 @@ fn lower_semantic_function(
         &mut ctx,
         Some(entry),
         &spec,
-        None,
+        &[],
     )?;
 
     if current.is_none() {
@@ -707,7 +727,7 @@ fn lower_stmt_sequence<'a, I>(
     ctx: &mut LoweringCtx,
     mut current: Option<ActiveBlock>,
     spec: &FunctionLoweringSpec,
-    loop_ctx: Option<&LoopContext>,
+    loop_ctx: &[LoopContext],
 ) -> Result<Option<ActiveBlock>, LoweringError>
 where
     I: IntoIterator<Item = &'a SemanticStmt>,
@@ -729,7 +749,7 @@ fn lower_stmt(
     ctx: &mut LoweringCtx,
     mut current: ActiveBlock,
     spec: &FunctionLoweringSpec,
-    loop_ctx: Option<&LoopContext>,
+    loop_ctx: &[LoopContext],
 ) -> Result<Option<ActiveBlock>, LoweringError> {
     match stmt {
         SemanticStmt::Noop => Ok(Some(current)),
@@ -1080,34 +1100,30 @@ fn lower_stmt(
         SemanticStmt::EnumDef { .. } => Ok(Some(current)),
 SemanticStmt::Block { .. } => { unsupported!("Block") },
         SemanticStmt::WhileIn { .. } => { unsupported!("WhileIn") },
-        SemanticStmt::While { cond, body, .. } => {
-    return match lower_while(cond, body, ctx, current, spec, loop_ctx)? {
+        SemanticStmt::While { label, cond, body, .. } => {
+    return match lower_while(label, cond, body, ctx, current, spec, loop_ctx)? {
         Some(new_active) => Ok(Some(new_active)),
         None => Ok(None),
     };
 },
-        SemanticStmt::For { binding, start, end, inclusive, body, .. } => {
-    return match lower_for(*binding, start, end, *inclusive, body, ctx, current, spec, loop_ctx)? {
+        SemanticStmt::For { label, binding, start, end, inclusive, body, .. } => {
+    return match lower_for(label, *binding, start, end, *inclusive, body, ctx, current, spec, loop_ctx)? {
         Some(new_active) => Ok(Some(new_active)),
         None => Ok(None),
     };
 },
-        SemanticStmt::Loop { body, .. } => {
-    return match lower_loop(body, ctx, current, spec, loop_ctx)? {
+        SemanticStmt::Loop { label, body, .. } => {
+    return match lower_loop(label, body, ctx, current, spec, loop_ctx)? {
         Some(new_active) => Ok(Some(new_active)),
         None => Ok(None),
     };
 },
         SemanticStmt::Break { label, .. } => {
-    // labeled-breaks (a): a labeled break parsed + passed semantic validation, but
-    // execution lands in commit (b). SKIP it (unsupported) so the JIT never
-    // mis-targets the innermost loop's exit. Unlabeled break is unchanged below.
-    if label.is_some() {
-        return Err(LoweringError::UnsupportedSemanticConstruct {
-            construct: "labeled break (execution wired in labeled-breaks b)".to_string(),
-        });
-    }
-    let ctx_ref = loop_ctx.ok_or_else(|| LoweringError::UnsupportedSemanticConstruct {
+    // labeled-breaks (b): a labeled break walks the loop stack to the named loop's
+    // exit; an unlabeled break takes the innermost (top of stack). Both Jump to
+    // that context's exit block, gathering ITS exit bindings from the live SSA
+    // environment (the target loop's bindings are a subset of what's live here).
+    let ctx_ref = find_target_loop(loop_ctx, label).ok_or_else(|| LoweringError::UnsupportedSemanticConstruct {
         construct: "break outside of loop".to_string(),
     })?;
     let mut exit_args = Vec::new();
@@ -1127,13 +1143,9 @@ SemanticStmt::Block { .. } => { unsupported!("Block") },
     return Ok(None);
 },
         SemanticStmt::Continue { label, .. } => {
-    // labeled-breaks (a): labeled continue SKIPs until execution lands in (b).
-    if label.is_some() {
-        return Err(LoweringError::UnsupportedSemanticConstruct {
-            construct: "labeled continue (execution wired in labeled-breaks b)".to_string(),
-        });
-    }
-    let ctx_ref = loop_ctx.ok_or_else(|| LoweringError::UnsupportedSemanticConstruct {
+    // labeled-breaks (b): a labeled continue walks the loop stack to the named
+    // loop's header; an unlabeled continue takes the innermost.
+    let ctx_ref = find_target_loop(loop_ctx, label).ok_or_else(|| LoweringError::UnsupportedSemanticConstruct {
         construct: "continue outside of loop".to_string(),
     })?;
     let mut header_args = Vec::new();
@@ -1192,7 +1204,7 @@ fn lower_if_else(
     ctx: &mut LoweringCtx,
     current: ActiveBlock,
     spec: &FunctionLoweringSpec,
-    loop_ctx: Option<&LoopContext>,
+    loop_ctx: &[LoopContext],
 ) -> Result<Option<ActiveBlock>, LoweringError> {
     let incoming = current.bindings.clone();
     let fallthroughs = lower_if_chain(
@@ -1223,7 +1235,7 @@ fn lower_if_chain(
     mut decision_block: ActiveBlock,
     incoming: &BindingMap,
     spec: &FunctionLoweringSpec,
-    loop_ctx: Option<&LoopContext>,
+    loop_ctx: &[LoopContext],
 ) -> Result<Vec<ActiveBlock>, LoweringError> {
     let cond = lower_expr(condition, ctx, &mut decision_block)?;
     // D2.x-A1: an unknown (TBool) condition traps (cx_trap) — the interpreter's
@@ -1391,12 +1403,13 @@ fn merge_fallthroughs(
 }
 
 fn lower_while(
+    label: &Option<String>,
     cond: &SemanticExpr,
     body: &[SemanticStmt],
     ctx: &mut LoweringCtx,
     current: ActiveBlock,
     spec: &FunctionLoweringSpec,
-    _outer_loop_ctx: Option<&LoopContext>,
+    outer_loop_ctx: &[LoopContext],
 ) -> Result<Option<ActiveBlock>, LoweringError> {
     let incoming = current.bindings.clone();
 
@@ -1476,17 +1489,20 @@ fn lower_while(
     ctx.seal_block(header)?;
 
     let loop_context = LoopContext {
+        label: label.clone(),
         header_id,
         exit_id,
         ordered_bindings: ordered_bindings.clone(),
         exit_ordered_bindings: ordered_bindings.clone(),
     };
+    let mut loop_stack = outer_loop_ctx.to_vec();
+    loop_stack.push(loop_context);
     let body_result = lower_stmt_sequence(
         body.iter(),
         ctx,
         Some(body_block),
         spec,
-        Some(&loop_context),
+        &loop_stack,
     )?;
 
     if let Some(mut body_active) = body_result {
@@ -1506,11 +1522,12 @@ fn lower_while(
 }
 
 fn lower_loop(
+    label: &Option<String>,
     body: &[SemanticStmt],
     ctx: &mut LoweringCtx,
     current: ActiveBlock,
     spec: &FunctionLoweringSpec,
-    _outer_loop_ctx: Option<&LoopContext>,
+    outer_loop_ctx: &[LoopContext],
 ) -> Result<Option<ActiveBlock>, LoweringError> {
     let incoming = current.bindings.clone();
 
@@ -1581,18 +1598,21 @@ fn lower_loop(
     ctx.seal_block(header_mut)?;
 
     let loop_context = LoopContext {
+        label: label.clone(),
         header_id,
         exit_id,
         ordered_bindings: ordered_bindings.clone(),
         exit_ordered_bindings: ordered_bindings.clone(),
     };
+    let mut loop_stack = outer_loop_ctx.to_vec();
+    loop_stack.push(loop_context);
 
     let body_result = lower_stmt_sequence(
         body.iter(),
         ctx,
         Some(body_block),
         spec,
-        Some(&loop_context),
+        &loop_stack,
     )?;
 
     if let Some(mut body_active) = body_result {
@@ -1612,6 +1632,7 @@ fn lower_loop(
 }
 
 fn lower_for(
+    label: &Option<String>,
     binding: BindingId,
     start: &SemanticExpr,
     end: &SemanticExpr,
@@ -1620,7 +1641,7 @@ fn lower_for(
     ctx: &mut LoweringCtx,
     current: ActiveBlock,
     spec: &FunctionLoweringSpec,
-    _outer_loop_ctx: Option<&LoopContext>,
+    outer_loop_ctx: &[LoopContext],
 ) -> Result<Option<ActiveBlock>, LoweringError> {
     let mut current = current;
 
@@ -1734,6 +1755,7 @@ fn lower_for(
     // We use inc_id as header_id in the LoopContext so continue goes to increment block.
     // Body's natural fallthrough also goes to inc_block.
     let loop_context = LoopContext {
+        label: label.clone(),
         header_id: inc_id,
         exit_id,
         ordered_bindings: {
@@ -1746,13 +1768,15 @@ fn lower_for(
         },
         exit_ordered_bindings: ordered_bindings.clone(),
     };
+    let mut loop_stack = outer_loop_ctx.to_vec();
+    loop_stack.push(loop_context);
 
     let body_result = lower_stmt_sequence(
         body.iter(),
         ctx,
         Some(body_block),
         spec,
-        Some(&loop_context),
+        &loop_stack,
     )?;
 
     if let Some(mut body_active) = body_result {
@@ -3114,7 +3138,7 @@ fn lower_when_stmt(
     ctx: &mut LoweringCtx,
     mut current: ActiveBlock,
     spec: &FunctionLoweringSpec,
-    loop_ctx: Option<&LoopContext>,
+    loop_ctx: &[LoopContext],
 ) -> Result<Option<ActiveBlock>, LoweringError> {
     let incoming = current.bindings.clone();
     let scrutinee_val = lower_expr(scrutinee, ctx, &mut current)?;
@@ -3496,7 +3520,7 @@ fn lower_branch_value(
             return_ty: None,
             allow_return_stmt: false,
         };
-        let result = lower_stmt(stmt, ctx, body_active, &inline_spec, None)?;
+        let result = lower_stmt(stmt, ctx, body_active, &inline_spec, &[])?;
         body_active = match result {
             Some(active) => active,
             None => return Ok(()), // diverged — no merge edge
@@ -6514,6 +6538,7 @@ mod tests {
     fn rejects_unsupported_statement() {
         let program = SemanticProgram {
             stmts: vec![SemanticStmt::WhileIn {
+                label: None,
                 arr: "arr".to_string(),
                 start_slot: 0,
                 range_start: int_expr(0, SemanticType::I64),
@@ -6543,6 +6568,7 @@ mod tests {
                 vec![],
                 None,
                 vec![SemanticStmt::WhileIn {
+                    label: None,
                     arr: "arr".to_string(),
                     start_slot: 0,
                     range_start: int_expr(0, SemanticType::I64),
@@ -7113,6 +7139,7 @@ mod tests {
             stmts: vec![if_stmt(
                 bool_expr(true),
                 vec![SemanticStmt::WhileIn {
+                    label: None,
                     arr: "arr".to_string(),
                     start_slot: 0,
                     range_start: int_expr(0, SemanticType::I64),
@@ -7149,6 +7176,7 @@ mod tests {
                     pos_type: 0,
                 },
                 SemanticStmt::While {
+                    label: None,
                     cond: bool_expr(true),
                     body: vec![],
                     pos: 0,
@@ -7182,6 +7210,7 @@ mod tests {
                 vec![],
                 Some(SemanticType::I64),
                 vec![SemanticStmt::While {
+                    label: None,
                     cond: bool_expr(true),
                     body: vec![],
                     pos: 0,
@@ -7208,6 +7237,7 @@ mod tests {
                     pos_type: 0,
                 },
                 SemanticStmt::While {
+                    label: None,
                     cond: bool_expr(true),
                     body: vec![SemanticStmt::Assign {
                         target: SemanticLValue::Binding {
@@ -7235,6 +7265,7 @@ mod tests {
     fn lowers_simple_for_loop() {
         let program = SemanticProgram {
             stmts: vec![SemanticStmt::For {
+                label: None,
                 binding: BindingId(0),
                 var: "i".to_string(),
                 start: int_expr(0, SemanticType::I64),
@@ -7254,6 +7285,7 @@ mod tests {
     fn lowers_inclusive_for_loop() {
         let program = SemanticProgram {
             stmts: vec![SemanticStmt::For {
+                label: None,
                 binding: BindingId(0),
                 var: "i".to_string(),
                 start: int_expr(1, SemanticType::I64),
@@ -7271,6 +7303,7 @@ mod tests {
     fn lowers_for_with_break() {
         let program = SemanticProgram {
             stmts: vec![SemanticStmt::For {
+                label: None,
                 binding: BindingId(0),
                 var: "i".to_string(),
                 start: int_expr(0, SemanticType::I64),
@@ -7288,6 +7321,7 @@ mod tests {
     fn lowers_for_with_continue() {
         let program = SemanticProgram {
             stmts: vec![SemanticStmt::For {
+                label: None,
                 binding: BindingId(0),
                 var: "i".to_string(),
                 start: int_expr(0, SemanticType::I64),
@@ -7309,6 +7343,7 @@ mod tests {
                 vec![],
                 Some(SemanticType::I64),
                 vec![SemanticStmt::While {
+                    label: None,
                     cond: bool_expr(true),
                     body: vec![if_stmt(
                         bool_expr(true),

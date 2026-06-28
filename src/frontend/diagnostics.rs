@@ -228,8 +228,8 @@ pub(crate) fn runtime_error_message(err: &RuntimeError) -> (String, usize) {
             },
             *pos,
         ),
-        RuntimeError::BreakSignal =>("unhandled 'break' outside of a loop -- this may be a compiler bug".to_string(), 0),
-        RuntimeError::ContinueSignal => ("unhandled 'continue' outside of a loop -- this may be a compiler bug".to_string(), 0),
+        RuntimeError::BreakSignal(_) =>("unhandled 'break' outside of a loop -- this may be a compiler bug".to_string(), 0),
+        RuntimeError::ContinueSignal(_) => ("unhandled 'continue' outside of a loop -- this may be a compiler bug".to_string(), 0),
         RuntimeError::ReadOnlyLoopVar { pos, name } => (
             format!("loop variable '{}' is read-only", name),
             *pos,

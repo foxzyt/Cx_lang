@@ -3,6 +3,14 @@ use crate::frontend::{ast::*, types::*};
 use crate::frontend::semantic_types::*;
 use std::sync::Arc;
 
+/// labeled-breaks (b): does a break/continue signal carrying `sig` target a loop
+/// whose own label is `mine`? Yes when the signal is unlabeled (`None` → innermost
+/// loop, unchanged) or the labels match; otherwise the loop re-raises so the signal
+/// walks outward to the enclosing loop it names.
+fn signal_targets_loop(sig: &Option<String>, mine: &Option<String>) -> bool {
+    sig.is_none() || sig.as_deref() == mine.as_deref()
+}
+
 impl RunTime {
     pub fn run_semantic_stmt(&mut self, stmt: &SemanticStmt) -> Result<(), RuntimeError> {
         match stmt {
@@ -120,7 +128,7 @@ SemanticStmt::Decl { binding, name, ty, .. } => {
                 self.pop_scope();
                 Ok(())
             }
-            SemanticStmt::While { cond, body, .. } => {
+            SemanticStmt::While { label, cond, body, .. } => {
                 loop {
                     let cv = self.eval_semantic_expr(cond)?;
                     match cv {
@@ -133,8 +141,8 @@ SemanticStmt::Decl { binding, name, ty, .. } => {
                     for s in body {
                         match self.run_semantic_stmt(s) {
                             Ok(_) => {}
-                            Err(RuntimeError::BreakSignal) => { should_break = true; break; }
-                            Err(RuntimeError::ContinueSignal) => break,
+                            Err(RuntimeError::BreakSignal(lbl)) if signal_targets_loop(&lbl, label) => { should_break = true; break; }
+                            Err(RuntimeError::ContinueSignal(lbl)) if signal_targets_loop(&lbl, label) => break,
                             Err(e) => { self.pop_scope(); return Err(e); }
                         }
                     }
@@ -143,7 +151,7 @@ SemanticStmt::Decl { binding, name, ty, .. } => {
                 }
                 Ok(())
             }
-            SemanticStmt::For { binding, var, start, end, inclusive, body, .. } => {
+            SemanticStmt::For { label, binding, var, start, end, inclusive, body, .. } => {
                 let start_val = match self.eval_semantic_expr(start)? {
                     Value::Num(n) => n,
                     _ => return Err(RuntimeError::BadAssignTarget { pos: 0 }),
@@ -161,8 +169,8 @@ SemanticStmt::Decl { binding, name, ty, .. } => {
                             for s in body {
                                 match self.run_semantic_stmt(s) {
                                     Ok(_) => {}
-                                    Err(RuntimeError::BreakSignal) => { self.pop_scope(); break 'sem_for; }
-                                    Err(RuntimeError::ContinueSignal) => break,
+                                    Err(RuntimeError::BreakSignal(lbl)) if signal_targets_loop(&lbl, label) => { self.pop_scope(); break 'sem_for; }
+                                    Err(RuntimeError::ContinueSignal(lbl)) if signal_targets_loop(&lbl, label) => break,
                                     Err(e) => { self.pop_scope(); return Err(e); }
                                 }
                             }
@@ -176,8 +184,8 @@ SemanticStmt::Decl { binding, name, ty, .. } => {
                             for s in body {
                                 match self.run_semantic_stmt(s) {
                                     Ok(_) => {}
-                                    Err(RuntimeError::BreakSignal) => { self.pop_scope(); break 'sem_for; }
-                                    Err(RuntimeError::ContinueSignal) => break,
+                                    Err(RuntimeError::BreakSignal(lbl)) if signal_targets_loop(&lbl, label) => { self.pop_scope(); break 'sem_for; }
+                                    Err(RuntimeError::ContinueSignal(lbl)) if signal_targets_loop(&lbl, label) => break,
                                     Err(e) => { self.pop_scope(); return Err(e); }
                                 }
                             }
@@ -187,15 +195,15 @@ SemanticStmt::Decl { binding, name, ty, .. } => {
                 }
                 Ok(())
             }
-            SemanticStmt::Loop { body, .. } => {
+            SemanticStmt::Loop { label, body, .. } => {
                 loop {
                     self.push_scope();
                     let mut should_break = false;
                     for s in body {
                         match self.run_semantic_stmt(s) {
                             Ok(_) => {}
-                            Err(RuntimeError::BreakSignal) => { should_break = true; break; }
-                            Err(RuntimeError::ContinueSignal) => break,
+                            Err(RuntimeError::BreakSignal(lbl)) if signal_targets_loop(&lbl, label) => { should_break = true; break; }
+                            Err(RuntimeError::ContinueSignal(lbl)) if signal_targets_loop(&lbl, label) => break,
                             Err(e) => { self.pop_scope(); return Err(e); }
                         }
                     }
@@ -204,25 +212,12 @@ SemanticStmt::Decl { binding, name, ty, .. } => {
                 }
                 Ok(())
             }
-            // labeled-breaks (a): unlabeled break/continue are unchanged. A
-            // *labeled* jump parsed and passed semantic validation, but execution
-            // is wired in commit (b); raise a clean uncaught error (the loops below
-            // only catch the plain Break/ContinueSignal) rather than mis-breaking
-            // the innermost loop. Replaced by label-aware signals in (b).
-            SemanticStmt::Break { label, pos } => match label {
-                Some(name) => Err(RuntimeError::AssertionFailed {
-                    msg: format!("labeled break '{name} cannot execute yet — labeled-break execution lands in commit (b)"),
-                    pos: *pos,
-                }),
-                None => Err(RuntimeError::BreakSignal),
-            },
-            SemanticStmt::Continue { label, pos } => match label {
-                Some(name) => Err(RuntimeError::AssertionFailed {
-                    msg: format!("labeled continue '{name} cannot execute yet — labeled-break execution lands in commit (b)"),
-                    pos: *pos,
-                }),
-                None => Err(RuntimeError::ContinueSignal),
-            },
+            // labeled-breaks (b): raise the break/continue signal carrying its
+            // target label (None for unlabeled). Each enclosing loop catches it
+            // when the label is None or matches the loop's own label, else re-raises
+            // (the signal walks outward to the loop it names).
+            SemanticStmt::Break { label, .. } => Err(RuntimeError::BreakSignal(label.clone())),
+            SemanticStmt::Continue { label, .. } => Err(RuntimeError::ContinueSignal(label.clone())),
             SemanticStmt::FuncDef(sem_func) => {
                 self.semantic_funcs.insert(sem_func.name.clone(), Arc::new(sem_func.clone()));
                 Ok(())
@@ -350,7 +345,7 @@ SemanticStmt::Decl { binding, name, ty, .. } => {
 
                 Ok(())
             }
-            SemanticStmt::WhileIn { arr, start_slot, range_start, range_end, inclusive, body, then_chains, result, .. } => {
+            SemanticStmt::WhileIn { label, arr, start_slot, range_start, range_end, inclusive, body, then_chains, result, .. } => {
                 let start_val = match self.eval_semantic_expr(range_start)? {
                     Value::Num(n) => n,
                     _ => return Err(RuntimeError::BadAssignTarget { pos: 0 }),
@@ -383,8 +378,8 @@ SemanticStmt::Decl { binding, name, ty, .. } => {
                             for stmt in body {
                                 match self.run_semantic_stmt(stmt) {
                                     Ok(_) => {}
-                                    Err(RuntimeError::BreakSignal) => { should_break = true; break; }
-                                    Err(RuntimeError::ContinueSignal) => break,
+                                    Err(RuntimeError::BreakSignal(lbl)) if signal_targets_loop(&lbl, label) => { should_break = true; break; }
+                                    Err(RuntimeError::ContinueSignal(lbl)) if signal_targets_loop(&lbl, label) => break,
                                     Err(e) => { self.pop_scope(); return Err(e); }
                                 }
                             }
@@ -412,8 +407,8 @@ SemanticStmt::Decl { binding, name, ty, .. } => {
                             for stmt in body {
                                 match self.run_semantic_stmt(stmt) {
                                     Ok(_) => {}
-                                    Err(RuntimeError::BreakSignal) => { should_break = true; break; }
-                                    Err(RuntimeError::ContinueSignal) => break,
+                                    Err(RuntimeError::BreakSignal(lbl)) if signal_targets_loop(&lbl, label) => { should_break = true; break; }
+                                    Err(RuntimeError::ContinueSignal(lbl)) if signal_targets_loop(&lbl, label) => break,
                                     Err(e) => { self.pop_scope(); return Err(e); }
                                 }
                             }
@@ -454,8 +449,8 @@ SemanticStmt::Decl { binding, name, ty, .. } => {
                             for stmt in &chain.body {
                                 match self.run_semantic_stmt(stmt) {
                                     Ok(_) => {}
-                                    Err(RuntimeError::BreakSignal) => { should_break = true; break; }
-                                    Err(RuntimeError::ContinueSignal) => break,
+                                    Err(RuntimeError::BreakSignal(lbl)) if signal_targets_loop(&lbl, label) => { should_break = true; break; }
+                                    Err(RuntimeError::ContinueSignal(lbl)) if signal_targets_loop(&lbl, label) => break,
                                     Err(e) => { self.pop_scope(); return Err(e); }
                                 }
                             }
@@ -483,8 +478,8 @@ SemanticStmt::Decl { binding, name, ty, .. } => {
                             for stmt in &chain.body {
                                 match self.run_semantic_stmt(stmt) {
                                     Ok(_) => {}
-                                    Err(RuntimeError::BreakSignal) => { should_break = true; break; }
-                                    Err(RuntimeError::ContinueSignal) => break,
+                                    Err(RuntimeError::BreakSignal(lbl)) if signal_targets_loop(&lbl, label) => { should_break = true; break; }
+                                    Err(RuntimeError::ContinueSignal(lbl)) if signal_targets_loop(&lbl, label) => break,
                                     Err(e) => { self.pop_scope(); return Err(e); }
                                 }
                             }

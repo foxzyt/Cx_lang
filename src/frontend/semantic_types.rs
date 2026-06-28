@@ -353,11 +353,15 @@ ExprStmt {
         pos: usize,
     },
     While {
+        // labeled-breaks (b): this loop's own label, or None. Read by both backends
+        // to match a labeled break/continue against the loop it targets.
+        label: Option<String>,
         cond: SemanticExpr,
         body: Vec<SemanticStmt>,
         pos: usize,
     },
     For {
+        label: Option<String>,
         binding: BindingId,
         var: String,
         start: SemanticExpr,
@@ -367,6 +371,7 @@ ExprStmt {
         pos: usize,
     },
     Loop {
+        label: Option<String>,
         body: Vec<SemanticStmt>,
         pos: usize,
     },
@@ -388,6 +393,7 @@ ExprStmt {
         pos: usize,
     },
     WhileIn {
+        label: Option<String>,
         arr: String,
         start_slot: usize,
         range_start: SemanticExpr,

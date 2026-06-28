@@ -813,6 +813,7 @@ Stmt::ExprStmt { expr, _pos } => Ok(SemanticStmt::ExprStmt {
                     None => None,
                 };
                 Ok(SemanticStmt::WhileIn {
+                    label: label.clone(),
                     arr: arr.clone(),
                     start_slot: *start_slot,
                     range_start: sem_start,
@@ -836,6 +837,7 @@ Stmt::ExprStmt { expr, _pos } => Ok(SemanticStmt::ExprStmt {
                     .collect::<Result<Vec<_>, _>>();
                 self.exit_loop_label(pushed);
                 Ok(SemanticStmt::While {
+                    label: label.clone(),
                     cond: semantic_cond,
                     body: semantic_body?,
                     pos: *pos,
@@ -853,7 +855,13 @@ Stmt::ExprStmt { expr, _pos } => Ok(SemanticStmt::ExprStmt {
                 let pushed = self.enter_loop_label(label, *pos)?;
                 let result = self.analyze_for(var, start, end, *inclusive, body, *pos);
                 self.exit_loop_label(pushed);
-                result
+                // labeled-breaks (b): stamp the loop's label onto the For node.
+                match result? {
+                    SemanticStmt::For { binding, var, start, end, inclusive, body, pos, .. } => {
+                        Ok(SemanticStmt::For { label: label.clone(), binding, var, start, end, inclusive, body, pos })
+                    }
+                    other => Ok(other),
+                }
             }
             Stmt::Loop { label, body, pos } => {
                 let pushed = self.enter_loop_label(label, *pos)?;
@@ -863,6 +871,7 @@ Stmt::ExprStmt { expr, _pos } => Ok(SemanticStmt::ExprStmt {
                     .collect::<Result<Vec<_>, _>>();
                 self.exit_loop_label(pushed);
                 Ok(SemanticStmt::Loop {
+                    label: label.clone(),
                     body: semantic_body?,
                     pos: *pos,
                 })
@@ -1181,6 +1190,9 @@ Stmt::ExprStmt { expr, _pos } => Ok(SemanticStmt::ExprStmt {
         self.pop_scope();
 
         Ok(SemanticStmt::For {
+            // labeled-breaks (b): the For arm injects the real label after this
+            // returns (keeps analyze_for's arg count under the clippy threshold).
+            label: None,
             binding,
             var: var.to_string(),
             start: self.analyze_expr(start)?,

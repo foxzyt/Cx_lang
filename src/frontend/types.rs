@@ -121,8 +121,12 @@ pub enum RuntimeError {
         index: i64,
         length: usize,
     },
-    BreakSignal,
-    ContinueSignal,
+    // labeled-breaks (b): a break/continue carries its optional target label. A
+    // loop catches the signal when the label is None (unlabeled → innermost) or
+    // equals its own label; otherwise it re-raises, walking the signal out to the
+    // enclosing loop that matches.
+    BreakSignal(Option<String>),
+    ContinueSignal(Option<String>),
     #[allow(dead_code)] // frontend-level variant; IR layer currently enforces via IrValidationError::LoopVariableReassignment
     ReadOnlyLoopVar {
         pos: usize,
