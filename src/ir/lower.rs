@@ -323,6 +323,11 @@ struct LoweringCtx {
     struct_table: HashMap<String, StructLayoutInfo>,
     trace: bool,
     target: TargetConfig,
+    /// D2.3d flat name→binding map for print-time string interpolation: every
+    /// `Decl`/`TypedAssign`/`For`/`ConstDecl` name in the current function (+ its
+    /// params), last-wins. See `lower_interpolated_print` for the FILED
+    /// scope-limitation note.
+    binding_names: HashMap<String, BindingId>,
 }
 
 struct ActiveBlock {
@@ -334,10 +339,30 @@ struct ActiveBlock {
 
 #[derive(Clone, Debug)]
 struct LoopContext {
+    /// labeled-breaks (b): this loop's own label, or None. `break 'L`/`continue 'L`
+    /// walk the loop stack for the context whose label matches; unlabeled jumps
+    /// take the innermost (top of stack).
+    label: Option<String>,
     header_id: BlockId,
     exit_id: BlockId,
     ordered_bindings: Vec<BindingId>,
     exit_ordered_bindings: Vec<BindingId>,
+}
+
+/// labeled-breaks (b): resolve which enclosing loop a break/continue targets in
+/// the loop-context stack (innermost last). Unlabeled jumps take the innermost
+/// loop (top of stack); a labeled jump walks outward to the nearest enclosing loop
+/// whose label matches. The semantic layer guarantees a labeled jump always has a
+/// matching enclosing loop, so `None` for a labeled jump can't arise from a valid
+/// program; `None` for an unlabeled jump means "break/continue outside any loop".
+fn find_target_loop<'a>(stack: &'a [LoopContext], label: &Option<String>) -> Option<&'a LoopContext> {
+    match label {
+        None => stack.last(),
+        Some(target) => stack
+            .iter()
+            .rev()
+            .find(|c| c.label.as_deref() == Some(target.as_str())),
+    }
 }
 
 struct FunctionLoweringSpec {
@@ -360,6 +385,7 @@ impl LoweringCtx {
             struct_table,
             trace,
             target,
+            binding_names: HashMap::new(),
         }
     }
 
@@ -480,6 +506,9 @@ fn lower_program_inner(program: &SemanticProgram, trace: bool) -> Result<IrModul
             // executable semantics and produce no IR, so skip them here rather
             // than routing them into the synthetic-main statement sequence.
             SemanticStmt::StructDef { .. } => {}
+            // Enum definitions carry no runtime data — the tag is the variant_id
+            // in each enum value / pattern node (D2.2). No IR, like StructDef.
+            SemanticStmt::EnumDef { .. } => {}
             // Impl-block methods are emitted as IrFunctions under mangled names.
             // The captured `method_alias_params` carry the BindingIds the body's
             // VarRef/DotAccess nodes reference, so re-prepending them lets
@@ -548,13 +577,17 @@ fn lower_top_level_main(stmts: &[&SemanticStmt], signature_table: &HashMap<Strin
         allow_return_stmt: false,
     };
     let mut ctx = LoweringCtx::new(signature_table.clone(), struct_table.clone(), trace, target);
+    // D2.3d: flat name→binding map for print-time string interpolation.
+    for &stmt in stmts {
+        collect_binding_names_stmt(stmt, &mut ctx.binding_names);
+    }
     let entry = ctx.start_block(vec![], HashMap::new());
     let current = lower_stmt_sequence(
         stmts.iter().copied(),
         &mut ctx,
         Some(entry),
         &spec,
-        None,
+        &[],
     )?;
     if let Some(active) = current {
         finalize_active_block(&mut ctx, active, IrTerminator::Return { value: None })?;
@@ -619,6 +652,13 @@ fn lower_semantic_function(
         }
     }
 
+    // D2.3d: flat name→binding map (function body + params) for interpolation.
+    for stmt in &function.body {
+        collect_binding_names_stmt(stmt, &mut ctx.binding_names);
+    }
+    for param in &function.params {
+        ctx.binding_names.insert(param.name.clone(), param.binding);
+    }
     let spec = FunctionLoweringSpec {
         name: function.name.clone(),
         return_ty: return_ty.clone(),
@@ -630,7 +670,7 @@ fn lower_semantic_function(
         &mut ctx,
         Some(entry),
         &spec,
-        None,
+        &[],
     )?;
 
     if current.is_none() {
@@ -687,7 +727,7 @@ fn lower_stmt_sequence<'a, I>(
     ctx: &mut LoweringCtx,
     mut current: Option<ActiveBlock>,
     spec: &FunctionLoweringSpec,
-    loop_ctx: Option<&LoopContext>,
+    loop_ctx: &[LoopContext],
 ) -> Result<Option<ActiveBlock>, LoweringError>
 where
     I: IntoIterator<Item = &'a SemanticStmt>,
@@ -709,7 +749,7 @@ fn lower_stmt(
     ctx: &mut LoweringCtx,
     mut current: ActiveBlock,
     spec: &FunctionLoweringSpec,
-    loop_ctx: Option<&LoopContext>,
+    loop_ctx: &[LoopContext],
 ) -> Result<Option<ActiveBlock>, LoweringError> {
     match stmt {
         SemanticStmt::Noop => Ok(Some(current)),
@@ -769,18 +809,56 @@ fn lower_stmt(
         SemanticStmt::TypedAssign {
             binding, ty, expr, ..
         } => {
+            // D2.x-A1: a bool-typed `?` constructs the three-state-bool unknown
+            // wire value (TBool 2, #044), mirroring the interpreter's
+            // assignment-site coercion `(Type::Bool, Value::Unknown) => TBool(2)`
+            // (runtime/exec.rs). The discriminator is the *declared* target type
+            // — the `?` value itself is always SemanticType::Unknown — so the
+            // construct lives here, not at lower_value, which keeps rejecting
+            // numeric / untyped / expression-position `?` (R5: Path B stays SKIP).
+            // TBool is materialised as ConstInt(I8, 2) + Cast (the IR validator
+            // restricts ConstInt to non-TBool integer types), the same wire
+            // encoding the `unknown` when-arm match uses.
+            if matches!(&expr.kind, SemanticExprKind::Value(SemanticValue::Unknown))
+                && lower_type(ty)? == IrType::Bool
+            {
+                let byte = ctx.fresh_value();
+                current.emit(IrInst::ConstInt { dst: byte, ty: IrType::I8, value: 2 })?;
+                let unknown = ctx.fresh_value();
+                current.emit(IrInst::Cast {
+                    dst: unknown,
+                    from: IrType::I8,
+                    to: IrType::TBool,
+                    value: byte,
+                })?;
+                let dst = ctx.fresh_value();
+                current.emit(IrInst::SsaBind { dst, ty: IrType::TBool, src: unknown })?;
+                current
+                    .bindings
+                    .insert(*binding, LoweredValue { value: dst, ty: IrType::TBool });
+                return Ok(Some(current));
+            }
             let lowered = lower_expr(expr, ctx, &mut current)?;
             let target_ty = lower_type(ty)?;
-            ensure_type_match("typed assignment", target_ty.clone(), lowered.ty)?;
+            // D2.x-A2: a `bool` target may receive a three-state TBool value (a
+            // Kleene `&&`/`||`/`!` result, e.g. `z: bool = x && y`). Bind it as
+            // TBool — the same Bool/TBool relationship A1 gave VarRef and the
+            // when-scrutinee. Definite-Bool assignments are unaffected.
+            let bind_ty = if target_ty == IrType::Bool && lowered.ty == IrType::TBool {
+                IrType::TBool
+            } else {
+                ensure_type_match("typed assignment", target_ty.clone(), lowered.ty)?;
+                target_ty
+            };
             let dst = ctx.fresh_value();
             current.emit(IrInst::SsaBind {
                 dst,
-                ty: target_ty.clone(),
+                ty: bind_ty.clone(),
                 src: lowered.value,
             })?;
             current
                 .bindings
-                .insert(*binding, LoweredValue { value: dst, ty: target_ty });
+                .insert(*binding, LoweredValue { value: dst, ty: bind_ty });
             Ok(Some(current))
         }
         SemanticStmt::ExprStmt { expr, .. } => {
@@ -1017,29 +1095,35 @@ fn lower_stmt(
         SemanticStmt::FuncDef(_) => Err(LoweringError::UnsupportedSemanticConstruct {
             construct: "nested FuncDef".to_string(),
         }),
-        SemanticStmt::EnumDef { .. } => { unsupported!("EnumDef") },
+        // Enum definitions carry no runtime data (the tag is the variant_id in
+        // each value/pattern node, D2.2) — no IR, like StructDef below.
+        SemanticStmt::EnumDef { .. } => Ok(Some(current)),
 SemanticStmt::Block { .. } => { unsupported!("Block") },
         SemanticStmt::WhileIn { .. } => { unsupported!("WhileIn") },
-        SemanticStmt::While { cond, body, .. } => {
-    return match lower_while(cond, body, ctx, current, spec, loop_ctx)? {
+        SemanticStmt::While { label, cond, body, .. } => {
+    return match lower_while(label, cond, body, ctx, current, spec, loop_ctx)? {
         Some(new_active) => Ok(Some(new_active)),
         None => Ok(None),
     };
 },
-        SemanticStmt::For { binding, start, end, inclusive, body, .. } => {
-    return match lower_for(*binding, start, end, *inclusive, body, ctx, current, spec, loop_ctx)? {
+        SemanticStmt::For { label, binding, start, end, inclusive, body, .. } => {
+    return match lower_for(label, *binding, start, end, *inclusive, body, ctx, current, spec, loop_ctx)? {
         Some(new_active) => Ok(Some(new_active)),
         None => Ok(None),
     };
 },
-        SemanticStmt::Loop { body, .. } => {
-    return match lower_loop(body, ctx, current, spec, loop_ctx)? {
+        SemanticStmt::Loop { label, body, .. } => {
+    return match lower_loop(label, body, ctx, current, spec, loop_ctx)? {
         Some(new_active) => Ok(Some(new_active)),
         None => Ok(None),
     };
 },
-        SemanticStmt::Break { .. } => {
-    let ctx_ref = loop_ctx.ok_or_else(|| LoweringError::UnsupportedSemanticConstruct {
+        SemanticStmt::Break { label, .. } => {
+    // labeled-breaks (b): a labeled break walks the loop stack to the named loop's
+    // exit; an unlabeled break takes the innermost (top of stack). Both Jump to
+    // that context's exit block, gathering ITS exit bindings from the live SSA
+    // environment (the target loop's bindings are a subset of what's live here).
+    let ctx_ref = find_target_loop(loop_ctx, label).ok_or_else(|| LoweringError::UnsupportedSemanticConstruct {
         construct: "break outside of loop".to_string(),
     })?;
     let mut exit_args = Vec::new();
@@ -1058,8 +1142,10 @@ SemanticStmt::Block { .. } => { unsupported!("Block") },
     ctx.seal_block(current)?;
     return Ok(None);
 },
-        SemanticStmt::Continue { .. } => {
-    let ctx_ref = loop_ctx.ok_or_else(|| LoweringError::UnsupportedSemanticConstruct {
+        SemanticStmt::Continue { label, .. } => {
+    // labeled-breaks (b): a labeled continue walks the loop stack to the named
+    // loop's header; an unlabeled continue takes the innermost.
+    let ctx_ref = find_target_loop(loop_ctx, label).ok_or_else(|| LoweringError::UnsupportedSemanticConstruct {
         construct: "continue outside of loop".to_string(),
     })?;
     let mut header_args = Vec::new();
@@ -1118,7 +1204,7 @@ fn lower_if_else(
     ctx: &mut LoweringCtx,
     current: ActiveBlock,
     spec: &FunctionLoweringSpec,
-    loop_ctx: Option<&LoopContext>,
+    loop_ctx: &[LoopContext],
 ) -> Result<Option<ActiveBlock>, LoweringError> {
     let incoming = current.bindings.clone();
     let fallthroughs = lower_if_chain(
@@ -1149,9 +1235,13 @@ fn lower_if_chain(
     mut decision_block: ActiveBlock,
     incoming: &BindingMap,
     spec: &FunctionLoweringSpec,
-    loop_ctx: Option<&LoopContext>,
+    loop_ctx: &[LoopContext],
 ) -> Result<Vec<ActiveBlock>, LoweringError> {
     let cond = lower_expr(condition, ctx, &mut decision_block)?;
+    // D2.x-A1: an unknown (TBool) condition traps (cx_trap) — the interpreter's
+    // UnknownCondition (#026). No-op for a definite Bool; narrows a definite
+    // TBool to Bool so the ensure check below and the Branch see a Bool.
+    let cond = guard_unknown_condition(cond, ctx, &mut decision_block)?;
     ensure_type_match("if condition", IrType::Bool, cond.ty.clone())?;
 
     let then_active = ctx.start_block(vec![], incoming.clone());
@@ -1313,12 +1403,13 @@ fn merge_fallthroughs(
 }
 
 fn lower_while(
+    label: &Option<String>,
     cond: &SemanticExpr,
     body: &[SemanticStmt],
     ctx: &mut LoweringCtx,
     current: ActiveBlock,
     spec: &FunctionLoweringSpec,
-    _outer_loop_ctx: Option<&LoopContext>,
+    outer_loop_ctx: &[LoopContext],
 ) -> Result<Option<ActiveBlock>, LoweringError> {
     let incoming = current.bindings.clone();
 
@@ -1398,17 +1489,20 @@ fn lower_while(
     ctx.seal_block(header)?;
 
     let loop_context = LoopContext {
+        label: label.clone(),
         header_id,
         exit_id,
         ordered_bindings: ordered_bindings.clone(),
         exit_ordered_bindings: ordered_bindings.clone(),
     };
+    let mut loop_stack = outer_loop_ctx.to_vec();
+    loop_stack.push(loop_context);
     let body_result = lower_stmt_sequence(
         body.iter(),
         ctx,
         Some(body_block),
         spec,
-        Some(&loop_context),
+        &loop_stack,
     )?;
 
     if let Some(mut body_active) = body_result {
@@ -1428,11 +1522,12 @@ fn lower_while(
 }
 
 fn lower_loop(
+    label: &Option<String>,
     body: &[SemanticStmt],
     ctx: &mut LoweringCtx,
     current: ActiveBlock,
     spec: &FunctionLoweringSpec,
-    _outer_loop_ctx: Option<&LoopContext>,
+    outer_loop_ctx: &[LoopContext],
 ) -> Result<Option<ActiveBlock>, LoweringError> {
     let incoming = current.bindings.clone();
 
@@ -1503,18 +1598,21 @@ fn lower_loop(
     ctx.seal_block(header_mut)?;
 
     let loop_context = LoopContext {
+        label: label.clone(),
         header_id,
         exit_id,
         ordered_bindings: ordered_bindings.clone(),
         exit_ordered_bindings: ordered_bindings.clone(),
     };
+    let mut loop_stack = outer_loop_ctx.to_vec();
+    loop_stack.push(loop_context);
 
     let body_result = lower_stmt_sequence(
         body.iter(),
         ctx,
         Some(body_block),
         spec,
-        Some(&loop_context),
+        &loop_stack,
     )?;
 
     if let Some(mut body_active) = body_result {
@@ -1534,6 +1632,7 @@ fn lower_loop(
 }
 
 fn lower_for(
+    label: &Option<String>,
     binding: BindingId,
     start: &SemanticExpr,
     end: &SemanticExpr,
@@ -1542,7 +1641,7 @@ fn lower_for(
     ctx: &mut LoweringCtx,
     current: ActiveBlock,
     spec: &FunctionLoweringSpec,
-    _outer_loop_ctx: Option<&LoopContext>,
+    outer_loop_ctx: &[LoopContext],
 ) -> Result<Option<ActiveBlock>, LoweringError> {
     let mut current = current;
 
@@ -1656,6 +1755,7 @@ fn lower_for(
     // We use inc_id as header_id in the LoopContext so continue goes to increment block.
     // Body's natural fallthrough also goes to inc_block.
     let loop_context = LoopContext {
+        label: label.clone(),
         header_id: inc_id,
         exit_id,
         ordered_bindings: {
@@ -1668,13 +1768,15 @@ fn lower_for(
         },
         exit_ordered_bindings: ordered_bindings.clone(),
     };
+    let mut loop_stack = outer_loop_ctx.to_vec();
+    loop_stack.push(loop_context);
 
     let body_result = lower_stmt_sequence(
         body.iter(),
         ctx,
         Some(body_block),
         spec,
-        Some(&loop_context),
+        &loop_stack,
     )?;
 
     if let Some(mut body_active) = body_result {
@@ -1701,6 +1803,36 @@ fn finalize_active_block(
     ctx.seal_block(active)
 }
 
+/// Fold `len(x)` to its constant integer length when `x` has a compile-time-
+/// known length (tracker D2.3a) — no string representation needed. `len("…")`
+/// folds to the UTF-8 byte count (`str::len`, matching the interpreter's stored
+/// arena-slice length — bytes, not chars/graphemes; e.g. `len("é")` == 2, per
+/// runtime/call.rs #021). `len(<array>)` folds to the declared element count from
+/// the `Array(count, _)` type (the same count the bounds check and array layout
+/// read). `len` returns t64, so the folded constant is I64. Returns `None` when
+/// the length is not statically known (a dynamic string / strref), leaving the
+/// caller's `is_cx_builtin` path to SKIP it cleanly.
+fn try_fold_len(
+    args: &[SemanticCallArg],
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<Option<LoweredValue>, LoweringError> {
+    let arg = match args.first() {
+        Some(SemanticCallArg::Expr(e)) => e,
+        _ => return Ok(None),
+    };
+    let n: i128 = match &arg.kind {
+        SemanticExprKind::Value(SemanticValue::Str(s)) => s.len() as i128,
+        _ => match &arg.ty {
+            SemanticType::Array(count, _) => *count as i128,
+            _ => return Ok(None),
+        },
+    };
+    let dst = ctx.fresh_value();
+    active.emit(IrInst::ConstInt { dst, ty: IrType::I64, value: n })?;
+    Ok(Some(LoweredValue { value: dst, ty: IrType::I64 }))
+}
+
 fn lower_expr(
     expr: &SemanticExpr,
     ctx: &mut LoweringCtx,
@@ -1723,8 +1855,17 @@ fn lower_expr(
                 Ok(lowered)
             } else {
                 let ty = lower_type(&expr.ty)?;
-                ensure_type_match("var ref", ty, lowered.ty.clone())?;
-                Ok(lowered)
+                // D2.x-A1: a `bool`-typed reference may read a binding stored as
+                // TBool — a `bool = ?` unknown. Bool and TBool are the two- and
+                // three-state forms of the same semantic `bool`; accept the stored
+                // TBool so the when / if consumer sees the three-state value (it
+                // would otherwise mismatch and SKIP here, before the match/guard).
+                if ty == IrType::Bool && lowered.ty == IrType::TBool {
+                    Ok(lowered)
+                } else {
+                    ensure_type_match("var ref", ty, lowered.ty.clone())?;
+                    Ok(lowered)
+                }
             }
         }
         SemanticExprKind::Binary { lhs, op, rhs, .. } => {
@@ -1814,6 +1955,15 @@ fn lower_expr(
         //    the caller as a LoweredValue so it can flow into assignments,
         //    return statements, and sub-expressions.
         SemanticExprKind::Call { callee, function: _, args } => {
+            // D2.3a: fold `len()` on a compile-time-known operand to its constant
+            // integer length — no string representation needed. A `len` whose
+            // length is not statically known (a dynamic string, which doesn't
+            // lower anyway) returns None and falls through to the SKIP below.
+            if callee == "len" {
+                if let Some(folded) = try_fold_len(args, ctx, active)? {
+                    return Ok(folded);
+                }
+            }
             // Remaining unimplemented builtin intrinsics (read, input) are not in the
             // signature_table.  Intercept them before the lookup so the error is
             // structured and actionable rather than the generic UnresolvedSemanticArtifact
@@ -1948,6 +2098,12 @@ fn lower_expr(
             Ok(LoweredValue { value: dst, ty: lowered.ty })
         }
         Op::Not => {
+            // D2.x-A2: `!` on a three-state TBool negates per Kleene (!0=1, !1=0,
+            // !2=2) on the I8 wire (runtime/ops.rs:256). Definite Bool keeps the
+            // compare-against-zero path below.
+            if lowered.ty == IrType::TBool {
+                return emit_kleene_not(lowered.value, ctx, active);
+            }
             // Emit a Bool zero, then compare for equality:
             //   dst = (lowered == 0)
             // Because Bool is canonically 0/1, this flips the value.
@@ -2043,7 +2199,7 @@ fn lower_expr(
                 align: layout_info.layout.alignment,
             })?;
 
-            for (field_idx, (canonical_name, _field_ty)) in layout_info.fields.iter().enumerate() {
+            for (field_idx, (canonical_name, field_ir_ty)) in layout_info.fields.iter().enumerate() {
                 let field_offset = layout_info.layout.field_offsets[field_idx];
 
                 let field_expr = fields
@@ -2070,9 +2226,28 @@ fn lower_expr(
                     fp
                 };
 
+                // Narrow the field value to the field's width before storing
+                // (tracker Gate-2a — same root as lower_array_lit). A scalar
+                // sub-64-bit field receives an i64-typed value; without this the
+                // Store overruns the field slot. The cast is a no-op for fields
+                // whose value already matches the slot width (arrays/structs are
+                // Ptr-typed both sides; t64 scalars are i64 both sides).
+                let store_value = if lowered_field.ty != *field_ir_ty {
+                    let narrowed = ctx.fresh_value();
+                    active.emit(IrInst::Cast {
+                        dst: narrowed,
+                        from: lowered_field.ty.clone(),
+                        to: field_ir_ty.clone(),
+                        value: lowered_field.value,
+                    })?;
+                    narrowed
+                } else {
+                    lowered_field.value
+                };
+
                 active.emit(IrInst::Store {
                     ptr: field_ptr,
-                    value: lowered_field.value,
+                    value: store_value,
                 })?;
             }
 
@@ -2081,29 +2256,38 @@ fn lower_expr(
         SemanticExprKind::When { expr: scrutinee, arms, .. } => {
             lower_when_expr(scrutinee, arms, &expr.ty, ctx, active)
         },
-        // Tracker #046: `if`-expression lowering is not implemented yet — the JIT
-        // cleanly SKIPs these fixtures (the interpreter is the reference). When
-        // the backend lowers it, this stub is replaced; its `when`-expression
-        // lowering must replicate #046's else-required + #026 unknown-condition
-        // error, or the SKIP becomes a PARITY_FAIL (forward constraint).
-        SemanticExprKind::If { .. } => { unsupported!("If") },
-        SemanticExprKind::ResultOk { .. } => { unsupported!("ResultOk") },
-        SemanticExprKind::ResultErr { .. } => { unsupported!("ResultErr") },
-        SemanticExprKind::Try { .. } => { unsupported!("Try") },
+        // Tracker D2.1 (#046): if-expression lowering — a two-branch value-
+        // producing `when`. #046's else-required rule is enforced at semantic
+        // time (a missing else is rejected pre-lowering). As of D2.x-A1 a bool
+        // `?` lowers (TBool), so an unknown condition IS reachable here; it is
+        // trapped via `guard_unknown_condition` (cx_trap), reproducing #026's
+        // UnknownCondition. A definite condition lowers to a Bool as before.
+        SemanticExprKind::If { condition, then_body, else_body, .. } => {
+            lower_if_expr(condition, then_body, else_body, &expr.ty, ctx, active)
+        },
+        // D2.4a: `Ok(x)` = tag 0, `Err("...")` = tag 1 (packed-i128). The `?`
+        // operator (Try) is D2.4b — still SKIP.
+        SemanticExprKind::ResultOk { expr } => lower_result_construct(0, expr, ctx, active),
+        SemanticExprKind::ResultErr { expr } => lower_result_construct(1, expr, ctx, active),
+        // D2.4b: `expr?` unwraps the Ok payload (continuing) or early-returns the
+        // whole Err Result. `expr.ty` is the unwrapped Ok type T (semantic.rs sets
+        // it); `inner` is the Result<T> operand.
+        SemanticExprKind::Try { expr: inner, .. } => lower_try(inner, &expr.ty, ctx, active),
     }
 }
 
 /// Returns the inclusive `[min, max]` range of values that fit in `ty` as a
 /// signed integer, or `None` if `ty` is not an integer type.
 fn ir_int_range(ty: &IrType) -> Option<(i128, i128)> {
+    // Integer-width bounds come from the one facts table (tracker D1.1); Bool's
+    // `(0, 1)` is not a `tN` width fact and stays a local arm (int_facts scope note).
+    if let Some(width) = ty.int_width() {
+        let f = width.facts();
+        return Some((f.min, f.max));
+    }
     match ty {
-        IrType::I8   => Some((i8::MIN  as i128, i8::MAX  as i128)),
-        IrType::I16  => Some((i16::MIN as i128, i16::MAX as i128)),
-        IrType::I32  => Some((i32::MIN as i128, i32::MAX as i128)),
-        IrType::I64  => Some((i64::MIN as i128, i64::MAX as i128)),
-        IrType::I128 => Some((i128::MIN, i128::MAX)),
         IrType::Bool => Some((0, 1)),
-        _            => None,
+        _ => None,
     }
 }
 
@@ -2168,15 +2352,35 @@ fn lower_value(
         SemanticValue::Unknown => Err(LoweringError::UnsupportedSemanticType {
             ty: "Unknown".to_string(),
         }),
-        SemanticValue::Str(_) => Err(LoweringError::UnsupportedSemanticType {
-            ty: "Str".to_string(),
-        }),
+        // D2.3b: a static string literal lowers to a descriptor Ptr (shared with
+        // the D2.3c concat fold via `construct_static_str`).
+        SemanticValue::Str(s) => construct_static_str(s, ctx, active),
         SemanticValue::Char(_) => Err(LoweringError::UnsupportedSemanticType {
             ty: "Char".to_string(),
         }),
-        SemanticValue::EnumVariant { .. } => Err(LoweringError::UnsupportedSemanticType {
-            ty: "Enum".to_string(),
-        }),
+        // Construct a tag-only enum value as its tag constant (D2.2). The tag is
+        // the declaration-order `variant_id` carried in the semantic node — the
+        // same value the match arm compares against. `ty` is the enum's IR type
+        // (I8, from lower_type above).
+        SemanticValue::EnumVariant { enum_name, variant_name, variant_id, .. } => {
+            let tag = match variant_id {
+                Some(id) => id.0,
+                None => {
+                    return Err(LoweringError::UnsupportedSemanticConstruct {
+                        construct: format!(
+                            "enum variant '{}::{}' has no resolved tag (variant_id)",
+                            enum_name, variant_name
+                        ),
+                    })
+                }
+            };
+            active.emit(IrInst::ConstInt {
+                dst,
+                ty: ty.clone(),
+                value: tag as i128,
+            })?;
+            Ok(LoweredValue { value: dst, ty })
+        }
     }
 }
 
@@ -2194,6 +2398,96 @@ fn lower_value(
 //
 // Exception: Op::And and Op::Or use short-circuit evaluation and are
 // dispatched to lower_logical before any operand is evaluated.
+/// Build a static string VALUE (string rep (a), D2.3b): leak `s`'s bytes and a
+/// {byte_ptr, byte_len} descriptor to `&'static`, then materialize the descriptor
+/// address as a Ptr (ConstInt(I64) + the no-op Cast(I64->Ptr)). Shared by the
+/// literal construct (lower_value) and the D2.3c concat fold. Interpolation
+/// (`{…}`) defers to D2.3d — a brace-containing result stays SKIP.
+fn construct_static_str(
+    s: &str,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<LoweredValue, LoweringError> {
+    if s.contains('{') {
+        return Err(LoweringError::UnsupportedSemanticConstruct {
+            construct: "string interpolation '{...}' not yet lowered (tracker D2.3d)".to_string(),
+        });
+    }
+    // JIT-only / non-AOT (R6): the leaked address is process-specific and baked
+    // into the IR; the bytes outlive the program, so the descriptor never dangles.
+    let bytes: &'static [u8] = s.to_owned().into_bytes().leak();
+    let descriptor: &'static [i64] =
+        vec![bytes.as_ptr() as usize as i64, bytes.len() as i64].leak();
+    let desc_addr = descriptor.as_ptr() as usize as i128;
+    let addr = ctx.fresh_value();
+    active.emit(IrInst::ConstInt { dst: addr, ty: IrType::I64, value: desc_addr })?;
+    let ptr = ctx.fresh_value();
+    active.emit(IrInst::Cast { dst: ptr, from: IrType::I64, to: IrType::Ptr, value: addr })?;
+    Ok(LoweredValue { value: ptr, ty: IrType::Ptr })
+}
+
+/// Recursively evaluate a compile-time-known string: a `str` literal, or a
+/// left-associative chain of `+` over known strings. Returns `None` for any
+/// runtime operand (VarRef, call, …) — those stay SKIP (R6 / D2.3-DYN).
+fn try_const_str(expr: &SemanticExpr) -> Option<String> {
+    match &expr.kind {
+        SemanticExprKind::Value(SemanticValue::Str(s)) => Some(s.clone()),
+        SemanticExprKind::Binary { lhs, op: Op::Plus, rhs, .. }
+            if expr.ty == SemanticType::Str =>
+        {
+            Some(try_const_str(lhs)? + &try_const_str(rhs)?)
+        }
+        _ => None,
+    }
+}
+
+/// Lower `str + str` (D2.3c): constant-fold a literal concat to ONE new static
+/// descriptor (the same joined bytes the interpreter `alloc_str`s, different
+/// storage). A runtime operand stays SKIP (R6 / D2.3-DYN).
+fn lower_str_concat(
+    lhs: &SemanticExpr,
+    rhs: &SemanticExpr,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<LoweredValue, LoweringError> {
+    match (try_const_str(lhs), try_const_str(rhs)) {
+        (Some(l), Some(r)) => construct_static_str(&(l + &r), ctx, active),
+        _ => Err(LoweringError::UnsupportedSemanticConstruct {
+            construct: "runtime string concatenation not yet lowered (R6 / D2.3-DYN)".to_string(),
+        }),
+    }
+}
+
+/// Lower string content equality (D2.3c). Both operands are str descriptor Ptrs;
+/// `cx_str_eq` reads (ptr, len) from each and does a length-check + memcmp,
+/// returning a Bool. `!=` negates the result. The TBool refusal and scalar
+/// `Compare` are separate operand-type-dispatched branches in `lower_binary`.
+fn lower_str_eq(
+    op: Op,
+    lhs: ValueId,
+    rhs: ValueId,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<LoweredValue, LoweringError> {
+    let eq = ctx.fresh_value();
+    active.emit(IrInst::Call {
+        dst: Some(eq),
+        callee: "cx_str_eq".to_string(),
+        args: vec![lhs, rhs],
+        return_ty: Some(IrType::Bool),
+    })?;
+    if op == Op::NotEq {
+        // `!=` is `==` negated: (eq == 0).
+        let zero = ctx.fresh_value();
+        active.emit(IrInst::ConstInt { dst: zero, ty: IrType::Bool, value: 0 })?;
+        let ne = ctx.fresh_value();
+        active.emit(IrInst::Compare { dst: ne, op: CompareOp::Eq, lhs: eq, rhs: zero })?;
+        Ok(LoweredValue { value: ne, ty: IrType::Bool })
+    } else {
+        Ok(LoweredValue { value: eq, ty: IrType::Bool })
+    }
+}
+
 fn lower_binary(
     lhs: &SemanticExpr,
     op: Op,
@@ -2206,6 +2500,19 @@ fn lower_binary(
     if matches!(op, Op::And | Op::Or) {
         return lower_logical(lhs, op, rhs, result_ty, ctx, active);
     }
+
+    // D2.3c: `str + str` is concatenation, constant-folded to one static
+    // descriptor — handled before the operands lower (the fold needs their string
+    // content, not their descriptor Ptrs). A runtime operand stays SKIP (R6).
+    if op == Op::Plus && *result_ty == SemanticType::Str {
+        return lower_str_concat(lhs, rhs, ctx, active);
+    }
+    // D2.3c: string `==`/`!=` dispatches on operand type — captured here, before
+    // the operands lower to Ptr. str → content comparison (cx_str_eq); TBool → the
+    // existing refusal; scalar → Compare. (Computed before the shadowing below.)
+    let str_eq = matches!(op, Op::EqEq | Op::NotEq)
+        && (matches!(lhs.ty, SemanticType::Str | SemanticType::StrRef)
+            || matches!(rhs.ty, SemanticType::Str | SemanticType::StrRef));
 
     // Left operand lowered first — preserves left-to-right evaluation order.
     let lhs = lower_expr(lhs, ctx, active)?;
@@ -2227,6 +2534,26 @@ fn lower_binary(
             };
             ensure_type_match("binary lhs", ty.clone(), lhs.ty)?;
             ensure_type_match("binary rhs", ty.clone(), rhs.ty)?;
+            // Integer division and modulo route through the guard helper —
+            // divisor==0 traps cleanly (Gate-1b), and Div additionally guards
+            // INT_MIN/-1 overflow (Gate-1a). Float div/mod (no int width) and the
+            // other ops fall through unchanged, so their emitted IR is identical.
+            if matches!(op, Op::Div | Op::Mod) && ty.int_width().is_some() {
+                let binop = if matches!(op, Op::Div) {
+                    BinaryOp::Div
+                } else {
+                    BinaryOp::Rem
+                };
+                return emit_guarded_idiv(
+                    dst,
+                    ty.clone(),
+                    binop,
+                    lhs.value,
+                    rhs.value,
+                    ctx,
+                    active,
+                );
+            }
             let op = match op {
                 Op::Plus => BinaryOp::Add,
                 Op::Minus => BinaryOp::Sub,
@@ -2245,6 +2572,29 @@ fn lower_binary(
             Ok(LoweredValue { value: dst, ty })
         }
         Op::EqEq | Op::NotEq | Op::Lt | Op::LtEq | Op::Gt | Op::GtEq => {
+            // D2.x-A1 safety valve: `==` / `!=` on a three-state bool yields TBool
+            // (unknown) in the interpreter (runtime/ops.rs), which the IR Compare
+            // cannot produce (it yields a definite Bool — the dual-rep seam). The
+            // operand-match check below PASSES for TBool == TBool (both equal), so
+            // without this guard the comparison would silently miscompile. Refuse
+            // until Path B / the seam lowers three-valued equality.
+            if lhs.ty == IrType::TBool || rhs.ty == IrType::TBool {
+                unsupported!(
+                    "equality/comparison on three-state bool (TBool) — deferred to D2.x Path B"
+                );
+            }
+            // D2.3c: string content comparison — str `==`/`!=` operands route to
+            // cx_str_eq (length + memcmp), NOT a pointer Compare. str-ness was
+            // captured before the operands lowered to Ptr. The TBool refusal above
+            // and the scalar Compare below are untouched — purely additive
+            // operand-type dispatch.
+            if str_eq {
+                return lower_str_eq(op, lhs.value, rhs.value, ctx, active);
+            }
+            // Composite (non-str) Ptr comparison — structs/arrays — stays SKIP.
+            if lhs.ty == IrType::Ptr || rhs.ty == IrType::Ptr {
+                unsupported!("composite comparison not yet lowered");
+            }
             ensure_type_match("compare lhs/rhs", lhs.ty, rhs.ty)?;
             let result_ty = lower_type(result_ty)?;
             if result_ty != IrType::Bool {
@@ -2277,6 +2627,181 @@ fn lower_binary(
     }
 }
 
+/// Whether `expr` lowers to a three-state TBool value (vs a definite Bool),
+/// determined structurally WITHOUT emitting IR — so `lower_logical` can route a
+/// TBool operand to the Kleene path before committing to the definite-Bool
+/// short-circuit CFG (which lowers rhs eagerly into its own block and would
+/// reject a TBool there). TBool arises only from a `bool = ?` binding (read via
+/// VarRef) or a Kleene `&&`/`||`/`!` over a TBool operand, so those are the only
+/// shapes that propagate it.
+fn expr_lowers_to_tbool(expr: &SemanticExpr, active: &ActiveBlock) -> bool {
+    match &expr.kind {
+        SemanticExprKind::VarRef { binding, .. } => active
+            .bindings
+            .get(binding)
+            .is_some_and(|v| v.ty == IrType::TBool),
+        SemanticExprKind::Unary { op: Op::Not, expr: inner, .. } => {
+            expr_lowers_to_tbool(inner, active)
+        }
+        SemanticExprKind::Binary { lhs, op: Op::And | Op::Or, rhs, .. } => {
+            expr_lowers_to_tbool(lhs, active) || expr_lowers_to_tbool(rhs, active)
+        }
+        _ => false,
+    }
+}
+
+/// Emit the three-valued (Kleene) result of `a <op> b` on the I8 wire encoding
+/// (false=0, true=1, unknown=2), matching the interpreter's tables exactly
+/// (runtime/ops.rs:212/230). `op` is `And` or `Or`; `a`/`b` are operand wire
+/// values (TBool, or a Bool promoted as wire). Returns a TBool. No `Select` IR
+/// exists, so each result is selected by a small compare/branch/merge CFG.
+///
+/// AND: `0` if either operand is `0`; else `1` if both are `1`; else `2`.
+///   With `p = a*b` (operands ∈ {0,1,2}): `p==0` ⟺ a factor is `0`; `p==1` ⟺
+///   both are `1`. So `result = (p==0)?0 : (p==1)?1 : 2`.
+/// OR:  `1` if either operand is `1`; else `0` if both are `0` (`a+b==0`); else `2`.
+fn emit_kleene_and_or(
+    op: Op,
+    a: ValueId,
+    b: ValueId,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<LoweredValue, LoweringError> {
+    let incoming = active.bindings.clone();
+    let c0 = ctx.fresh_value();
+    active.emit(IrInst::ConstInt { dst: c0, ty: IrType::I8, value: 0 })?;
+    let c1 = ctx.fresh_value();
+    active.emit(IrInst::ConstInt { dst: c1, ty: IrType::I8, value: 1 })?;
+    let c2 = ctx.fresh_value();
+    active.emit(IrInst::ConstInt { dst: c2, ty: IrType::I8, value: 2 })?;
+
+    let result_param = ctx.fresh_value();
+    let merge = ctx.start_block(
+        vec![BlockParam { value: result_param, ty: IrType::I8, read_only: false }],
+        incoming.clone(),
+    );
+    let merge_id = merge.id();
+
+    match op {
+        Op::And => {
+            let p = ctx.fresh_value();
+            active.emit(IrInst::Binary { dst: p, op: BinaryOp::Mul, ty: IrType::I8, lhs: a, rhs: b })?;
+            let is_p0 = ctx.fresh_value();
+            active.emit(IrInst::Compare { dst: is_p0, op: CompareOp::Eq, lhs: p, rhs: c0 })?;
+            let mut check1 = ctx.start_block(vec![], incoming.clone());
+            let check1_id = check1.id();
+            // p==0 → 0; else fall to the p==1 check. Seal decision first (the
+            // sub-blocks read `p` / the consts defined here).
+            active.terminate(IrTerminator::Branch {
+                cond: is_p0,
+                then_block: merge_id, then_args: vec![c0],
+                else_block: check1_id, else_args: vec![],
+            })?;
+            let old = std::mem::replace(active, merge);
+            ctx.seal_block(old)?;
+            let is_p1 = ctx.fresh_value();
+            check1.emit(IrInst::Compare { dst: is_p1, op: CompareOp::Eq, lhs: p, rhs: c1 })?;
+            let mut leaf2 = ctx.start_block(vec![], incoming.clone());
+            let leaf2_id = leaf2.id();
+            check1.terminate(IrTerminator::Branch {
+                cond: is_p1,
+                then_block: merge_id, then_args: vec![c1],
+                else_block: leaf2_id, else_args: vec![],
+            })?;
+            ctx.seal_block(check1)?;
+            leaf2.terminate(IrTerminator::Jump { target: merge_id, args: vec![c2] })?;
+            ctx.seal_block(leaf2)?;
+        }
+        Op::Or => {
+            let is_a1 = ctx.fresh_value();
+            active.emit(IrInst::Compare { dst: is_a1, op: CompareOp::Eq, lhs: a, rhs: c1 })?;
+            let mut chk_b1 = ctx.start_block(vec![], incoming.clone());
+            let chk_b1_id = chk_b1.id();
+            active.terminate(IrTerminator::Branch {
+                cond: is_a1,
+                then_block: merge_id, then_args: vec![c1],
+                else_block: chk_b1_id, else_args: vec![],
+            })?;
+            let old = std::mem::replace(active, merge);
+            ctx.seal_block(old)?;
+            let is_b1 = ctx.fresh_value();
+            chk_b1.emit(IrInst::Compare { dst: is_b1, op: CompareOp::Eq, lhs: b, rhs: c1 })?;
+            let mut chk_both0 = ctx.start_block(vec![], incoming.clone());
+            let chk_both0_id = chk_both0.id();
+            chk_b1.terminate(IrTerminator::Branch {
+                cond: is_b1,
+                then_block: merge_id, then_args: vec![c1],
+                else_block: chk_both0_id, else_args: vec![],
+            })?;
+            ctx.seal_block(chk_b1)?;
+            let sum = ctx.fresh_value();
+            chk_both0.emit(IrInst::Binary { dst: sum, op: BinaryOp::Add, ty: IrType::I8, lhs: a, rhs: b })?;
+            let is_sum0 = ctx.fresh_value();
+            chk_both0.emit(IrInst::Compare { dst: is_sum0, op: CompareOp::Eq, lhs: sum, rhs: c0 })?;
+            let mut leaf2 = ctx.start_block(vec![], incoming.clone());
+            let leaf2_id = leaf2.id();
+            chk_both0.terminate(IrTerminator::Branch {
+                cond: is_sum0,
+                then_block: merge_id, then_args: vec![c0],
+                else_block: leaf2_id, else_args: vec![],
+            })?;
+            ctx.seal_block(chk_both0)?;
+            leaf2.terminate(IrTerminator::Jump { target: merge_id, args: vec![c2] })?;
+            ctx.seal_block(leaf2)?;
+        }
+        _ => unreachable!("emit_kleene_and_or only handles And/Or"),
+    }
+
+    // active is now the merge block; narrow the I8 wire result to TBool.
+    let res = ctx.fresh_value();
+    active.emit(IrInst::Cast { dst: res, from: IrType::I8, to: IrType::TBool, value: result_param })?;
+    Ok(LoweredValue { value: res, ty: IrType::TBool })
+}
+
+/// Emit the three-valued (Kleene) `!a` on the I8 wire encoding: `!0=1`, `!1=0`,
+/// `!2=2` (runtime/ops.rs:256). Unknown negates to unknown; a definite `0`/`1`
+/// flips via `1 - a`. Returns a TBool.
+fn emit_kleene_not(
+    a: ValueId,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<LoweredValue, LoweringError> {
+    let incoming = active.bindings.clone();
+    let c1 = ctx.fresh_value();
+    active.emit(IrInst::ConstInt { dst: c1, ty: IrType::I8, value: 1 })?;
+    let c2 = ctx.fresh_value();
+    active.emit(IrInst::ConstInt { dst: c2, ty: IrType::I8, value: 2 })?;
+    let is_a2 = ctx.fresh_value();
+    active.emit(IrInst::Compare { dst: is_a2, op: CompareOp::Eq, lhs: a, rhs: c2 })?;
+
+    let result_param = ctx.fresh_value();
+    let merge = ctx.start_block(
+        vec![BlockParam { value: result_param, ty: IrType::I8, read_only: false }],
+        incoming.clone(),
+    );
+    let merge_id = merge.id();
+    let mut not_def = ctx.start_block(vec![], incoming);
+    let not_def_id = not_def.id();
+
+    // unknown (2) negates to unknown; else flip via 1 - a (a is 0 or 1 here).
+    active.terminate(IrTerminator::Branch {
+        cond: is_a2,
+        then_block: merge_id, then_args: vec![c2],
+        else_block: not_def_id, else_args: vec![],
+    })?;
+    let old = std::mem::replace(active, merge);
+    ctx.seal_block(old)?;
+
+    let flipped = ctx.fresh_value();
+    not_def.emit(IrInst::Binary { dst: flipped, op: BinaryOp::Sub, ty: IrType::I8, lhs: c1, rhs: a })?;
+    not_def.terminate(IrTerminator::Jump { target: merge_id, args: vec![flipped] })?;
+    ctx.seal_block(not_def)?;
+
+    let res = ctx.fresh_value();
+    active.emit(IrInst::Cast { dst: res, from: IrType::I8, to: IrType::TBool, value: result_param })?;
+    Ok(LoweredValue { value: res, ty: IrType::TBool })
+}
+
 // Logical AND/OR short-circuit lowering
 //
 // `a && b` and `a || b` cannot be lowered as eager binary instructions
@@ -2307,6 +2832,19 @@ fn lower_logical(
 
     // Evaluate the left operand in the current (decision) block.
     let lhs_val = lower_expr(lhs, ctx, active)?;
+    // D2.x-A2: three-valued (Kleene) logic when EITHER operand is a three-state
+    // TBool. Compute eagerly on the I8 wire encoding, matching the interpreter's
+    // tables (runtime/ops.rs); both operands are treated as wire values, so a
+    // Bool operand (`? && false`, `false && ?`) works as 0/1. The rhs type is
+    // detected structurally (`expr_lowers_to_tbool`) WITHOUT lowering it, because
+    // the definite-Bool short-circuit path below lowers rhs eagerly into its own
+    // block and would reject a TBool there. Definite-Bool `&&`/`||` is untouched
+    // (neither operand is TBool → falls through). The `==`/`!=` TBool refusal
+    // stays in lower_binary — that's the seam's Path-B guard, not A2's.
+    if lhs_val.ty == IrType::TBool || expr_lowers_to_tbool(rhs, active) {
+        let rhs_val = lower_expr(rhs, ctx, active)?;
+        return emit_kleene_and_or(op, lhs_val.value, rhs_val.value, ctx, active);
+    }
     ensure_type_match("logical lhs", IrType::Bool, lhs_val.ty.clone())?;
 
     // Block that evaluates the right operand (reached when short-circuit does not fire).
@@ -2372,6 +2910,192 @@ fn lower_logical(
     Ok(LoweredValue { value: result_param, ty: IrType::Bool })
 }
 
+/// Emit guarded integer division (`op = Div`) or modulo (`op = Rem`) — the single
+/// source for "guard a division" (trackers Gate-1a + Gate-1b). Raw Cranelift
+/// `sdiv`/`srem` trap in hardware on two inputs; this branches around both so the
+/// JIT matches the interpreter:
+///
+///   - `divisor == 0` (Gate-1b): the interpreter raises a clean `DivByZero`
+///     error (R4: not overflow). Route to the `Trap` terminator, which since
+///     Gate-1b0 calls `cx_trap` for a clean process exit (126) — NOT a hardware
+///     fault. Applies to BOTH Div and Mod.
+///   - `INT_MIN / -1` (Gate-1a, Div only): signed overflow; R4 rules it wraps to
+///     `INT_MIN`. A `select` would still execute the faulting `sdiv`, so this is a
+///     BRANCH that produces `MIN` without dividing, mirroring the interpreter's
+///     `if b == -1 { a.wrapping_neg() }` (runtime/ops.rs:93). `MIN` is sourced
+///     per-width from the int-facts leaf. Mod needs no INT_MIN guard — `srem`
+///     already yields 0 for `INT_MIN % -1` (R4-confirmed), so Rem goes straight
+///     to the divide block once the zero-check passes.
+///
+///   [decision]  is_zero = Eq(divisor, 0);  Branch(is_zero, trap, nonzero)
+///       |    \
+///    [trap]   \                              trap: clean cx_trap exit (Gate-1b0)
+///              \
+///           [nonzero]  — Div: the INT_MIN/-1 sub-guard below; Rem: = divide
+///   (Div)   is_min → check_neg1 → min_blk(MIN) / divide ; merge ← MIN | quotient
+///   (Rem)   divide: srem ; Jump merge(rem)
+///     [merge(result)]  — receives the result via a block parameter
+///
+/// The per-width `MIN` (Div only) is read from `ty`'s int-facts leaf entry inside.
+/// Non-integer (F64) div/mod and all other ops do not reach here (the caller
+/// gates on `ty.int_width()`), so their IR is unchanged.
+fn emit_guarded_idiv(
+    dst: ValueId,
+    ty: IrType,
+    op: BinaryOp,
+    dividend: ValueId,
+    divisor: ValueId,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<LoweredValue, LoweringError> {
+    let incoming = active.bindings.clone();
+
+    // ── Outer gate (Gate-1b): divisor == 0 → clean trap. ──────────────────────
+    // Decision block (current `active`): is_zero = (divisor == 0).
+    let zero_const = ctx.fresh_value();
+    active.emit(IrInst::ConstInt { dst: zero_const, ty: ty.clone(), value: 0 })?;
+    let is_zero = ctx.fresh_value();
+    active.emit(IrInst::Compare {
+        dst: is_zero,
+        op: CompareOp::Eq,
+        lhs: divisor,
+        rhs: zero_const,
+    })?;
+
+    // Clean-trap block for the zero path (Gate-1b0: Trap → cx_trap, exit 126).
+    let mut trap_blk = ctx.start_block(vec![], incoming.clone());
+    let trap_blk_id = trap_blk.id();
+
+    // Shared merge (result param) and divide (sdiv/srem) blocks.
+    let result_param = ctx.fresh_value();
+    let merge_block = ctx.start_block(
+        vec![BlockParam { value: result_param, ty: ty.clone(), read_only: false }],
+        incoming.clone(),
+    );
+    let merge_id = merge_block.id();
+
+    let mut divide = ctx.start_block(vec![], incoming.clone());
+    let divide_id = divide.id();
+
+    // Non-zero entry: Div gets the INT_MIN/-1 sub-guard (Gate-1a); Rem goes
+    // straight to the divide (srem already handles INT_MIN % -1). The sub-guard
+    // blocks are CREATED here (their ids feed the branch below) but FILLED only
+    // after the decision block is sealed — they read dividend/divisor, which are
+    // defined in the decision block and resolve cross-block only once it is
+    // sealed (the seal-order Gate-1a relied on as well).
+    let is_div = matches!(op, BinaryOp::Div);
+    let mut check_min = if is_div {
+        Some(ctx.start_block(vec![], incoming.clone()))
+    } else {
+        None
+    };
+    let check_min_id = check_min.as_ref().map(|b| b.id());
+    let mut check_neg1 = if is_div {
+        Some(ctx.start_block(vec![], incoming.clone()))
+    } else {
+        None
+    };
+    let check_neg1_id = check_neg1.as_ref().map(|b| b.id());
+    let mut min_blk = if is_div {
+        Some(ctx.start_block(vec![], incoming.clone()))
+    } else {
+        None
+    };
+    let min_blk_id = min_blk.as_ref().map(|b| b.id());
+
+    let nonzero_entry = check_min_id.unwrap_or(divide_id);
+
+    // Terminate + seal the decision block FIRST, so dividend/divisor resolve in
+    // the divide and the cross-block sub-guards filled below.
+    active.terminate(IrTerminator::Branch {
+        cond: is_zero,
+        then_block: trap_blk_id,
+        then_args: vec![],
+        else_block: nonzero_entry,
+        else_args: vec![],
+    })?;
+    let old_active = std::mem::replace(active, merge_block);
+    ctx.seal_block(old_active)?;
+
+    // trap_blk: clean exit via cx_trap (Gate-1b0). Never reached for divisor != 0.
+    trap_blk.terminate(IrTerminator::Trap)?;
+    ctx.seal_block(trap_blk)?;
+
+    // divide: the actual sdiv/srem — never reached for divisor 0 (or INT_MIN/-1
+    // for Div). `op` is Div or Rem; both are well-typed at `ty`.
+    divide.emit(IrInst::Binary {
+        dst,
+        op,
+        ty: ty.clone(),
+        lhs: dividend,
+        rhs: divisor,
+    })?;
+    divide.terminate(IrTerminator::Jump { target: merge_id, args: vec![dst] })?;
+    ctx.seal_block(divide)?;
+
+    // Div-only INT_MIN/-1 sub-guard (Gate-1a), filled now that the decision block
+    // is sealed: check_min → check_neg1 → min_blk(MIN) / divide.
+    if let (Some(mut check_min), Some(mut check_neg1), Some(mut min_blk)) =
+        (check_min.take(), check_neg1.take(), min_blk.take())
+    {
+        let check_neg1_id = check_neg1_id.expect("check_neg1 id present for Div");
+        let min_blk_id = min_blk_id.expect("min_blk id present for Div");
+        // Per-width INT_MIN from the int-facts leaf (Div reaches here only for an
+        // integer `ty`, so int_width() is always Some).
+        let min = ty
+            .int_width()
+            .expect("integer division requires an integer width")
+            .facts()
+            .min;
+
+        // check_min: is_min = (dividend == MIN) → check_neg1 / divide.
+        let min_const = ctx.fresh_value();
+        check_min.emit(IrInst::ConstInt { dst: min_const, ty: ty.clone(), value: min })?;
+        let is_min = ctx.fresh_value();
+        check_min.emit(IrInst::Compare {
+            dst: is_min,
+            op: CompareOp::Eq,
+            lhs: dividend,
+            rhs: min_const,
+        })?;
+        check_min.terminate(IrTerminator::Branch {
+            cond: is_min,
+            then_block: check_neg1_id,
+            then_args: vec![],
+            else_block: divide_id,
+            else_args: vec![],
+        })?;
+        ctx.seal_block(check_min)?;
+
+        // check_neg1: reached only when dividend == MIN. is_neg1 = (divisor == -1).
+        let neg1_const = ctx.fresh_value();
+        check_neg1.emit(IrInst::ConstInt { dst: neg1_const, ty: ty.clone(), value: -1 })?;
+        let is_neg1 = ctx.fresh_value();
+        check_neg1.emit(IrInst::Compare {
+            dst: is_neg1,
+            op: CompareOp::Eq,
+            lhs: divisor,
+            rhs: neg1_const,
+        })?;
+        check_neg1.terminate(IrTerminator::Branch {
+            cond: is_neg1,
+            then_block: min_blk_id,
+            then_args: vec![],
+            else_block: divide_id,
+            else_args: vec![],
+        })?;
+        ctx.seal_block(check_neg1)?;
+
+        // min_blk: INT_MIN / -1 → MIN, without dividing. Re-emit MIN block-locally.
+        let min_result = ctx.fresh_value();
+        min_blk.emit(IrInst::ConstInt { dst: min_result, ty: ty.clone(), value: min })?;
+        min_blk.terminate(IrTerminator::Jump { target: merge_id, args: vec![min_result] })?;
+        ctx.seal_block(min_blk)?;
+    }
+
+    Ok(LoweredValue { value: result_param, ty })
+}
+
 /// Lower a `when` statement (chained-decision CFG modeled on lower_logical).
 ///
 /// SCOPE BOUNDARY (Option A, 0.1):
@@ -2414,7 +3138,7 @@ fn lower_when_stmt(
     ctx: &mut LoweringCtx,
     mut current: ActiveBlock,
     spec: &FunctionLoweringSpec,
-    loop_ctx: Option<&LoopContext>,
+    loop_ctx: &[LoopContext],
 ) -> Result<Option<ActiveBlock>, LoweringError> {
     let incoming = current.bindings.clone();
     let scrutinee_val = lower_expr(scrutinee, ctx, &mut current)?;
@@ -2449,44 +3173,18 @@ fn lower_when_stmt(
                     _ => Ok(Some(merge_fallthroughs(ctx, fallthroughs, &incoming)?)),
                 };
             }
-            SemanticWhenPattern::Literal(value) => {
-                let pat_value = if matches!(value, SemanticValue::Unknown) {
-                    // TBool wire-value match — see SCOPE BOUNDARY at fn doc.
-                    let unknown_byte = ctx.fresh_value();
-                    current.emit(IrInst::ConstInt {
-                        dst: unknown_byte,
-                        ty: IrType::I8,
-                        value: 2,
-                    })?;
-                    let unknown_const = ctx.fresh_value();
-                    current.emit(IrInst::Cast {
-                        dst: unknown_const,
-                        from: IrType::I8,
-                        to: scrutinee_val.ty.clone(),
-                        value: unknown_byte,
-                    })?;
-                    unknown_const
-                } else {
-                    let lowered = lower_value(value, &scrutinee.ty, ctx, &mut current)?;
-                    lowered.value
-                };
-                let cmp_dst = ctx.fresh_value();
-                current.emit(IrInst::Compare {
-                    dst: cmp_dst,
-                    op: CompareOp::Eq,
-                    lhs: scrutinee_val.value,
-                    rhs: pat_value,
-                })?;
-                let next_block = ctx.start_block(vec![], incoming.clone());
-                let next_id = next_block.id();
-                current.terminate(IrTerminator::Branch {
-                    cond: cmp_dst,
-                    then_block: body_id,
-                    then_args: vec![],
-                    else_block: next_id,
-                    else_args: vec![],
-                })?;
-                ctx.seal_block(current)?;
+            // Literal / Range / EnumVariant share one comparison emitter (D1.2a);
+            // the stmt mechanism (fallthrough collection) stays local here.
+            _ => {
+                current = emit_when_arm_match(
+                    &arm.pattern,
+                    scrutinee,
+                    &scrutinee_val,
+                    body_id,
+                    &incoming,
+                    current,
+                    ctx,
+                )?;
                 if let Some(active) = lower_stmt_sequence(
                     arm.body.iter(),
                     ctx,
@@ -2496,66 +3194,6 @@ fn lower_when_stmt(
                 )? {
                     fallthroughs.push(active);
                 }
-                current = next_block;
-            }
-            SemanticWhenPattern::Range(low, high, inclusive) => {
-                let lo_lowered = lower_value(low, &scrutinee.ty, ctx, &mut current)?;
-                let lo_cmp = ctx.fresh_value();
-                current.emit(IrInst::Compare {
-                    dst: lo_cmp,
-                    op: CompareOp::Ge,
-                    lhs: scrutinee_val.value,
-                    rhs: lo_lowered.value,
-                })?;
-                let mut lo_pass = ctx.start_block(vec![], incoming.clone());
-                let lo_pass_id = lo_pass.id();
-                let no_match = ctx.start_block(vec![], incoming.clone());
-                let no_match_id = no_match.id();
-                current.terminate(IrTerminator::Branch {
-                    cond: lo_cmp,
-                    then_block: lo_pass_id,
-                    then_args: vec![],
-                    else_block: no_match_id,
-                    else_args: vec![],
-                })?;
-                ctx.seal_block(current)?;
-
-                let hi_lowered = lower_value(high, &scrutinee.ty, ctx, &mut lo_pass)?;
-                let hi_op = if *inclusive { CompareOp::Le } else { CompareOp::Lt };
-                let hi_cmp = ctx.fresh_value();
-                lo_pass.emit(IrInst::Compare {
-                    dst: hi_cmp,
-                    op: hi_op,
-                    lhs: scrutinee_val.value,
-                    rhs: hi_lowered.value,
-                })?;
-                lo_pass.terminate(IrTerminator::Branch {
-                    cond: hi_cmp,
-                    then_block: body_id,
-                    then_args: vec![],
-                    else_block: no_match_id,
-                    else_args: vec![],
-                })?;
-                ctx.seal_block(lo_pass)?;
-
-                if let Some(active) = lower_stmt_sequence(
-                    arm.body.iter(),
-                    ctx,
-                    Some(body_block),
-                    spec,
-                    loop_ctx,
-                )? {
-                    fallthroughs.push(active);
-                }
-                current = no_match;
-            }
-            SemanticWhenPattern::EnumVariant { enum_name, variant_name, .. } => {
-                return Err(LoweringError::UnsupportedSemanticConstruct {
-                    construct: format!(
-                        "EnumVariant when arm '{}::{}' — blocked on Enum IR lowering (separate work)",
-                        enum_name, variant_name
-                    ),
-                });
             }
         }
     }
@@ -2568,6 +3206,184 @@ fn lower_when_stmt(
         0 => Ok(None),
         1 => Ok(Some(fallthroughs.into_iter().next().unwrap())),
         _ => Ok(Some(merge_fallthroughs(ctx, fallthroughs, &incoming)?)),
+    }
+}
+
+/// Emit the comparison CFG for one non-catchall `when` arm (tracker D1.2a) — the
+/// pattern->Compare judgment that `lower_when_stmt` and `lower_when_expr` used to
+/// duplicate verbatim. On entry `current` is the active decision block; this
+/// emits the compare(s), branches to `body_id` on match, and returns the "no
+/// match" continuation block the next arm builds from. The caller owns the body
+/// lowering (stmt's fallthrough vs expr's value-merge) — only the judgment is
+/// shared, the mechanism stays local. Catchall is caller-handled (its control
+/// flow differs between the two forms) and never reaches here.
+fn emit_when_arm_match(
+    pattern: &SemanticWhenPattern,
+    scrutinee: &SemanticExpr,
+    scrutinee_val: &LoweredValue,
+    body_id: crate::ir::types::BlockId,
+    incoming: &BindingMap,
+    mut current: ActiveBlock,
+    ctx: &mut LoweringCtx,
+) -> Result<ActiveBlock, LoweringError> {
+    match pattern {
+        SemanticWhenPattern::Literal(value) => {
+            let pat_value = if scrutinee_val.ty == IrType::TBool {
+                // D2.x-A1: a three-state TBool scrutinee (a `bool = ?` unknown)
+                // compares against TBool wire constants — false=0, true=1,
+                // unknown=2 — each materialised as ConstInt(I8) + Cast→TBool
+                // (the validator restricts ConstInt to non-TBool types, and
+                // Compare requires matching operand types). This mirrors the
+                // interpreter matching bool patterns against a TBool value
+                // (runtime/exec.rs). A definite-Bool scrutinee keeps the path
+                // below byte-for-byte (true/false via lower_value; unknown via
+                // I8 + Cast→Bool), so t20 / t144 / every other `when` are unmoved.
+                let wire: i128 = match value {
+                    SemanticValue::Bool(false) => 0,
+                    SemanticValue::Bool(true) => 1,
+                    SemanticValue::Unknown => 2,
+                    _ => unsupported!(
+                        "non-bool when-pattern against a three-state bool scrutinee"
+                    ),
+                };
+                let byte = ctx.fresh_value();
+                current.emit(IrInst::ConstInt { dst: byte, ty: IrType::I8, value: wire })?;
+                let wire_const = ctx.fresh_value();
+                current.emit(IrInst::Cast {
+                    dst: wire_const,
+                    from: IrType::I8,
+                    to: IrType::TBool,
+                    value: byte,
+                })?;
+                wire_const
+            } else if matches!(value, SemanticValue::Unknown) {
+                // TBool wire-value match — see SCOPE BOUNDARY at lower_when_stmt doc.
+                let unknown_byte = ctx.fresh_value();
+                current.emit(IrInst::ConstInt {
+                    dst: unknown_byte,
+                    ty: IrType::I8,
+                    value: 2,
+                })?;
+                let unknown_const = ctx.fresh_value();
+                current.emit(IrInst::Cast {
+                    dst: unknown_const,
+                    from: IrType::I8,
+                    to: scrutinee_val.ty.clone(),
+                    value: unknown_byte,
+                })?;
+                unknown_const
+            } else {
+                let lowered = lower_value(value, &scrutinee.ty, ctx, &mut current)?;
+                lowered.value
+            };
+            let cmp_dst = ctx.fresh_value();
+            current.emit(IrInst::Compare {
+                dst: cmp_dst,
+                op: CompareOp::Eq,
+                lhs: scrutinee_val.value,
+                rhs: pat_value,
+            })?;
+            let next_block = ctx.start_block(vec![], incoming.clone());
+            let next_id = next_block.id();
+            current.terminate(IrTerminator::Branch {
+                cond: cmp_dst,
+                then_block: body_id,
+                then_args: vec![],
+                else_block: next_id,
+                else_args: vec![],
+            })?;
+            ctx.seal_block(current)?;
+            Ok(next_block)
+        }
+        SemanticWhenPattern::Range(low, high, inclusive) => {
+            let lo_lowered = lower_value(low, &scrutinee.ty, ctx, &mut current)?;
+            let lo_cmp = ctx.fresh_value();
+            current.emit(IrInst::Compare {
+                dst: lo_cmp,
+                op: CompareOp::Ge,
+                lhs: scrutinee_val.value,
+                rhs: lo_lowered.value,
+            })?;
+            let mut lo_pass = ctx.start_block(vec![], incoming.clone());
+            let lo_pass_id = lo_pass.id();
+            let no_match = ctx.start_block(vec![], incoming.clone());
+            let no_match_id = no_match.id();
+            current.terminate(IrTerminator::Branch {
+                cond: lo_cmp,
+                then_block: lo_pass_id,
+                then_args: vec![],
+                else_block: no_match_id,
+                else_args: vec![],
+            })?;
+            ctx.seal_block(current)?;
+
+            let hi_lowered = lower_value(high, &scrutinee.ty, ctx, &mut lo_pass)?;
+            let hi_op = if *inclusive { CompareOp::Le } else { CompareOp::Lt };
+            let hi_cmp = ctx.fresh_value();
+            lo_pass.emit(IrInst::Compare {
+                dst: hi_cmp,
+                op: hi_op,
+                lhs: scrutinee_val.value,
+                rhs: hi_lowered.value,
+            })?;
+            lo_pass.terminate(IrTerminator::Branch {
+                cond: hi_cmp,
+                then_block: body_id,
+                then_args: vec![],
+                else_block: no_match_id,
+                else_args: vec![],
+            })?;
+            ctx.seal_block(lo_pass)?;
+            Ok(no_match)
+        }
+        SemanticWhenPattern::EnumVariant { enum_name, variant_name, variant_id, .. } => {
+            // Match the scrutinee's tag against this variant's tag (D2.2) — the
+            // same `variant_id` the construct emits. Mirrors the Literal arm:
+            // ConstInt(tag) → Compare(Eq) → Branch. The scrutinee is already the
+            // enum's I8 tag.
+            let tag = match variant_id {
+                Some(id) => id.0,
+                None => {
+                    return Err(LoweringError::UnsupportedSemanticConstruct {
+                        construct: format!(
+                            "enum variant '{}::{}' has no resolved tag (variant_id)",
+                            enum_name, variant_name
+                        ),
+                    })
+                }
+            };
+            let pat_value = ctx.fresh_value();
+            current.emit(IrInst::ConstInt {
+                dst: pat_value,
+                ty: scrutinee_val.ty.clone(),
+                value: tag as i128,
+            })?;
+            let cmp_dst = ctx.fresh_value();
+            current.emit(IrInst::Compare {
+                dst: cmp_dst,
+                op: CompareOp::Eq,
+                lhs: scrutinee_val.value,
+                rhs: pat_value,
+            })?;
+            let next_block = ctx.start_block(vec![], incoming.clone());
+            let next_id = next_block.id();
+            current.terminate(IrTerminator::Branch {
+                cond: cmp_dst,
+                then_block: body_id,
+                then_args: vec![],
+                else_block: next_id,
+                else_args: vec![],
+            })?;
+            ctx.seal_block(current)?;
+            Ok(next_block)
+        }
+        SemanticWhenPattern::Catchall => {
+            // Catchall is caller-handled; it must never be routed through here.
+            Err(LoweringError::InternalInvariantViolation {
+                detail: "Catchall must be handled by the when caller, not emit_when_arm_match"
+                    .to_string(),
+            })
+        }
     }
 }
 
@@ -2590,7 +3406,15 @@ fn lower_when_expr(
     ctx: &mut LoweringCtx,
     active: &mut ActiveBlock,
 ) -> Result<LoweredValue, LoweringError> {
-    let result_ir_ty = lower_type(result_ty)?;
+    // Bare-literal arm tails type the when-expr as the unresolved `Numeric`
+    // placeholder; resolve it to the default integer width like lower_binary /
+    // lower_if_expr do (D2.1), so an enclosing typed context narrows the result.
+    // Inert for concrete-typed when-exprs (the `else` is the prior behavior).
+    let result_ir_ty = if *result_ty == SemanticType::Numeric {
+        ctx.target.numeric_literal_ir_type()
+    } else {
+        lower_type(result_ty)?
+    };
     let incoming = active.bindings.clone();
     let scrutinee_val = lower_expr(scrutinee, ctx, active)?;
 
@@ -2610,57 +3434,15 @@ fn lower_when_expr(
     // built in `current` (a local), starting from what was originally `*active`.
     let mut current = std::mem::replace(active, merge_block);
 
-    // Helper to lower one arm body and Jump to merge with its value.
-    // The arm body's leading stmts (all but the last) lower via the void path;
-    // the trailing ExprStmt is lowered as an expression to capture its value.
-    // If the body diverges before producing the trailing value, no merge edge
-    // is added — that arm just doesn't contribute to the merge.
+    // Each arm body lowers to a value via the shared `lower_branch_value`
+    // (extracted in D2.1 so if-expr branches reuse the same merge machinery —
+    // leading stmts via the void path, trailing ExprStmt as the value, Jump to
+    // merge with `ensure_type_match`). This thin wrapper keeps the per-arm call
+    // sites unchanged, so the `when`-expr emitted IR is byte-identical.
     let lower_arm_body =
-        |ctx: &mut LoweringCtx,
-         mut body_active: ActiveBlock,
-         arm: &SemanticWhenArm|
+        |ctx: &mut LoweringCtx, body_active: ActiveBlock, arm: &SemanticWhenArm|
          -> Result<(), LoweringError> {
-            if arm.body.is_empty() {
-                return Err(LoweringError::InternalInvariantViolation {
-                    detail: "when expression arm body is empty".to_string(),
-                });
-            }
-            let last_idx = arm.body.len() - 1;
-            // Lower leading stmts in-place into body_active.
-            for stmt in &arm.body[..last_idx] {
-                // Use a minimal lowering spec — when arms in expression position
-                // shouldn't contain Return statements; if they do, this errors.
-                let inline_spec = FunctionLoweringSpec {
-                    name: "<when-arm>".to_string(),
-                    return_ty: None,
-                    allow_return_stmt: false,
-                };
-                let result = lower_stmt(stmt, ctx, body_active, &inline_spec, None)?;
-                body_active = match result {
-                    Some(active) => active,
-                    None => return Ok(()), // diverged — no merge edge
-                };
-            }
-            // Lower the trailing expression to capture the arm's value.
-            let trailing_expr = match &arm.body[last_idx] {
-                SemanticStmt::ExprStmt { expr, .. } => expr,
-                other => {
-                    return Err(LoweringError::UnsupportedSemanticConstruct {
-                        construct: format!(
-                            "when expression arm must end in an expression, got {:?}",
-                            std::mem::discriminant(other)
-                        ),
-                    });
-                }
-            };
-            let arm_value = lower_expr(trailing_expr, ctx, &mut body_active)?;
-            ensure_type_match("when arm result", result_ir_ty.clone(), arm_value.ty)?;
-            body_active.terminate(IrTerminator::Jump {
-                target: merge_id,
-                args: vec![arm_value.value],
-            })?;
-            ctx.seal_block(body_active)?;
-            Ok(())
+            lower_branch_value(&arm.body, &result_ir_ty, merge_id, body_active, ctx)
         };
 
     for arm in arms.iter() {
@@ -2681,99 +3463,19 @@ fn lower_when_expr(
                     ty: result_ir_ty,
                 });
             }
-            SemanticWhenPattern::Literal(value) => {
-                let pat_value = if matches!(value, SemanticValue::Unknown) {
-                    let unknown_byte = ctx.fresh_value();
-                    current.emit(IrInst::ConstInt {
-                        dst: unknown_byte,
-                        ty: IrType::I8,
-                        value: 2,
-                    })?;
-                    let unknown_const = ctx.fresh_value();
-                    current.emit(IrInst::Cast {
-                        dst: unknown_const,
-                        from: IrType::I8,
-                        to: scrutinee_val.ty.clone(),
-                        value: unknown_byte,
-                    })?;
-                    unknown_const
-                } else {
-                    let lowered = lower_value(value, &scrutinee.ty, ctx, &mut current)?;
-                    lowered.value
-                };
-                let cmp_dst = ctx.fresh_value();
-                current.emit(IrInst::Compare {
-                    dst: cmp_dst,
-                    op: CompareOp::Eq,
-                    lhs: scrutinee_val.value,
-                    rhs: pat_value,
-                })?;
-                let next_block = ctx.start_block(vec![], incoming.clone());
-                let next_id = next_block.id();
-                current.terminate(IrTerminator::Branch {
-                    cond: cmp_dst,
-                    then_block: body_id,
-                    then_args: vec![],
-                    else_block: next_id,
-                    else_args: vec![],
-                })?;
-                ctx.seal_block(current)?;
+            // Literal / Range / EnumVariant share one comparison emitter (D1.2a);
+            // the expr mechanism (value-producing arm body -> merge) stays local.
+            _ => {
+                current = emit_when_arm_match(
+                    &arm.pattern,
+                    scrutinee,
+                    &scrutinee_val,
+                    body_id,
+                    &incoming,
+                    current,
+                    ctx,
+                )?;
                 lower_arm_body(ctx, body_block, arm)?;
-                current = next_block;
-            }
-            SemanticWhenPattern::Range(low, high, inclusive) => {
-                let lo_lowered = lower_value(low, &scrutinee.ty, ctx, &mut current)?;
-                let lo_cmp = ctx.fresh_value();
-                current.emit(IrInst::Compare {
-                    dst: lo_cmp,
-                    op: CompareOp::Ge,
-                    lhs: scrutinee_val.value,
-                    rhs: lo_lowered.value,
-                })?;
-                let mut lo_pass = ctx.start_block(vec![], incoming.clone());
-                let lo_pass_id = lo_pass.id();
-                let no_match = ctx.start_block(vec![], incoming.clone());
-                let no_match_id = no_match.id();
-                current.terminate(IrTerminator::Branch {
-                    cond: lo_cmp,
-                    then_block: lo_pass_id,
-                    then_args: vec![],
-                    else_block: no_match_id,
-                    else_args: vec![],
-                })?;
-                ctx.seal_block(current)?;
-
-                let hi_lowered = lower_value(high, &scrutinee.ty, ctx, &mut lo_pass)?;
-                let hi_op = if *inclusive { CompareOp::Le } else { CompareOp::Lt };
-                let hi_cmp = ctx.fresh_value();
-                lo_pass.emit(IrInst::Compare {
-                    dst: hi_cmp,
-                    op: hi_op,
-                    lhs: scrutinee_val.value,
-                    rhs: hi_lowered.value,
-                })?;
-                lo_pass.terminate(IrTerminator::Branch {
-                    cond: hi_cmp,
-                    then_block: body_id,
-                    then_args: vec![],
-                    else_block: no_match_id,
-                    else_args: vec![],
-                })?;
-                ctx.seal_block(lo_pass)?;
-                lower_arm_body(ctx, body_block, arm)?;
-                current = no_match;
-            }
-            SemanticWhenPattern::EnumVariant {
-                enum_name,
-                variant_name,
-                ..
-            } => {
-                return Err(LoweringError::UnsupportedSemanticConstruct {
-                    construct: format!(
-                        "EnumVariant when arm '{}::{}' — blocked on Enum IR lowering (separate work)",
-                        enum_name, variant_name
-                    ),
-                });
             }
         }
     }
@@ -2789,6 +3491,274 @@ fn lower_when_expr(
         value: result_param,
         ty: result_ir_ty,
     })
+}
+
+/// Lower a value-producing branch body — a `when`-expr arm or an if-expr branch
+/// (tracker D2.1) — and `Jump` to `merge_id` with its value. Leading statements
+/// lower via the void path; the trailing `ExprStmt` is the branch value, type-
+/// checked against `result_ir_ty`. If the body diverges before the trailing
+/// expression (a leading stmt that never returns control), no merge edge is
+/// added — that branch simply contributes nothing to the merge.
+fn lower_branch_value(
+    body: &[SemanticStmt],
+    result_ir_ty: &IrType,
+    merge_id: crate::ir::types::BlockId,
+    mut body_active: ActiveBlock,
+    ctx: &mut LoweringCtx,
+) -> Result<(), LoweringError> {
+    if body.is_empty() {
+        return Err(LoweringError::InternalInvariantViolation {
+            detail: "value-producing branch body is empty".to_string(),
+        });
+    }
+    let last_idx = body.len() - 1;
+    // Lower leading stmts in-place. Minimal spec — a value-producing branch
+    // shouldn't contain a Return statement; if it does, this errors (→ SKIP).
+    for stmt in &body[..last_idx] {
+        let inline_spec = FunctionLoweringSpec {
+            name: "<branch>".to_string(),
+            return_ty: None,
+            allow_return_stmt: false,
+        };
+        let result = lower_stmt(stmt, ctx, body_active, &inline_spec, &[])?;
+        body_active = match result {
+            Some(active) => active,
+            None => return Ok(()), // diverged — no merge edge
+        };
+    }
+    let trailing_expr = match &body[last_idx] {
+        SemanticStmt::ExprStmt { expr, .. } => expr,
+        other => {
+            return Err(LoweringError::UnsupportedSemanticConstruct {
+                construct: format!(
+                    "value-producing branch must end in an expression, got {:?}",
+                    std::mem::discriminant(other)
+                ),
+            });
+        }
+    };
+    let value = lower_expr(trailing_expr, ctx, &mut body_active)?;
+    ensure_type_match("branch result", result_ir_ty.clone(), value.ty)?;
+    body_active.terminate(IrTerminator::Jump {
+        target: merge_id,
+        args: vec![value.value],
+    })?;
+    ctx.seal_block(body_active)?;
+    Ok(())
+}
+
+/// Lower an `if`-EXPRESSION to a value (tracker D2.1, #046). Structurally a
+/// two-branch value-producing `when`: branch on the definite condition, each
+/// branch produces its trailing-expression value, both merging through one
+/// result block parameter — the same machinery `lower_when_expr` uses, via the
+/// shared `lower_branch_value`.
+///
+///   [decision]  Branch(cond, then_block, else_block)
+///   [then] lower_branch_value(then_body) → Jump merge(v)
+///   [else] lower_branch_value(else_body) → Jump merge(v)
+///   [merge(result)]
+///
+/// `else if` is a nested `If` in `else_body`, handled by recursion through
+/// `lower_branch_value`'s trailing-expr lowering. The #026 unknown-condition
+/// case is unreachable here — an unknown value SKIPs at `lower_value` before any
+/// if (audit D2.1) — so the condition always lowers to a definite Bool.
+/// If `cond` is a three-state TBool, trap (`cx_trap`) when its wire value is the
+/// unknown state (2) — the interpreter's `UnknownCondition` for an `if` /
+/// `if`-expression (#026 / #046) — then narrow the now-definite 0/1 value to
+/// Bool for the branch (the IR validator requires `Branch` conditions to be
+/// Bool). A definite Bool condition is returned unchanged with **no** emitted IR,
+/// so every existing `if` lowers byte-identically. Modeled on `emit_bounds_check`
+/// (trap-branch + continue block, seal-decision-first).
+fn guard_unknown_condition(
+    cond: LoweredValue,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<LoweredValue, LoweringError> {
+    if cond.ty != IrType::TBool {
+        return Ok(cond);
+    }
+    let incoming = active.bindings.clone();
+
+    // Decision block (current `active`): is the condition the unknown wire (2)?
+    let unknown_byte = ctx.fresh_value();
+    active.emit(IrInst::ConstInt { dst: unknown_byte, ty: IrType::I8, value: 2 })?;
+    let unknown_const = ctx.fresh_value();
+    active.emit(IrInst::Cast {
+        dst: unknown_const,
+        from: IrType::I8,
+        to: IrType::TBool,
+        value: unknown_byte,
+    })?;
+    let is_unknown = ctx.fresh_value();
+    active.emit(IrInst::Compare {
+        dst: is_unknown,
+        op: CompareOp::Eq,
+        lhs: cond.value,
+        rhs: unknown_const,
+    })?;
+
+    let mut trap_blk = ctx.start_block(vec![], incoming.clone());
+    let trap_id = trap_blk.id();
+    let cont = ctx.start_block(vec![], incoming);
+    let cont_id = cont.id();
+
+    // Seal the decision block first (seal-order rule): `cont` reads `cond` from it.
+    active.terminate(IrTerminator::Branch {
+        cond: is_unknown,
+        then_block: trap_id,
+        then_args: vec![],
+        else_block: cont_id,
+        else_args: vec![],
+    })?;
+    let old_active = std::mem::replace(active, cont);
+    ctx.seal_block(old_active)?;
+
+    // trap: clean cx_trap exit (shared with the Gate-1 / Gate-2 guards).
+    trap_blk.terminate(IrTerminator::Trap)?;
+    ctx.seal_block(trap_blk)?;
+
+    // continue: the value is now known 0/1 — narrow TBool → Bool for the branch.
+    let cond_bool = ctx.fresh_value();
+    active.emit(IrInst::Cast {
+        dst: cond_bool,
+        from: IrType::TBool,
+        to: IrType::Bool,
+        value: cond.value,
+    })?;
+    Ok(LoweredValue { value: cond_bool, ty: IrType::Bool })
+}
+
+fn lower_if_expr(
+    condition: &SemanticExpr,
+    then_body: &[SemanticStmt],
+    else_body: &[SemanticStmt],
+    result_ty: &SemanticType,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<LoweredValue, LoweringError> {
+    // #046 types the if-expr as its then-branch's trailing type, which for a
+    // bare integer literal (`if c { 100 } else { 5 }`) is the unresolved
+    // `Numeric` placeholder. Resolve it to the target's default integer width
+    // (I64 on 64-bit) — the same rule lower_binary uses — so the merge param is
+    // concrete; an enclosing typed context narrows the I64 result as usual.
+    let result_ir_ty = if *result_ty == SemanticType::Numeric {
+        ctx.target.numeric_literal_ir_type()
+    } else {
+        lower_type(result_ty)?
+    };
+    let incoming = active.bindings.clone();
+
+    // Lower the condition in the decision block (current `active`).
+    let cond = lower_expr(condition, ctx, active)?;
+    // D2.x-A1: an unknown (TBool) condition traps (cx_trap) — #046 reuses #026.
+    // No-op for a definite Bool condition; narrows a definite TBool to Bool.
+    let cond = guard_unknown_condition(cond, ctx, active)?;
+
+    // Merge block carries the single result block parameter.
+    let result_param = ctx.fresh_value();
+    let merge_block = ctx.start_block(
+        vec![BlockParam { value: result_param, ty: result_ir_ty.clone(), read_only: false }],
+        incoming.clone(),
+    );
+    let merge_id = merge_block.id();
+
+    // then / else branch blocks.
+    let then_block = ctx.start_block(vec![], incoming.clone());
+    let then_id = then_block.id();
+    let else_block = ctx.start_block(vec![], incoming.clone());
+    let else_id = else_block.id();
+
+    // Terminate + seal the decision block FIRST (seal-order rule): the branch
+    // bodies read `cond`/other values defined in the decision block.
+    active.terminate(IrTerminator::Branch {
+        cond: cond.value,
+        then_block: then_id,
+        then_args: vec![],
+        else_block: else_id,
+        else_args: vec![],
+    })?;
+    let old_active = std::mem::replace(active, merge_block);
+    ctx.seal_block(old_active)?;
+
+    // Lower each branch to a value merging into the result param.
+    lower_branch_value(then_body, &result_ir_ty, merge_id, then_block, ctx)?;
+    lower_branch_value(else_body, &result_ir_ty, merge_id, else_block, ctx)?;
+
+    Ok(LoweredValue { value: result_param, ty: result_ir_ty })
+}
+
+/// D2.4b: lower `expr?` (the Try operator) on a packed-i128 Result. Unpack the
+/// operand (D2.4a `result_unpack`), then branch on the tag: Ok continues with the
+/// payload narrowed back to T (reverse of the construct's widen), Err early-returns
+/// the WHOLE original Result i128, byte-identical, from the enclosing function.
+///
+/// The semantic analyser guarantees `?` only appears inside a Result-returning
+/// function and that the operand is a Result<T> (semantic.rs rejects t85/t86), so
+/// the Err early-return of the i128 is type-correct without consulting the return
+/// type here, and `inner` always lowers to an i128.
+///
+/// `EarlyReturn` reuses the plain `Return` terminator — zero overlap with the
+/// unknown-`?`/TBool machinery (the unknown arc is independent, audit-confirmed).
+fn lower_try(
+    inner_expr: &SemanticExpr,
+    result_ty: &SemanticType,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<LoweredValue, LoweringError> {
+    // Word-payload fence (R7): unwrapping a NESTED Result (T is itself a Result,
+    // so lower_type(T) == I128) exceeds the word payload — stays SKIP, exactly as
+    // the D2.4a construct does. Scalar/str `?` is the target.
+    let t_ir = lower_type(result_ty)?;
+    if matches!(t_ir, IrType::I128) {
+        return Err(LoweringError::UnsupportedSemanticConstruct {
+            construct: "? on a nested Result (word-payload limit, R7-deferred)".to_string(),
+        });
+    }
+
+    // Lower the Result operand and unpack it into (tag, payload word).
+    let result = lower_expr(inner_expr, ctx, active)?;
+    let (tag, payload) = result_unpack(result.value, ctx, active)?;
+
+    // Ok payload narrowed back to T (i64 word -> T). Identity when T is already I64.
+    let unwrapped = if t_ir == IrType::I64 {
+        payload
+    } else {
+        let dst = ctx.fresh_value();
+        active.emit(IrInst::Cast { dst, from: IrType::I64, to: t_ir.clone(), value: payload })?;
+        dst
+    };
+
+    // is_ok = (tag == 0).
+    let zero = ctx.fresh_value();
+    active.emit(IrInst::ConstInt { dst: zero, ty: IrType::I64, value: 0 })?;
+    let is_ok = ctx.fresh_value();
+    active.emit(IrInst::Compare { dst: is_ok, op: CompareOp::Eq, lhs: tag, rhs: zero })?;
+
+    let incoming = active.bindings.clone();
+    let cont_block = ctx.start_block(vec![], incoming.clone());
+    let cont_id = cont_block.id();
+    let mut err_block = ctx.start_block(vec![], incoming);
+    let err_id = err_block.id();
+
+    // Seal the decision block first: the Err block reads `result.value` and the
+    // continuation reads `unwrapped`, both defined here (they dominate both edges).
+    active.terminate(IrTerminator::Branch {
+        cond: is_ok,
+        then_block: cont_id,
+        then_args: vec![],
+        else_block: err_id,
+        else_args: vec![],
+    })?;
+    let old = std::mem::replace(active, cont_block);
+    ctx.seal_block(old)?;
+
+    // Err: early-return the whole original Result i128, unchanged.
+    err_block.terminate(IrTerminator::Return { value: Some(result.value) })?;
+    ctx.seal_block(err_block)?;
+
+    // Ok: `active` is now the continuation; the `?`-expression's value is the
+    // unwrapped payload at type T.
+    Ok(LoweredValue { value: unwrapped, ty: t_ir })
 }
 
 // Struct field access lowering strategy
@@ -2910,6 +3880,90 @@ fn resolve_field_ptr(
     Ok((field_ptr, field_ir_ty))
 }
 
+/// Emit an array bounds check (tracker Gate-2b): trap cleanly via `cx_trap`
+/// (exit 126, Gate-1b0) when `idx` is outside `[0, count)`, matching the
+/// interpreter's `IndexOutOfBounds` error. On return `*active` is the in-bounds
+/// continuation block — the caller emits the element address/access there.
+///
+/// `idx` is a signed I64, and the IR has only signed compares, so a single
+/// `idx >= count` would NOT catch a negative index. Two checks, nested so either
+/// routes to the one trap block:
+///
+///   [decision]  idx < 0 ?      → trap : check_hi
+///   [check_hi]  idx >= count ? → trap : continue
+///   [trap] cx_trap            [continue] caller emits PtrAdd + load/store
+///
+/// Decision is sealed before `continue` is filled (the Gate-1b seal-order rule):
+/// `idx` and the array base are defined in the decision block and resolve in the
+/// dominated continuation only once it is sealed.
+fn emit_bounds_check(
+    idx: ValueId,
+    count: usize,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<(), LoweringError> {
+    let incoming = active.bindings.clone();
+
+    // Decision block (current `active`): idx < 0 ?
+    let zero = ctx.fresh_value();
+    active.emit(IrInst::ConstInt { dst: zero, ty: IrType::I64, value: 0 })?;
+    let idx_neg = ctx.fresh_value();
+    active.emit(IrInst::Compare {
+        dst: idx_neg,
+        op: CompareOp::Lt,
+        lhs: idx,
+        rhs: zero,
+    })?;
+
+    let mut trap_blk = ctx.start_block(vec![], incoming.clone());
+    let trap_blk_id = trap_blk.id();
+    let mut check_hi = ctx.start_block(vec![], incoming.clone());
+    let check_hi_id = check_hi.id();
+    let cont = ctx.start_block(vec![], incoming.clone());
+    let cont_id = cont.id();
+
+    // Seal the decision block first, then fill the dependent blocks.
+    active.terminate(IrTerminator::Branch {
+        cond: idx_neg,
+        then_block: trap_blk_id,
+        then_args: vec![],
+        else_block: check_hi_id,
+        else_args: vec![],
+    })?;
+    let old_active = std::mem::replace(active, cont);
+    ctx.seal_block(old_active)?;
+
+    // trap: clean cx_trap exit (shared with Gate-1's guards).
+    trap_blk.terminate(IrTerminator::Trap)?;
+    ctx.seal_block(trap_blk)?;
+
+    // check_hi: idx >= count ? → trap : continue.
+    let count_const = ctx.fresh_value();
+    check_hi.emit(IrInst::ConstInt {
+        dst: count_const,
+        ty: IrType::I64,
+        value: count as i128,
+    })?;
+    let idx_ge = ctx.fresh_value();
+    check_hi.emit(IrInst::Compare {
+        dst: idx_ge,
+        op: CompareOp::Ge,
+        lhs: idx,
+        rhs: count_const,
+    })?;
+    check_hi.terminate(IrTerminator::Branch {
+        cond: idx_ge,
+        then_block: trap_blk_id,
+        then_args: vec![],
+        else_block: cont_id,
+        else_args: vec![],
+    })?;
+    ctx.seal_block(check_hi)?;
+
+    // `*active` is now the `continue` block; the caller emits the access there.
+    Ok(())
+}
+
 // Array element write lowering strategy
 //
 // An array element write `arr:[i] = value` where `arr: Array(N, ElemTy)` is
@@ -2984,6 +4038,10 @@ fn resolve_array_element_ptr(
         })?;
         cast_dst
     };
+
+    // 3b. Bounds-check the index before computing its address (Gate-2b).
+    // OOB traps cleanly via cx_trap; `*active` becomes the in-bounds block.
+    emit_bounds_check(idx_i64, count, ctx, active)?;
 
     // 4. Compute byte_offset = idx_i64 * stride.
     let stride_val = ctx.fresh_value();
@@ -3123,9 +4181,30 @@ fn lower_array_lit(
             fp
         };
 
+        // Narrow the element to the array's element width before storing
+        // (tracker Gate-2a). `IrInst::Store` carries no width — it stores at the
+        // value's type. The element expression lowers at its computed width
+        // (i64 for an integer literal), so without this an i64 store into a
+        // sub-64-bit slot overruns by up to 7 bytes, corrupting adjacent stack.
+        // The cast truncates to the element's low bytes (the correct value); the
+        // read path sign-extends on load. A no-op when widths already match
+        // (i64 elements, t64 arrays).
+        let store_value = if lowered_elem.ty != elem_ir_ty {
+            let narrowed = ctx.fresh_value();
+            active.emit(IrInst::Cast {
+                dst: narrowed,
+                from: lowered_elem.ty.clone(),
+                to: elem_ir_ty.clone(),
+                value: lowered_elem.value,
+            })?;
+            narrowed
+        } else {
+            lowered_elem.value
+        };
+
         active.emit(IrInst::Store {
             ptr: elem_ptr,
-            value: lowered_elem.value,
+            value: store_value,
         })?;
     }
 
@@ -3223,6 +4302,10 @@ fn lower_index(
         cast_dst
     };
 
+    // 2b. Bounds-check the index before computing its address (Gate-2b).
+    // OOB traps cleanly via cx_trap; `*active` becomes the in-bounds block.
+    emit_bounds_check(idx_i64, count, ctx, active)?;
+
     // 3. Compute byte_offset = idx_i64 * stride.
     let stride_val = ctx.fresh_value();
     active.emit(IrInst::ConstInt {
@@ -3275,13 +4358,24 @@ fn lower_type(ty: &SemanticType) -> Result<IrType, LoweringError> {
         SemanticType::Handle(_) => { unsupported_type!("Handle") },
         SemanticType::StrRef => { unsupported_type!("StrRef") },
         SemanticType::Container => { unsupported_type!("Container") },
-        SemanticType::Str => { unsupported_type!("Str") },
+        // D2.3b: a `str` is rep (a) — a Ptr to a static {ptr, len} descriptor.
+        // Reuses the struct/array Ptr convention for bindings, params, and
+        // returns. (StrRef stays unsupported — borrowed views are a later step.)
+        SemanticType::Str => Ok(IrType::Ptr),
         SemanticType::Char => { unsupported_type!("Char") },
-        SemanticType::Enum(_) => { unsupported_type!("Enum") },
+        // Tag-only enums (no payloads in 0.3) erase to the u8 tag's IR type
+        // (D2.2). Exhaustiveness is enforced at semantic time, not in the IR.
+        SemanticType::Enum(_) => Ok(IrType::I8),
         SemanticType::TypeParam(_) => { unsupported_type!("TypeParam") },
         SemanticType::Struct(_) => Ok(IrType::Ptr),
         SemanticType::Array(_, _) => Ok(IrType::Ptr),
-        SemanticType::Result(_) => { unsupported_type!("Result") },
+        // D2.4a: a `Result<T>` (Ok(T) | Err(str)) is a packed i128 — tag in the
+        // high 64 (Ok=0/Err=1), payload word in the low 64. Single SSA value,
+        // returnable, heap-free. WORD-PAYLOAD-ONLY: the payload is a scalar or a
+        // static Ptr (Err-str). This rep does NOT generalize to nested/large
+        // payloads — `Result<Result<T>>` (R7-deferred) needs a different rep and
+        // SKIPs at the construct's `widen_payload_to_i64` (do not force it here).
+        SemanticType::Result(_) => Ok(IrType::I128),
         // Void is not a storable type — it is only valid in return position,
         // where `lower_return_type` canonicalises it to `None`.  Letting Void
         // leak into params, block params, locals, or SSA values would violate
@@ -3428,6 +4522,427 @@ fn lower_printn_stmt(
 /// integer widths (I8/I16/I32) and Bool/TBool are widened to I64 at the boundary
 /// via `widen_to_i64_for_print`.  F64, I128, Ptr, Str, and composite types
 /// produce a structured error.
+/// D2.3d: collect one statement's binding NAME → BindingId pairs (recursing into
+/// nested bodies) into the flat interpolation map. Last-wins for repeats.
+fn collect_binding_names_stmt(stmt: &SemanticStmt, map: &mut HashMap<String, BindingId>) {
+    match stmt {
+        SemanticStmt::Decl { binding, name, .. }
+        | SemanticStmt::TypedAssign { binding, name, .. }
+        | SemanticStmt::ConstDecl { binding, name, .. } => {
+            map.insert(name.clone(), *binding);
+        }
+        SemanticStmt::For { binding, var, body, .. } => {
+            map.insert(var.clone(), *binding);
+            for s in body {
+                collect_binding_names_stmt(s, map);
+            }
+        }
+        SemanticStmt::Block { stmts, .. }
+        | SemanticStmt::While { body: stmts, .. }
+        | SemanticStmt::Loop { body: stmts, .. }
+        | SemanticStmt::WhileIn { body: stmts, .. } => {
+            for s in stmts {
+                collect_binding_names_stmt(s, map);
+            }
+        }
+        SemanticStmt::IfElse { then_body, else_ifs, else_body, .. } => {
+            for s in then_body {
+                collect_binding_names_stmt(s, map);
+            }
+            for (_, b) in else_ifs {
+                for s in b {
+                    collect_binding_names_stmt(s, map);
+                }
+            }
+            if let Some(b) = else_body {
+                for s in b {
+                    collect_binding_names_stmt(s, map);
+                }
+            }
+        }
+        SemanticStmt::When { arms, .. } => {
+            for arm in arms {
+                for s in &arm.body {
+                    collect_binding_names_stmt(s, map);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// D2.3d: a `{...}` segment is a bare-variable reference iff its trimmed content
+/// is a non-empty identifier — mirrors runtime/print.rs `is_bare_identifier` (#038).
+fn is_bare_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_alphanumeric() || c == '_')
+}
+
+enum InterpPiece {
+    Lit(String),
+    Ref(String),
+}
+
+/// D2.3d: split an interpolated literal into literal-text and `{identifier}`
+/// pieces, mirroring runtime/print.rs `expand_interpolation` exactly (#038: bare
+/// identifiers only; an unclosed `{` is a literal brace). Returns `None` if a
+/// closed `{...}` is NOT a bare identifier — the interpreter raises
+/// BadInterpolation there, so the JIT SKIPs rather than mis-rendering.
+fn parse_interpolation(s: &str) -> Option<Vec<InterpPiece>> {
+    let mut pieces = Vec::new();
+    let mut lit = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '{' {
+            let mut name = String::new();
+            let mut closed = false;
+            for inner in chars.by_ref() {
+                if inner == '}' {
+                    closed = true;
+                    break;
+                }
+                name.push(inner);
+            }
+            if closed {
+                let trimmed = name.trim();
+                if is_bare_identifier(trimmed) {
+                    if !lit.is_empty() {
+                        pieces.push(InterpPiece::Lit(std::mem::take(&mut lit)));
+                    }
+                    pieces.push(InterpPiece::Ref(trimmed.to_string()));
+                } else {
+                    return None;
+                }
+            } else {
+                lit.push('{');
+                lit.push_str(&name);
+            }
+        } else {
+            lit.push(c);
+        }
+    }
+    if !lit.is_empty() {
+        pieces.push(InterpPiece::Lit(lit));
+    }
+    Some(pieces)
+}
+
+/// D2.3d: pick the no-newline inline print intrinsic for an interpolated value by
+/// its IR type, widening narrow ints to I64 (mirrors `route_print_arg`).
+fn interp_value_print(
+    val: &LoweredValue,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<(ValueId, &'static str), LoweringError> {
+    match val.ty {
+        IrType::I64 => Ok((val.value, "cx_printn_inline")),
+        IrType::I8 | IrType::I16 | IrType::I32 => {
+            let dst = ctx.fresh_value();
+            active.emit(IrInst::Cast {
+                dst,
+                from: val.ty.clone(),
+                to: IrType::I64,
+                value: val.value,
+            })?;
+            Ok((dst, "cx_printn_inline"))
+        }
+        IrType::Bool | IrType::TBool => Ok((val.value, "cx_print_bool_inline")),
+        IrType::F64 => Ok((val.value, "cx_print_f64_inline")),
+        // A Ptr in interpolation is a str descriptor (the only Ptr value a bare
+        // identifier resolves to in practice; composites aren't interpolated).
+        IrType::Ptr => Ok((val.value, "cx_print_str_inline")),
+        _ => Err(LoweringError::UnsupportedSemanticConstruct {
+            construct: format!("string interpolation of unsupported type {:?}", val.ty),
+        }),
+    }
+}
+
+/// D2.3d: lower `print("…{x}…")` as a print SEQUENCE — print-time interpolation,
+/// NO new string built (R6 untouched). Each literal chunk and each resolved `{x}`
+/// prints via a no-newline inline intrinsic; one `cx_print_newline` closes the
+/// line (matching the interpreter's single-newline `print`).
+///
+/// FILED LIMITATION (D2.3d flat map): `{x}` resolves via the function-wide
+/// `binding_names` map (last-wins). This DIVERGES from the interpreter's
+/// scope-correct resolution on two corners — (1) a shadowed name interpolated
+/// after the inner block exits (resolves the inner binding; the interpreter sees
+/// the outer), and (2) use-before-declaration (the interpreter errors #038; the
+/// map resolves a later declaration). No fixture exercises these; it is the
+/// accepted tradeoff tied to the OPEN interpolation-scoping question (a future
+/// scope-threaded map or semantic pre-resolution closes it). A shadowing /
+/// use-before-decl interpolation bug belongs on THIS note, not a fresh mystery.
+fn lower_interpolated_print(
+    s: &str,
+    ctx: &mut LoweringCtx,
+    mut current: ActiveBlock,
+) -> Result<Option<ActiveBlock>, LoweringError> {
+    let pieces = parse_interpolation(s).ok_or_else(|| {
+        LoweringError::UnsupportedSemanticConstruct {
+            construct: "string interpolation with a non-identifier `{...}` not supported"
+                .to_string(),
+        }
+    })?;
+    for piece in &pieces {
+        match piece {
+            InterpPiece::Lit(text) => {
+                let desc = construct_static_str(text, ctx, &mut current)?;
+                current.emit(IrInst::Call {
+                    dst: None,
+                    callee: "cx_print_str_inline".to_string(),
+                    args: vec![desc.value],
+                    return_ty: None,
+                })?;
+            }
+            InterpPiece::Ref(name) => {
+                let binding = ctx.binding_names.get(name).copied().ok_or_else(|| {
+                    LoweringError::UnsupportedSemanticConstruct {
+                        construct: format!("string interpolation: `{}` not resolvable at lowering", name),
+                    }
+                })?;
+                let val = current.bindings.get(&binding).cloned().ok_or_else(|| {
+                    LoweringError::UnsupportedSemanticConstruct {
+                        construct: format!("string interpolation: `{}` not in scope at this print", name),
+                    }
+                })?;
+                let (arg_val, callee) = interp_value_print(&val, ctx, &mut current)?;
+                current.emit(IrInst::Call {
+                    dst: None,
+                    callee: callee.to_string(),
+                    args: vec![arg_val],
+                    return_ty: None,
+                })?;
+            }
+        }
+    }
+    current.emit(IrInst::Call {
+        dst: None,
+        callee: "cx_print_newline".to_string(),
+        args: vec![],
+        return_ty: None,
+    })?;
+    Ok(Some(current))
+}
+
+/// D2.4a: widen a Result payload to the i64 word slot. Scalars sign/zero-extend
+/// via the existing Cast; a Ptr (Err-str descriptor) reinterprets to i64. An
+/// I128 payload (nested Result) is REFUSED — the word-payload rep can't hold it
+/// (R7-deferred); this is the SKIP that fences `Result<Result<T>>`.
+fn widen_payload_to_i64(
+    payload: &LoweredValue,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<ValueId, LoweringError> {
+    match payload.ty {
+        IrType::I64 => Ok(payload.value),
+        IrType::I8 | IrType::I16 | IrType::I32 | IrType::Ptr => {
+            let dst = ctx.fresh_value();
+            active.emit(IrInst::Cast {
+                dst,
+                from: payload.ty.clone(),
+                to: IrType::I64,
+                value: payload.value,
+            })?;
+            Ok(dst)
+        }
+        _ => Err(LoweringError::UnsupportedSemanticConstruct {
+            construct: format!(
+                "Result payload type {:?} exceeds the word-payload slot (nested/large Result is R7-deferred)",
+                payload.ty
+            ),
+        }),
+    }
+}
+
+/// D2.4a: pack a Result tag + payload word into the i128 rep via a MEMORY
+/// round-trip — store payload @0 and tag @8 into a 16-byte slot, then `Load`
+/// the i128. The raw-byte store/load is exactly why a NEGATIVE Ok payload can't
+/// corrupt the tag: its sign bits stay in the payload's 8 bytes, never reaching
+/// the tag's. (Arithmetic packing would `sextend` them into the tag — the bug
+/// this rep avoids.)
+fn result_pack(
+    tag: i128,
+    payload_i64: ValueId,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<LoweredValue, LoweringError> {
+    let slot = ctx.fresh_value();
+    active.emit(IrInst::Alloca { dst: slot, size: 16, align: 16 })?;
+    active.emit(IrInst::Store { ptr: slot, value: payload_i64 })?;
+    let tag_val = ctx.fresh_value();
+    active.emit(IrInst::ConstInt { dst: tag_val, ty: IrType::I64, value: tag })?;
+    let slot8 = ctx.fresh_value();
+    active.emit(IrInst::PtrOffset { dst: slot8, base: slot, offset: 8 })?;
+    active.emit(IrInst::Store { ptr: slot8, value: tag_val })?;
+    let result = ctx.fresh_value();
+    active.emit(IrInst::Load { dst: result, ty: IrType::I128, ptr: slot })?;
+    Ok(LoweredValue { value: result, ty: IrType::I128 })
+}
+
+/// D2.4a: lower `Ok(x)` (tag 0) / `Err("...")` (tag 1) — lower the payload, widen
+/// to the i64 word, pack. Err's str payload is the static D2.3 descriptor Ptr, so
+/// nothing runtime-allocated escapes (R7-clean).
+fn lower_result_construct(
+    tag: i128,
+    payload_expr: &SemanticExpr,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<LoweredValue, LoweringError> {
+    let payload = lower_expr(payload_expr, ctx, active)?;
+    let payload_i64 = widen_payload_to_i64(&payload, ctx, active)?;
+    result_pack(tag, payload_i64, ctx, active)
+}
+
+/// D2.4a: unpack a Result i128 into (tag, payload_word). Payload is the low half
+/// (`Cast I128->I64` = truncate). Tag is the high half, read from its OWN 8 bytes
+/// (store the i128, `Load i64@8`) — so a negative payload's sign bits never reach
+/// the tag.
+fn result_unpack(
+    result: ValueId,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<(ValueId, ValueId), LoweringError> {
+    let payload = ctx.fresh_value();
+    active.emit(IrInst::Cast {
+        dst: payload,
+        from: IrType::I128,
+        to: IrType::I64,
+        value: result,
+    })?;
+    let slot = ctx.fresh_value();
+    active.emit(IrInst::Alloca { dst: slot, size: 16, align: 16 })?;
+    active.emit(IrInst::Store { ptr: slot, value: result })?;
+    let slot8 = ctx.fresh_value();
+    active.emit(IrInst::PtrOffset { dst: slot8, base: slot, offset: 8 })?;
+    let tag = ctx.fresh_value();
+    active.emit(IrInst::Load { dst: tag, ty: IrType::I64, ptr: slot8 })?;
+    Ok((tag, payload))
+}
+
+/// D2.4a: print a static literal chunk inline (no newline) — `construct_static_str`
+/// + `cx_print_str_inline`, reused from the D2.3/D2.3d print machinery.
+fn emit_inline_str(
+    text: &str,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<(), LoweringError> {
+    let desc = construct_static_str(text, ctx, active)?;
+    active.emit(IrInst::Call {
+        dst: None,
+        callee: "cx_print_str_inline".to_string(),
+        args: vec![desc.value],
+        return_ty: None,
+    })?;
+    Ok(())
+}
+
+/// D2.4a: print the Ok payload (the i64 word) by the `Result<T>` Ok type — an
+/// integer T prints via `cx_printn_inline` (the widened word carries the signed
+/// value); a str T reinterprets the word to a descriptor Ptr.
+fn emit_ok_payload(
+    payload: ValueId,
+    ok_ty: &SemanticType,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<(), LoweringError> {
+    match lower_type(ok_ty)? {
+        IrType::I8 | IrType::I16 | IrType::I32 | IrType::I64 => {
+            active.emit(IrInst::Call {
+                dst: None,
+                callee: "cx_printn_inline".to_string(),
+                args: vec![payload],
+                return_ty: None,
+            })?;
+        }
+        IrType::Ptr => {
+            let p = ctx.fresh_value();
+            active.emit(IrInst::Cast { dst: p, from: IrType::I64, to: IrType::Ptr, value: payload })?;
+            active.emit(IrInst::Call {
+                dst: None,
+                callee: "cx_print_str_inline".to_string(),
+                args: vec![p],
+                return_ty: None,
+            })?;
+        }
+        other => {
+            return Err(LoweringError::UnsupportedSemanticConstruct {
+                construct: format!("print of Result<{other:?}> Ok payload not yet supported"),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// D2.4a: print(Result) as a tag-branch print SEQUENCE (no new string built —
+/// R6-style). Unpack → branch on tag; Ok → `Ok(` + payload-by-type + `)`; Err →
+/// `Err(` + the str payload + `)`; one trailing `cx_print_newline`. Matches the
+/// interpreter's `Ok(15)` / `Err(cannot be zero)` byte-for-byte.
+fn lower_result_print(
+    arg_expr: &SemanticExpr,
+    ok_ty: &SemanticType,
+    ctx: &mut LoweringCtx,
+    mut current: ActiveBlock,
+) -> Result<Option<ActiveBlock>, LoweringError> {
+    let result = lower_expr(arg_expr, ctx, &mut current)?;
+    let (tag, payload) = result_unpack(result.value, ctx, &mut current)?;
+    let zero = ctx.fresh_value();
+    current.emit(IrInst::ConstInt { dst: zero, ty: IrType::I64, value: 0 })?;
+    let is_ok = ctx.fresh_value();
+    current.emit(IrInst::Compare { dst: is_ok, op: CompareOp::Eq, lhs: tag, rhs: zero })?;
+
+    let incoming = current.bindings.clone();
+    let mut ok_block = ctx.start_block(vec![], incoming.clone());
+    let ok_id = ok_block.id();
+    let mut err_block = ctx.start_block(vec![], incoming.clone());
+    let err_id = err_block.id();
+    let merge = ctx.start_block(vec![], incoming);
+    let merge_id = merge.id();
+
+    // Seal the decision block first (Ok/Err read `payload` from it).
+    current.terminate(IrTerminator::Branch {
+        cond: is_ok,
+        then_block: ok_id,
+        then_args: vec![],
+        else_block: err_id,
+        else_args: vec![],
+    })?;
+    let old = std::mem::replace(&mut current, merge);
+    ctx.seal_block(old)?;
+
+    // Ok( payload )
+    emit_inline_str("Ok(", ctx, &mut ok_block)?;
+    emit_ok_payload(payload, ok_ty, ctx, &mut ok_block)?;
+    emit_inline_str(")", ctx, &mut ok_block)?;
+    ok_block.terminate(IrTerminator::Jump { target: merge_id, args: vec![] })?;
+    ctx.seal_block(ok_block)?;
+
+    // Err( <str> ) — the Err payload is always a str descriptor Ptr.
+    emit_inline_str("Err(", ctx, &mut err_block)?;
+    let err_ptr = ctx.fresh_value();
+    err_block.emit(IrInst::Cast { dst: err_ptr, from: IrType::I64, to: IrType::Ptr, value: payload })?;
+    err_block.emit(IrInst::Call {
+        dst: None,
+        callee: "cx_print_str_inline".to_string(),
+        args: vec![err_ptr],
+        return_ty: None,
+    })?;
+    emit_inline_str(")", ctx, &mut err_block)?;
+    err_block.terminate(IrTerminator::Jump { target: merge_id, args: vec![] })?;
+    ctx.seal_block(err_block)?;
+
+    // merge: one trailing newline.
+    current.emit(IrInst::Call {
+        dst: None,
+        callee: "cx_print_newline".to_string(),
+        args: vec![],
+        return_ty: None,
+    })?;
+    Ok(Some(current))
+}
+
 fn lower_print_stmt(
     builtin_name: &str,
     args: &[SemanticCallArg],
@@ -3447,6 +4962,53 @@ fn lower_print_stmt(
             });
         }
     };
+    // D2.4a: print(Result) — unpack the packed-i128 and print a tag-branch
+    // sequence (`Ok(..)` / `Err(..)`), no new string built.
+    if let SemanticType::Result(ok_ty) = &arg_expr.ty {
+        return lower_result_print(arg_expr, ok_ty, ctx, current);
+    }
+    // D2.3d: print-time string interpolation — a str LITERAL containing `{…}`
+    // decomposes into a print sequence (literal chunks + resolved `{x}` values +
+    // one trailing newline), building NO new string (R6 untouched). A non-literal
+    // str arg can't hold `{…}` in a lowerable program (the construct would SKIP),
+    // so it falls through to the plain cx_print_str path below.
+    if let SemanticExprKind::Value(SemanticValue::Str(s)) = &arg_expr.kind {
+        if s.contains('{') {
+            return lower_interpolated_print(s, ctx, current);
+        }
+    }
+    // D2.3d: bare f64 print (f64 wasn't routable before) — inline render via
+    // `x.to_string()` + one trailing newline, matching the interpreter's print.
+    if matches!(arg_expr.ty, SemanticType::F64) {
+        let arg = lower_expr(arg_expr, ctx, &mut current)?;
+        current.emit(IrInst::Call {
+            dst: None,
+            callee: "cx_print_f64_inline".to_string(),
+            args: vec![arg.value],
+            return_ty: None,
+        })?;
+        current.emit(IrInst::Call {
+            dst: None,
+            callee: "cx_print_newline".to_string(),
+            args: vec![],
+            return_ty: None,
+        })?;
+        return Ok(Some(current));
+    }
+    // D2.3b: string print — pass the descriptor Ptr to cx_print_str, which reads
+    // (byte ptr, len) from it and writes the bytes + newline (matching the
+    // interpreter's print/println for a string, byte-for-byte). Interpolation
+    // (`{…}`) literals already SKIP at the construct (tracker D2.3d).
+    if matches!(arg_expr.ty, SemanticType::Str) {
+        let arg = lower_expr(arg_expr, ctx, &mut current)?;
+        current.emit(IrInst::Call {
+            dst: None,
+            callee: "cx_print_str".to_string(),
+            args: vec![arg.value],
+            return_ty: None,
+        })?;
+        return Ok(Some(current));
+    }
     let arg = lower_expr(arg_expr, ctx, &mut current)?;
     let (routed_value, callee) = route_print_arg(arg.value, arg.ty.clone(), ctx, &mut current)?
         .ok_or_else(|| LoweringError::UnsupportedSemanticConstruct {
@@ -3530,6 +5092,18 @@ fn lower_assert_eq_stmt(
             });
         }
     };
+
+    // D2.3c: assert_eq on strings — content comparison via cx_str_eq (the same
+    // operand-type dispatch as `==`), then the standard assert branch. (The
+    // existing scalar type check below rejects Ptr, so strings must route here.)
+    if matches!(lhs_expr.ty, SemanticType::Str | SemanticType::StrRef)
+        || matches!(rhs_expr.ty, SemanticType::Str | SemanticType::StrRef)
+    {
+        let lhs = lower_expr(lhs_expr, ctx, &mut current)?;
+        let rhs = lower_expr(rhs_expr, ctx, &mut current)?;
+        let eq = lower_str_eq(Op::EqEq, lhs.value, rhs.value, ctx, &mut current)?;
+        return emit_assert_branch(eq.value, ctx, current);
+    }
 
     let lhs = lower_expr(lhs_expr, ctx, &mut current)?;
     let rhs = lower_expr(rhs_expr, ctx, &mut current)?;
@@ -4964,6 +6538,7 @@ mod tests {
     fn rejects_unsupported_statement() {
         let program = SemanticProgram {
             stmts: vec![SemanticStmt::WhileIn {
+                label: None,
                 arr: "arr".to_string(),
                 start_slot: 0,
                 range_start: int_expr(0, SemanticType::I64),
@@ -4993,6 +6568,7 @@ mod tests {
                 vec![],
                 None,
                 vec![SemanticStmt::WhileIn {
+                    label: None,
                     arr: "arr".to_string(),
                     start_slot: 0,
                     range_start: int_expr(0, SemanticType::I64),
@@ -5563,6 +7139,7 @@ mod tests {
             stmts: vec![if_stmt(
                 bool_expr(true),
                 vec![SemanticStmt::WhileIn {
+                    label: None,
                     arr: "arr".to_string(),
                     start_slot: 0,
                     range_start: int_expr(0, SemanticType::I64),
@@ -5599,6 +7176,7 @@ mod tests {
                     pos_type: 0,
                 },
                 SemanticStmt::While {
+                    label: None,
                     cond: bool_expr(true),
                     body: vec![],
                     pos: 0,
@@ -5632,6 +7210,7 @@ mod tests {
                 vec![],
                 Some(SemanticType::I64),
                 vec![SemanticStmt::While {
+                    label: None,
                     cond: bool_expr(true),
                     body: vec![],
                     pos: 0,
@@ -5658,6 +7237,7 @@ mod tests {
                     pos_type: 0,
                 },
                 SemanticStmt::While {
+                    label: None,
                     cond: bool_expr(true),
                     body: vec![SemanticStmt::Assign {
                         target: SemanticLValue::Binding {
@@ -5685,6 +7265,7 @@ mod tests {
     fn lowers_simple_for_loop() {
         let program = SemanticProgram {
             stmts: vec![SemanticStmt::For {
+                label: None,
                 binding: BindingId(0),
                 var: "i".to_string(),
                 start: int_expr(0, SemanticType::I64),
@@ -5704,6 +7285,7 @@ mod tests {
     fn lowers_inclusive_for_loop() {
         let program = SemanticProgram {
             stmts: vec![SemanticStmt::For {
+                label: None,
                 binding: BindingId(0),
                 var: "i".to_string(),
                 start: int_expr(1, SemanticType::I64),
@@ -5721,12 +7303,13 @@ mod tests {
     fn lowers_for_with_break() {
         let program = SemanticProgram {
             stmts: vec![SemanticStmt::For {
+                label: None,
                 binding: BindingId(0),
                 var: "i".to_string(),
                 start: int_expr(0, SemanticType::I64),
                 end: int_expr(10, SemanticType::I64),
                 inclusive: false,
-                body: vec![SemanticStmt::Break { pos: 0 }],
+                body: vec![SemanticStmt::Break { label: None, pos: 0 }],
                 pos: 0,
             }],
             enums: vec![],
@@ -5738,12 +7321,13 @@ mod tests {
     fn lowers_for_with_continue() {
         let program = SemanticProgram {
             stmts: vec![SemanticStmt::For {
+                label: None,
                 binding: BindingId(0),
                 var: "i".to_string(),
                 start: int_expr(0, SemanticType::I64),
                 end: int_expr(10, SemanticType::I64),
                 inclusive: false,
-                body: vec![SemanticStmt::Continue { pos: 0 }],
+                body: vec![SemanticStmt::Continue { label: None, pos: 0 }],
                 pos: 0,
             }],
             enums: vec![],
@@ -5759,6 +7343,7 @@ mod tests {
                 vec![],
                 Some(SemanticType::I64),
                 vec![SemanticStmt::While {
+                    label: None,
                     cond: bool_expr(true),
                     body: vec![if_stmt(
                         bool_expr(true),
@@ -6895,11 +8480,11 @@ mod tests {
     }
 
     #[test]
-    fn print_f64_arg_returns_unsupported_construct() {
-        // print with an F64 argument must return UnsupportedSemanticConstruct.
-        // Post-widening contract: I8/I16/I32 sign-extend to I64 via Cast and
-        // succeed; Bool/TBool route to cx_print_bool. F64, I128, Str, and
-        // composites are the still-unsupported set the lowering must reject.
+    fn print_f64_arg_lowers_to_inline_plus_newline() {
+        // D2.3d: print with an F64 argument now lowers to cx_print_f64_inline +
+        // cx_print_newline (f64 was previously the still-unsupported set's first
+        // member; I8/I16/I32 still sign-extend to I64; Bool/TBool route to
+        // cx_print_bool).
         let program = SemanticProgram {
             stmts: vec![builtin_stmt(
                 "print",
@@ -6907,15 +8492,26 @@ mod tests {
             )],
             enums: vec![],
         };
-        let err = lower_program(&program).expect_err("lowering should fail for F64 print arg");
+        let module = lower_program(&program).expect("F64 print should lower (D2.3d)");
+        let callees: Vec<&str> = module
+            .functions
+            .iter()
+            .flat_map(|f| f.blocks.iter())
+            .flat_map(|b| b.insts.iter())
+            .filter_map(|inst| match inst {
+                IrInst::Call { callee, .. } => Some(callee.as_str()),
+                _ => None,
+            })
+            .collect();
         assert!(
-            matches!(
-                &err,
-                LoweringError::UnsupportedSemanticConstruct { construct }
-                if construct.contains("F64")
-            ),
-            "expected UnsupportedSemanticConstruct mentioning F64, got: {:?}",
-            err
+            callees.contains(&"cx_print_f64_inline"),
+            "expected a cx_print_f64_inline call, got {:?}",
+            callees
+        );
+        assert!(
+            callees.contains(&"cx_print_newline"),
+            "expected a trailing cx_print_newline call, got {:?}",
+            callees
         );
     }
 

@@ -244,11 +244,13 @@ ExprStmt {
         _pos: usize,
     },
     While {
+        label: Option<String>,
         cond: Expr,
         body: Vec<Stmt>,
         pos: usize,
     },
     For {
+        label: Option<String>,
         var: String,
         start: Expr,
         end: Expr,
@@ -257,13 +259,16 @@ ExprStmt {
         pos: usize,
     },
     Loop {
+        label: Option<String>,
         body: Vec<Stmt>,
         pos: usize,
     },
     Break {
+        label: Option<String>,
         pos: usize,
     },
     Continue {
+        label: Option<String>,
         pos: usize,
     },
     IfElse {
@@ -274,6 +279,7 @@ ExprStmt {
         pos: usize,
     },
     WhileIn {
+        label: Option<String>,
         arr: String,
         start_slot: usize,
         range_start: Expr,

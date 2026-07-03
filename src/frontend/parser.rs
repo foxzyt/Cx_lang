@@ -884,19 +884,33 @@ Stmt::Break { .. } | Stmt::Continue { .. } => {
             .map(|((pos, expr), arms)| Stmt::When { expr, arms, pos })
             .boxed();
 
-        let while_stmt = just(Token::KeywordWhile)
-            .map_with(|_, e: &mut ParseExtra<'a, '_, I>| e.span().start)
+        // labeled-breaks (a): an optional `'name:` prefix on any loop. Absent → None.
+        let loop_label = select! { Token::Label(name) => name }
+            .then_ignore(just(Token::PunctColon))
+            .or_not()
+            .boxed();
+
+        let while_stmt = loop_label
+            .clone()
+            .then(
+                just(Token::KeywordWhile)
+                    .map_with(|_, e: &mut ParseExtra<'a, '_, I>| e.span().start),
+            )
             .then_ignore(just(Token::PunctParenOpen))
             .then(expr.clone())
             .then_ignore(just(Token::PunctParenClose))
             .then_ignore(just(Token::PunctBraceOpen))
             .then(stmt.clone().repeated().collect::<Vec<_>>())
             .then_ignore(just(Token::PunctBraceClose))
-            .map(|((pos, cond), body)| Stmt::While { cond, body, pos })
+            .map(|(((label, pos), cond), body)| Stmt::While { label, cond, body, pos })
             .boxed();
 
-        let while_in_stmt = just(Token::KeywordWhile)
-            .map_with(|_, e: &mut ParseExtra<'a, '_, I>| e.span().start)
+        let while_in_stmt = loop_label
+            .clone()
+            .then(
+                just(Token::KeywordWhile)
+                    .map_with(|_, e: &mut ParseExtra<'a, '_, I>| e.span().start),
+            )
             .then_ignore(just(Token::KeywordIn))
             .then(select! { Token::Identifier(name) => name })
             .then_ignore(just(Token::PunctColon))
@@ -946,8 +960,9 @@ Stmt::Break { .. } | Stmt::Continue { .. } => {
                     .repeated()
                     .collect::<Vec<_>>()
             )
-            .map(|(((((((pos, arr), start_slot), range_start), inclusive), range_end), body), then_chains)| {
+            .map(|((((((((label, pos), arr), start_slot), range_start), inclusive), range_end), body), then_chains)| {
                 Stmt::WhileIn {
+                    label,
                     arr,
                     start_slot,
                     range_start,
@@ -961,8 +976,12 @@ Stmt::Break { .. } | Stmt::Continue { .. } => {
             })
             .boxed();
 
-        let for_stmt = just(Token::KeywordFor)
-            .map_with(|_, e: &mut ParseExtra<'a, '_, I>| e.span().start)
+        let for_stmt = loop_label
+            .clone()
+            .then(
+                just(Token::KeywordFor)
+                    .map_with(|_, e: &mut ParseExtra<'a, '_, I>| e.span().start),
+            )
             .then(ident.clone())
             .then_ignore(just(Token::KeywordIn))
             .then(expr.clone())
@@ -975,7 +994,8 @@ Stmt::Break { .. } | Stmt::Continue { .. } => {
             .then(stmt.clone().repeated().collect::<Vec<_>>())
             .then_ignore(just(Token::PunctBraceClose))
             .map(
-                |(((((pos, var), start), inclusive), end), body)| Stmt::For {
+                |((((((label, pos), var), start), inclusive), end), body)| Stmt::For {
+                    label,
                     var,
                     start,
                     end,
@@ -1024,24 +1044,30 @@ Stmt::Break { .. } | Stmt::Continue { .. } => {
             })
             .boxed();
 
-        let loop_stmt = just(Token::KeywordLoop)
-            .map_with(|_, e: &mut ParseExtra<'a, '_, I>| e.span().start)
+        let loop_stmt = loop_label
+            .clone()
+            .then(
+                just(Token::KeywordLoop)
+                    .map_with(|_, e: &mut ParseExtra<'a, '_, I>| e.span().start),
+            )
             .then_ignore(just(Token::PunctBraceOpen))
             .then(stmt.clone().repeated().collect::<Vec<_>>())
             .then_ignore(just(Token::PunctBraceClose))
-            .map(|(pos, body)| Stmt::Loop { body, pos })
+            .map(|((label, pos), body)| Stmt::Loop { label, body, pos })
             .boxed();
 
         let break_stmt = just(Token::KeywordBreak)
             .map_with(|_, e: &mut ParseExtra<'a, '_, I>| e.span().start)
+            .then(select! { Token::Label(name) => name }.or_not())
             .then_ignore(semi.clone().or_not())
-            .map(|pos| Stmt::Break { pos })
+            .map(|(pos, label)| Stmt::Break { label, pos })
             .boxed();
 
         let continue_stmt = just(Token::KeywordContinue)
             .map_with(|_, e: &mut ParseExtra<'a, '_, I>| e.span().start)
+            .then(select! { Token::Label(name) => name }.or_not())
             .then_ignore(semi.clone().or_not())
-            .map(|pos| Stmt::Continue { pos })
+            .map(|(pos, label)| Stmt::Continue { label, pos })
             .boxed();
 
         let compound_assign = ident

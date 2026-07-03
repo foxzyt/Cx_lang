@@ -288,6 +288,84 @@ extern "C" fn cx_print_bool(b: i8) {
     let _ = writeln!(stdout, "{}", if b != 0 { "true" } else { "false" });
 }
 
+/// Runtime intrinsic: print a string to stdout followed by a newline (D2.3b).
+///
+/// Exported as `cx_print_str`. JIT code calls it via
+/// `Call { callee: "cx_print_str", args: [descriptor_ptr] }` for a `str` argument
+/// to print/println. The argument is the address of a static
+/// `{byte_ptr: i64, byte_len: i64}` descriptor (string rep (a), storage (ii));
+/// this reads both fields and writes the raw bytes followed by a newline,
+/// matching the interpreter's `print_value` for a string byte-for-byte (no
+/// quotes, no escaping). The descriptor and its bytes are leaked `&'static` at
+/// lowering, so the address is valid for the process lifetime (JIT-only).
+extern "C" fn cx_print_str(descriptor: *const i64) {
+    use std::io::{self, Write};
+    // SAFETY: `descriptor` points at a leaked `&'static [i64; 2]` whose first
+    // slot is the (also leaked) byte pointer and second is the byte length.
+    let (ptr, len) = unsafe { (*descriptor as *const u8, *descriptor.add(1) as usize) };
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    let mut stdout = io::stdout().lock();
+    let _ = stdout.write_all(bytes);
+    let _ = stdout.write_all(b"\n");
+}
+
+/// Runtime intrinsic: content equality of two strings (D2.3c).
+///
+/// Exported as `cx_str_eq`. JIT code calls it via
+/// `Call { callee: "cx_str_eq", args: [a_descriptor, b_descriptor], return_ty: Bool }`
+/// for `str == str` / `str != str` / `assert_eq` on strings. Each argument is the
+/// address of a static `{byte_ptr: i64, byte_len: i64}` descriptor; this returns
+/// 1 iff the lengths match and the bytes are equal (length-check then memcmp),
+/// matching the interpreter's content equality. Returns an i8 Bool (0/1).
+extern "C" fn cx_str_eq(a: *const i64, b: *const i64) -> i8 {
+    // SAFETY: both args are leaked `&'static` descriptors (see cx_print_str).
+    let (pa, la) = unsafe { (*a as *const u8, *a.add(1) as usize) };
+    let (pb, lb) = unsafe { (*b as *const u8, *b.add(1) as usize) };
+    if la != lb {
+        return 0;
+    }
+    let sa = unsafe { std::slice::from_raw_parts(pa, la) };
+    let sb = unsafe { std::slice::from_raw_parts(pb, lb) };
+    i8::from(sa == sb)
+}
+
+// D2.3d inline (no-newline) print intrinsics for print-time string interpolation.
+// The interpolation lowering emits a sequence of these (literal chunks + resolved
+// values) followed by ONE `cx_print_newline`, matching the interpreter's
+// single-newline `print`. The existing newline-adding intrinsics are unchanged —
+// normal (non-interpolated) print keeps using them.
+
+extern "C" fn cx_print_str_inline(descriptor: *const i64) {
+    use std::io::{self, Write};
+    // SAFETY: leaked `&'static` descriptor (see cx_print_str).
+    let (ptr, len) = unsafe { (*descriptor as *const u8, *descriptor.add(1) as usize) };
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    let _ = io::stdout().lock().write_all(bytes);
+}
+
+extern "C" fn cx_printn_inline(n: i64) {
+    use std::io::{self, Write};
+    let _ = write!(io::stdout().lock(), "{n}");
+}
+
+extern "C" fn cx_print_bool_inline(b: i8) {
+    use std::io::{self, Write};
+    let _ = write!(io::stdout().lock(), "{}", if b != 0 { "true" } else { "false" });
+}
+
+/// f64 rendered via Rust's `Display` (`x.to_string()`), matching the
+/// interpreter's `value_to_string(Float)` byte-for-byte (3.14 -> "3.14",
+/// 2.0 -> "2").
+extern "C" fn cx_print_f64_inline(x: f64) {
+    use std::io::{self, Write};
+    let _ = write!(io::stdout().lock(), "{x}");
+}
+
+extern "C" fn cx_print_newline() {
+    use std::io::{self, Write};
+    let _ = io::stdout().lock().write_all(b"\n");
+}
+
 /// Backend-private symbol name for the F64 remainder host helper.
 ///
 /// Using a mangled name (double-underscore prefix) keeps it out of the user-visible namespace.
@@ -305,6 +383,40 @@ const JIT_F64_REM_SYMBOL: &str = "__cx_fmod";
 #[cfg(feature = "jit")]
 extern "C" fn host_fmod(a: f64, b: f64) -> f64 {
     a % b
+}
+
+/// Backend-private symbol name for the clean-exit trap host helper (Gate-1b0).
+const JIT_TRAP_SYMBOL: &str = "cx_trap";
+
+/// Process exit code for a JIT runtime trap. Reuses the documented
+/// [`JitExitCode::JIT_RUNTIME_FAILURE`] convention (126). Deliberately NOT 127
+/// ([`JitExitCode::UNSUPPORTED_CONSTRUCT`] / `JIT_SKIP_EXIT_CODE`), so the parity
+/// harness can never misclassify a runtime trap as a codegen SKIP, and NOT 0, so
+/// expected-fail fixtures see a clean rejection.
+#[cfg(feature = "jit")]
+const JIT_TRAP_EXIT_CODE: i32 = 126;
+
+/// Runtime intrinsic: the clean-exit path for `IrTerminator::Trap` (Gate-1b0).
+///
+/// Before this, `Trap` lowered to a bare Cranelift `trap` (`ud2`). Because
+/// `main` is invoked by a raw transmute+call with no host exception handler
+/// (see `execute`), that hardware trap was unhandled and the process died with
+/// STATUS_STACK_OVERFLOW (0xC00000FD) instead of the documented clean exit — so
+/// every failing `assert`/`assert_eq` and unmatched `when` crashed the JIT.
+///
+/// Routing `Trap` through this host call (the `cx_printn` import mechanism, not
+/// platform exception handling) gives a clean, deterministic process exit. The
+/// message goes to stderr (never stdout) so output-verified fixtures are
+/// unaffected; exact-message parity with the interpreter is not required (the
+/// parity harness only checks for a non-zero exit on expected-fail fixtures).
+#[cfg(feature = "jit")]
+extern "C" fn cx_trap() -> ! {
+    use std::io::Write;
+    let _ = writeln!(
+        std::io::stderr(),
+        "cx: runtime trap (assertion failed or non-exhaustive `when`)"
+    );
+    std::process::exit(JIT_TRAP_EXIT_CODE);
 }
 
 pub struct HostBoundary;
@@ -339,6 +451,14 @@ impl HostBoundary {
             .map_err(|e| JitExecutionError::CodegenFailure {
                 detail: e.to_string(),
             })?;
+        // D2.4a: the packed-i128 Result rep is returned by value from functions.
+        // Cranelift's x64 ABI rejects i128 args/returns unless this extension is
+        // enabled (cranelift-codegen x64/abi.rs).
+        flag_builder
+            .set("enable_llvm_abi_extensions", "true")
+            .map_err(|e| JitExecutionError::CodegenFailure {
+                detail: e.to_string(),
+            })?;
         let flags = settings::Flags::new(flag_builder);
         let isa = cranelift_native::builder()
             .map_err(|s| JitExecutionError::CodegenFailure {
@@ -354,7 +474,15 @@ impl HostBoundary {
             JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
         jit_builder.symbol("cx_printn", cx_printn as *const u8);
         jit_builder.symbol("cx_print_bool", cx_print_bool as *const u8);
+        jit_builder.symbol("cx_print_str", cx_print_str as *const u8);
+        jit_builder.symbol("cx_str_eq", cx_str_eq as *const u8);
+        jit_builder.symbol("cx_print_str_inline", cx_print_str_inline as *const u8);
+        jit_builder.symbol("cx_printn_inline", cx_printn_inline as *const u8);
+        jit_builder.symbol("cx_print_bool_inline", cx_print_bool_inline as *const u8);
+        jit_builder.symbol("cx_print_f64_inline", cx_print_f64_inline as *const u8);
+        jit_builder.symbol("cx_print_newline", cx_print_newline as *const u8);
         jit_builder.symbol(JIT_F64_REM_SYMBOL, host_fmod as *const u8);
+        jit_builder.symbol(JIT_TRAP_SYMBOL, cx_trap as *const u8);
         let mut module = JITModule::new(jit_builder);
 
         // Pass 1: declare every user-defined function AND runtime intrinsics into
@@ -392,6 +520,80 @@ impl HostBoundary {
             func_id_map.insert("cx_print_bool".to_string(), id);
         }
 
+        // cx_print_str(ptr) — Str routes here; the single argument is the address
+        // of the static {byte_ptr, byte_len} descriptor (D2.3b). Ptr lowers to
+        // cranelift types::I64.
+        {
+            use cranelift_codegen::ir::{types, AbiParam};
+            let call_conv = module.target_config().default_call_conv;
+            let mut sig = cranelift_codegen::ir::Signature::new(call_conv);
+            sig.params.push(AbiParam::new(types::I64));
+            let id = module
+                .declare_function("cx_print_str", Linkage::Import, &sig)
+                .map_err(|e| JitExecutionError::CodegenFailure {
+                    detail: e.to_string(),
+                })?;
+            func_id_map.insert("cx_print_str".to_string(), id);
+        }
+
+        // cx_str_eq(a_descriptor, b_descriptor) -> Bool(I8) — string content
+        // equality (D2.3c): two descriptor-address params, an i8 (0/1) result.
+        {
+            use cranelift_codegen::ir::{types, AbiParam};
+            let call_conv = module.target_config().default_call_conv;
+            let mut sig = cranelift_codegen::ir::Signature::new(call_conv);
+            sig.params.push(AbiParam::new(types::I64));
+            sig.params.push(AbiParam::new(types::I64));
+            sig.returns.push(AbiParam::new(types::I8));
+            let id = module
+                .declare_function("cx_str_eq", Linkage::Import, &sig)
+                .map_err(|e| JitExecutionError::CodegenFailure {
+                    detail: e.to_string(),
+                })?;
+            func_id_map.insert("cx_str_eq".to_string(), id);
+        }
+
+        // D2.3d no-newline inline print intrinsics for string interpolation.
+        {
+            use cranelift_codegen::ir::{types, AbiParam};
+            let call_conv = module.target_config().default_call_conv;
+            // single-I64-param, void: descriptor-ptr (str) and integer prints.
+            for name in ["cx_print_str_inline", "cx_printn_inline"] {
+                let mut sig = cranelift_codegen::ir::Signature::new(call_conv);
+                sig.params.push(AbiParam::new(types::I64));
+                let id = module
+                    .declare_function(name, Linkage::Import, &sig)
+                    .map_err(|e| JitExecutionError::CodegenFailure { detail: e.to_string() })?;
+                func_id_map.insert(name.to_string(), id);
+            }
+            // cx_print_bool_inline(i8)
+            {
+                let mut sig = cranelift_codegen::ir::Signature::new(call_conv);
+                sig.params.push(AbiParam::new(types::I8));
+                let id = module
+                    .declare_function("cx_print_bool_inline", Linkage::Import, &sig)
+                    .map_err(|e| JitExecutionError::CodegenFailure { detail: e.to_string() })?;
+                func_id_map.insert("cx_print_bool_inline".to_string(), id);
+            }
+            // cx_print_f64_inline(f64)
+            {
+                let mut sig = cranelift_codegen::ir::Signature::new(call_conv);
+                sig.params.push(AbiParam::new(types::F64));
+                let id = module
+                    .declare_function("cx_print_f64_inline", Linkage::Import, &sig)
+                    .map_err(|e| JitExecutionError::CodegenFailure { detail: e.to_string() })?;
+                func_id_map.insert("cx_print_f64_inline".to_string(), id);
+            }
+            // cx_print_newline() — no params, void.
+            {
+                let sig = cranelift_codegen::ir::Signature::new(call_conv);
+                let id = module
+                    .declare_function("cx_print_newline", Linkage::Import, &sig)
+                    .map_err(|e| JitExecutionError::CodegenFailure { detail: e.to_string() })?;
+                func_id_map.insert("cx_print_newline".to_string(), id);
+            }
+        }
+
         // Pre-declare __cx_fmod(f64, f64) -> f64 for F64 Rem lowering.
         // Uses JIT_F64_REM_SYMBOL ("__cx_fmod") to avoid colliding with any user-defined
         // function named "fmod" in the Cx program.
@@ -408,6 +610,19 @@ impl HostBoundary {
                     detail: e.to_string(),
                 })?;
             func_id_map.insert(JIT_F64_REM_SYMBOL.to_string(), id);
+        }
+
+        // Pre-declare cx_trap() -> ! (Gate-1b0): the clean-exit path for Trap.
+        // No params, no returns — it never returns (process::exit).
+        {
+            let call_conv = module.target_config().default_call_conv;
+            let sig = cranelift_codegen::ir::Signature::new(call_conv);
+            let id = module
+                .declare_function(JIT_TRAP_SYMBOL, Linkage::Import, &sig)
+                .map_err(|e| JitExecutionError::CodegenFailure {
+                    detail: e.to_string(),
+                })?;
+            func_id_map.insert(JIT_TRAP_SYMBOL.to_string(), id);
         }
 
         for ir_func in &ir.functions {
@@ -938,6 +1153,12 @@ fn compile_ir_function(
                 IrInst::Cast { dst, from, to, value } => {
                     // Reject Ptr and Void — neither has a meaningful scalar cast path.
                     match (from, to) {
+                        // D2.3b: I64 ↔ Ptr is a no-op reinterpret — both map to
+                        // cranelift `types::I64`, so this materializes a baked
+                        // string-descriptor address as a Ptr (string rep (a)). It
+                        // falls through to the `from_cl == to_cl` alias path below.
+                        // All other Ptr casts stay unsupported (no scalar equivalent).
+                        (IrType::I64, IrType::Ptr) | (IrType::Ptr, IrType::I64) => {}
                         (IrType::Ptr, _) | (_, IrType::Ptr) => {
                             return Err(JitExecutionError::UnsupportedConstruct {
                                 construct: format!(
@@ -1086,9 +1307,21 @@ fn compile_ir_function(
             }
             IrTerminator::Trap => {
                 use cranelift_codegen::ir::TrapCode;
-                // User trap code 1 = assertion failure.
-                // TrapCode::unwrap_user panics at compile time if the code is 0 or reserved;
-                // code 1 is always valid (reserved range starts at 251).
+                // Gate-1b0: route every Trap (assert/assert_eq failure,
+                // non-exhaustive `when`) through the cx_trap host callback so it
+                // exits cleanly (code 126) instead of a bare Cranelift `trap`,
+                // which stack-overflowed because no host exception handler wraps
+                // `main_fn()`. cx_trap is `-> !` (process::exit), so it never
+                // returns; the trailing `trap` below is an unreachable terminator
+                // that satisfies Cranelift's block-termination rule and can never
+                // fire (the process has already exited).
+                let cx_trap_id = *func_id_map.get(JIT_TRAP_SYMBOL).ok_or_else(|| {
+                    JitExecutionError::CodegenFailure {
+                        detail: "cx_trap intrinsic not declared in func_id_map".to_string(),
+                    }
+                })?;
+                let func_ref = module.declare_func_in_func(cx_trap_id, builder.func);
+                builder.ins().call(func_ref, &[]);
                 builder.ins().trap(TrapCode::unwrap_user(1));
             }
         }
@@ -1496,8 +1729,9 @@ mod jit_tests {
 
     #[test]
     fn jit_unsupported_inst_returns_error() {
-        // Cast from Ptr is explicitly unsupported and must return UnsupportedConstruct.
-        // Ptr casts have no scalar equivalent in Cx and are rejected at the JIT boundary.
+        // Cast from Ptr to a non-I64 type is unsupported and must return
+        // UnsupportedConstruct. (I64 ↔ Ptr is a no-op reinterpret allowed since
+        // D2.3b; Ptr ↔ narrower/other types have no scalar equivalent.)
         let module = IrModule {
             debug_name: "test_unsupported".to_string(),
             functions: vec![IrFunction {
@@ -1512,7 +1746,7 @@ mod jit_tests {
                         IrInst::Cast {
                             dst: ValueId(1),
                             from: IrType::Ptr,
-                            to: IrType::I64,
+                            to: IrType::I32,
                             value: ValueId(0),
                         },
                     ],

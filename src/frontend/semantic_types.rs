@@ -37,6 +37,23 @@ pub enum SemanticType {
     Void,
 }
 
+impl SemanticType {
+    /// Map a signed-integer type to its [`IntWidth`] facts key (tracker D1.1),
+    /// or `None` for any non-integer type. The single mapping the frontend
+    /// range-check and the runtime cast both consult.
+    pub fn int_width(&self) -> Option<crate::frontend::int_facts::IntWidth> {
+        use crate::frontend::int_facts::IntWidth;
+        match self {
+            SemanticType::I8 => Some(IntWidth::W8),
+            SemanticType::I16 => Some(IntWidth::W16),
+            SemanticType::I32 => Some(IntWidth::W32),
+            SemanticType::I64 => Some(IntWidth::W64),
+            SemanticType::I128 => Some(IntWidth::W128),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum SemanticValue {
     Num(i128),
@@ -336,11 +353,15 @@ ExprStmt {
         pos: usize,
     },
     While {
+        // labeled-breaks (b): this loop's own label, or None. Read by both backends
+        // to match a labeled break/continue against the loop it targets.
+        label: Option<String>,
         cond: SemanticExpr,
         body: Vec<SemanticStmt>,
         pos: usize,
     },
     For {
+        label: Option<String>,
         binding: BindingId,
         var: String,
         start: SemanticExpr,
@@ -350,13 +371,18 @@ ExprStmt {
         pos: usize,
     },
     Loop {
+        label: Option<String>,
         body: Vec<SemanticStmt>,
         pos: usize,
     },
     Break {
+        // labeled-breaks (a): the target loop label, or None for an unlabeled
+        // break. Validated semantically here; execution is wired in commit (b).
+        label: Option<String>,
         pos: usize,
     },
     Continue {
+        label: Option<String>,
         pos: usize,
     },
     IfElse {
@@ -367,6 +393,7 @@ ExprStmt {
         pos: usize,
     },
     WhileIn {
+        label: Option<String>,
         arr: String,
         start_slot: usize,
         range_start: SemanticExpr,

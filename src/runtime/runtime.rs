@@ -172,14 +172,15 @@ pub(crate) fn value_to_string(rt: &RunTime, v: Value) -> String {
 pub(crate) fn apply_numeric_cast(val: Value, to: &SemanticType) -> Value {
     match val {
         Value::Num(n) => {
-            let truncated = match to {
-                SemanticType::I8   => (n as i8) as i128,
-                SemanticType::I16  => (n as i16) as i128,
-                SemanticType::I32  => (n as i32) as i128,
-                SemanticType::I64  => (n as i64) as i128,
-                SemanticType::I128 => n,
-                SemanticType::F64  => return Value::Float(n as f64),
-                _ => n,
+            // Integer narrowing comes from the one facts table (tracker D1.1):
+            // `width.truncate(n)` is the same `n as iN as i128` this match wrote
+            // inline. F64 and non-numeric targets keep their existing behavior.
+            let truncated = match to.int_width() {
+                Some(width) => width.truncate(n),
+                None => match to {
+                    SemanticType::F64 => return Value::Float(n as f64),
+                    _ => n,
+                },
             };
             Value::Num(truncated)
         }
