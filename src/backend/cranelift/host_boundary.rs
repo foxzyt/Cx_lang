@@ -366,6 +366,45 @@ extern "C" fn cx_print_newline() {
     let _ = io::stdout().lock().write_all(b"\n");
 }
 
+/// D2.5a: the Handle registry, reachable from JIT-compiled code via the
+/// `cx_handle_new` host callback below. Unlike every prior host callback
+/// (`cx_print_str`, `cx_str_eq`, ...), this one needs MUTABLE state that
+/// persists across multiple calls within one execution — the JIT investigation
+/// found `jit_builder.symbol()` registers by raw function pointer, so a closure
+/// capturing state is not an option; a process-lifetime `static` is the only
+/// mechanism available.
+///
+/// Payload type is `i64`: the packed word for a scalar Handle payload (D2.5a
+/// scope is `{I8, I16, I32, I64, Bool}` only — see `HandleNew` lowering).
+///
+/// SAFETY OF THE SHARED-PROCESS ASSUMPTION: this assumes exactly one
+/// `execute()` call per process. Verified true today — `run_jit_subprocess`
+/// (diff_harness.rs) spawns a fresh OS process per fixture, so a plain static
+/// never leaks state between programs. If the execution model ever changes
+/// (e.g. multiple programs run in one long-lived process), this registry MUST
+/// be reset at the start of `execute()` — it is not reset today because it
+/// does not need to be.
+static HANDLES: std::sync::OnceLock<std::sync::Mutex<crate::runtime::handle::HandleRegistry<i64>>> =
+    std::sync::OnceLock::new();
+
+/// Runtime intrinsic: construct a Handle (D2.5a).
+///
+/// Exported as `cx_handle_new`. JIT code calls it via
+/// `Call { callee: "cx_handle_new", args: [payload_i64], return_ty: Some(I64) }`
+/// for `Handle.new(v)` where `v`'s real lowered type is scalar/word-sized (the
+/// `HandleNew` lowering guard enforces this — Ptr and F64 never reach here).
+/// Inserts `payload` into the shared registry and packs the resulting
+/// `Handle{slot,gen}` (two u32s, both unsigned — no sign-extension risk, unlike
+/// Result's i128 pack) into a single i64: `slot | (gen << 32)`.
+extern "C" fn cx_handle_new(payload: i64) -> i64 {
+    let registry = HANDLES.get_or_init(|| std::sync::Mutex::new(crate::runtime::handle::HandleRegistry::new()));
+    let handle = registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(payload);
+    (handle.slot as i64) | ((handle.gen as i64) << 32)
+}
+
 /// Backend-private symbol name for the F64 remainder host helper.
 ///
 /// Using a mangled name (double-underscore prefix) keeps it out of the user-visible namespace.
@@ -483,6 +522,7 @@ impl HostBoundary {
         jit_builder.symbol("cx_print_newline", cx_print_newline as *const u8);
         jit_builder.symbol(JIT_F64_REM_SYMBOL, host_fmod as *const u8);
         jit_builder.symbol(JIT_TRAP_SYMBOL, cx_trap as *const u8);
+        jit_builder.symbol("cx_handle_new", cx_handle_new as *const u8);
         let mut module = JITModule::new(jit_builder);
 
         // Pass 1: declare every user-defined function AND runtime intrinsics into
@@ -623,6 +663,22 @@ impl HostBoundary {
                     detail: e.to_string(),
                 })?;
             func_id_map.insert(JIT_TRAP_SYMBOL.to_string(), id);
+        }
+
+        // cx_handle_new(i64) -> i64 (D2.5a): one scalar payload word in, one
+        // packed Handle{slot,gen} word out.
+        {
+            use cranelift_codegen::ir::{types, AbiParam};
+            let call_conv = module.target_config().default_call_conv;
+            let mut sig = cranelift_codegen::ir::Signature::new(call_conv);
+            sig.params.push(AbiParam::new(types::I64));
+            sig.returns.push(AbiParam::new(types::I64));
+            let id = module
+                .declare_function("cx_handle_new", Linkage::Import, &sig)
+                .map_err(|e| JitExecutionError::CodegenFailure {
+                    detail: e.to_string(),
+                })?;
+            func_id_map.insert("cx_handle_new".to_string(), id);
         }
 
         for ir_func in &ir.functions {

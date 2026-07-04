@@ -2044,7 +2044,7 @@ fn lower_expr(
         SemanticExprKind::DotAccess { binding, container, field, struct_name } => {
             lower_dot_access(binding, container, field, struct_name, &expr.ty, ctx, active)
         }
-        SemanticExprKind::HandleNew { .. } => { unsupported!("HandleNew") },
+        SemanticExprKind::HandleNew { value, .. } => lower_handle_new(value, ctx, active),
         SemanticExprKind::HandleVal { .. } => { unsupported!("HandleVal") },
         SemanticExprKind::HandleDrop { .. } => { unsupported!("HandleDrop") },
         SemanticExprKind::Range { .. } => {
@@ -4355,7 +4355,15 @@ fn lower_type(ty: &SemanticType) -> Result<IrType, LoweringError> {
         SemanticType::Bool => Ok(IrType::Bool),
         SemanticType::Numeric => { unsupported_type!("Numeric") },
         SemanticType::Unknown => { unsupported_type!("Unknown") },
-        SemanticType::Handle(_) => { unsupported_type!("Handle") },
+        // D2.5a: Handle{slot,gen} (two u32s, unsigned) packs into a single i64
+        // (`slot | (gen << 32)`, no sign-extension risk — unlike Result's i128,
+        // no enable_llvm_abi_extensions flag is needed for i64 returns/params).
+        // The semantic layer's declared/inferred inner T is hardcoded to I128
+        // regardless of the real construct-site payload (Finding 1, tracked, not
+        // fixed here) — but that's irrelevant to THIS mapping: a Handle is an
+        // opaque reference into the registry, never an inline T, so the OUTER
+        // Handle(_) always lowers to I64 no matter what the ignored inner claims.
+        SemanticType::Handle(_) => Ok(IrType::I64),
         SemanticType::StrRef => { unsupported_type!("StrRef") },
         SemanticType::Container => { unsupported_type!("Container") },
         // D2.3b: a `str` is rep (a) — a Ptr to a static {ptr, len} descriptor.
@@ -4755,6 +4763,75 @@ fn widen_payload_to_i64(
             ),
         }),
     }
+}
+
+/// D2.5a: widen a Handle payload to the i64 word `cx_handle_new` takes. Scope is
+/// DELIBERATELY narrower than Result's `widen_payload_to_i64` — scalars only,
+/// `{I8, I16, I32, I64, Bool}` — with two exclusions that are NOT mere gaps:
+///
+/// - `Ptr` (this includes `str`, whose rep is a descriptor Ptr) is excluded even
+///   though it's mechanically word-fittable: the semantic layer's `Handle<T>`
+///   claim is hardcoded to I128 regardless of the real payload (Finding 1), so a
+///   later `.val` read site has no way to know a returned i64 is "a raw scalar"
+///   vs. "a Ptr to a string descriptor" — accepting Ptr here would silently set
+///   up that landmine for D2.5b to trip over.
+/// - `F64` is excluded because it's actively unsafe with this mechanism, not
+///   just unsupported: `Cast(F64->I64)` lowers to `fcvt_to_sint_sat` (a NUMERIC
+///   float-to-int conversion), which would silently store the integer part of
+///   the float (e.g. `3` for `3.14`) instead of preserving its bits.
+///
+/// `Bool` widens via the same `Cast` the backend already uses for Bool/TBool
+/// widening (`uextend`, zero-extension — no sign-extension risk, confirmed in
+/// the D2.5a investigation even though Result's own helper never exercised it).
+fn widen_handle_payload_to_i64(
+    payload: &LoweredValue,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<ValueId, LoweringError> {
+    match payload.ty {
+        IrType::I64 => Ok(payload.value),
+        IrType::I8 | IrType::I16 | IrType::I32 | IrType::Bool => {
+            let dst = ctx.fresh_value();
+            active.emit(IrInst::Cast {
+                dst,
+                from: payload.ty.clone(),
+                to: IrType::I64,
+                value: payload.value,
+            })?;
+            Ok(dst)
+        }
+        _ => Err(LoweringError::UnsupportedSemanticConstruct {
+            construct: format!(
+                "Handle payload type {:?} is not a scalar D2.5a supports (Ptr/str would recreate Finding 1's landmine; F64 would corrupt via fcvt_to_sint_sat; TBool/Result/nested Handle are separately deferred)",
+                payload.ty
+            ),
+        }),
+    }
+}
+
+/// D2.5a: lower `Handle.new(v)` — CONSTRUCT ONLY (`.val`/`.drop` land in D2.5b,
+/// which have their own open question: a bare-identifier read site has no
+/// data-flow back to the `.new` that produced it, unlike this construct site,
+/// which can inspect its own inner expression's real lowered type directly).
+/// Widens `v`'s real lowered type (never the semantic layer's hardcoded
+/// `Handle<I128>` claim) via `widen_handle_payload_to_i64`, calls the stateful
+/// `cx_handle_new` host callback, and returns the packed `Handle{slot,gen}` i64.
+/// A non-scalar payload rejects cleanly (SKIP) rather than miscompiling.
+fn lower_handle_new(
+    value: &SemanticExpr,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<LoweredValue, LoweringError> {
+    let payload = lower_expr(value, ctx, active)?;
+    let widened = widen_handle_payload_to_i64(&payload, ctx, active)?;
+    let dst = ctx.fresh_value();
+    active.emit(IrInst::Call {
+        dst: Some(dst),
+        callee: "cx_handle_new".to_string(),
+        args: vec![widened],
+        return_ty: Some(IrType::I64),
+    })?;
+    Ok(LoweredValue { value: dst, ty: IrType::I64 })
 }
 
 /// D2.4a: pack a Result tag + payload word into the i128 rep via a MEMORY
@@ -5728,7 +5805,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_handle_type() {
+    fn rejects_handle_type_mismatch() {
+        // D2.5a: Handle now lowers (SemanticType::Handle(_) -> IrType::I64), so
+        // this is no longer "Handle types are unsupported" (renamed from
+        // rejects_handle_type) -- it's a genuine type mismatch: a Handle-typed
+        // binding's rep is I64 (the packed slot+gen word from Handle.new /
+        // cx_handle_new), and a raw Bool literal is a different IR type, not a
+        // real Handle value. The rejection reason correctly shifted from
+        // UnsupportedSemanticType to a type-mismatch InternalInvariantViolation.
         let program = SemanticProgram {
             stmts: vec![typed_assign(
                 BindingId(0),
@@ -5740,9 +5824,9 @@ mod tests {
         };
 
         assert_eq!(
-            lower_program(&program).expect_err("lowering should reject unsupported type"),
-            LoweringError::UnsupportedSemanticType {
-                ty: "Handle".to_string()
+            lower_program(&program).expect_err("lowering should reject the type mismatch"),
+            LoweringError::InternalInvariantViolation {
+                detail: "typed assignment type mismatch after semantic analysis: expected I64, got Bool".to_string()
             }
         );
     }
