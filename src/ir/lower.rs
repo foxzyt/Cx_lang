@@ -2045,7 +2045,7 @@ fn lower_expr(
             lower_dot_access(binding, container, field, struct_name, &expr.ty, ctx, active)
         }
         SemanticExprKind::HandleNew { value, .. } => lower_handle_new(value, ctx, active),
-        SemanticExprKind::HandleVal { .. } => { unsupported!("HandleVal") },
+        SemanticExprKind::HandleVal { binding, name, .. } => lower_handle_val(*binding, name, ctx, active),
         SemanticExprKind::HandleDrop { .. } => { unsupported!("HandleDrop") },
         SemanticExprKind::Range { .. } => {
             return Err(LoweringError::UnsupportedSemanticConstruct {
@@ -4832,6 +4832,92 @@ fn lower_handle_new(
         return_ty: Some(IrType::I64),
     })?;
     Ok(LoweredValue { value: dst, ty: IrType::I64 })
+}
+
+/// D2.5b: lower `h.val` — READ. Investigation-confirmed finding: the semantic
+/// layer's `HandleVal` claim is hardcoded to `SemanticType::I128` (same landmine
+/// as `HandleNew`'s outer-Handle claim), but UNLIKE the construct site, this
+/// claim is NOT protected by a T-blind `lower_type` collapse — every reachable
+/// consumer (untyped assign, typed-narrowing assign via a semantic-layer-inserted
+/// `Cast{from: I128, ...}`, a direct `I128`-typed assign) strictly requires
+/// `ensure_type_match` to see an ACTUAL `IrType::I128` value here — there is no
+/// cast-insertion anywhere downstream to paper over a bare i64. So this produces
+/// a genuine I128, not a raw i64: read the packed-i64 payload via the stateful
+/// `cx_handle_val` host callback, branch on its out-parameter validity flag
+/// (Trap on invalid — mirrors the interpreter's `RuntimeError::StaleHandle`,
+/// deterministic and non-panicking, not byte-identical text), then widen the
+/// payload to I128 via the same generic `Cast` (sign-extend) D2.5a's
+/// `widen_handle_payload_to_i64` uses in reverse. Sign-extension composes
+/// correctly across the two widening stages (I64 was itself sign/zero-extended
+/// from the original scalar in `HandleNew`) — a Bool's 0/1 value is always
+/// non-negative, so a second-stage sextend is bit-identical to a uextend for it.
+fn lower_handle_val(
+    binding: BindingId,
+    name: &str,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<LoweredValue, LoweringError> {
+    let handle_val = active.bindings.get(&binding).cloned().ok_or_else(|| {
+        LoweringError::InternalInvariantViolation {
+            detail: format!(
+                "HandleVal: binding '{name}' ({}) not found in scope",
+                binding.0
+            ),
+        }
+    })?;
+
+    // Out-parameter: a scratch i8 slot (Result's proven Alloca/Store/Load
+    // pattern, reused for a 1-byte out-param instead of a 16-byte round-trip).
+    let out_valid_slot = ctx.fresh_value();
+    active.emit(IrInst::Alloca { dst: out_valid_slot, size: 1, align: 1 })?;
+
+    let payload = ctx.fresh_value();
+    active.emit(IrInst::Call {
+        dst: Some(payload),
+        callee: "cx_handle_val".to_string(),
+        args: vec![handle_val.value, out_valid_slot],
+        return_ty: Some(IrType::I64),
+    })?;
+
+    let valid = ctx.fresh_value();
+    active.emit(IrInst::Load { dst: valid, ty: IrType::I8, ptr: out_valid_slot })?;
+    let zero = ctx.fresh_value();
+    active.emit(IrInst::ConstInt { dst: zero, ty: IrType::I8, value: 0 })?;
+    let is_valid = ctx.fresh_value();
+    active.emit(IrInst::Compare { dst: is_valid, op: CompareOp::Ne, lhs: valid, rhs: zero })?;
+
+    let incoming = active.bindings.clone();
+    let cont_block = ctx.start_block(vec![], incoming.clone());
+    let cont_id = cont_block.id();
+    let mut trap_block = ctx.start_block(vec![], incoming);
+    let trap_id = trap_block.id();
+
+    // Seal the decision block first (lower_try's pattern): the continuation
+    // reads `payload`, defined here, dominating both edges.
+    active.terminate(IrTerminator::Branch {
+        cond: is_valid,
+        then_block: cont_id,
+        then_args: vec![],
+        else_block: trap_id,
+        else_args: vec![],
+    })?;
+    let old = std::mem::replace(active, cont_block);
+    ctx.seal_block(old)?;
+
+    // Invalid: the same clean Trap -> cx_trap exit path assert/when-exhaustiveness
+    // use (Gate-1b0) — deterministic non-zero exit, not a panic. No continuation.
+    trap_block.terminate(IrTerminator::Trap)?;
+    ctx.seal_block(trap_block)?;
+
+    // Valid: `active` is now the continuation. Widen the i64 payload to I128.
+    let widened = ctx.fresh_value();
+    active.emit(IrInst::Cast {
+        dst: widened,
+        from: IrType::I64,
+        to: IrType::I128,
+        value: payload,
+    })?;
+    Ok(LoweredValue { value: widened, ty: IrType::I128 })
 }
 
 /// D2.4a: pack a Result tag + payload word into the i128 rep via a MEMORY

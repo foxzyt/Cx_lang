@@ -405,6 +405,48 @@ extern "C" fn cx_handle_new(payload: i64) -> i64 {
     (handle.slot as i64) | ((handle.gen as i64) << 32)
 }
 
+/// Runtime intrinsic: read a Handle (D2.5b).
+///
+/// Exported as `cx_handle_val`. JIT code calls it via
+/// `Call { callee: "cx_handle_val", args: [handle_i64, out_valid_ptr], return_ty: Some(I64) }`.
+/// Unpacks `handle` back into `{slot, gen}` (the exact reverse of `cx_handle_new`'s
+/// pack — low 32 bits are the slot, high 32 the generation; the shift-out is done
+/// on the `u64` reinterpretation, NOT the signed `i64`, so a `gen` value with its
+/// top bit set doesn't corrupt via arithmetic right-shift).
+///
+/// The registry's `get()` returns `Option<&i64>` — a real failure mode (stale or
+/// out-of-range handle) with no safe sentinel value (the packed bit-space is fully
+/// dense, so no reserved "invalid" pattern could avoid colliding with a legitimate
+/// handle). Communicated via the `out_valid` OUT-PARAMETER instead: writes 1/0:
+/// the JIT-side caller loads it back and branches to a clean `Trap` on invalid
+/// (mirroring the interpreter's `RuntimeError::StaleHandle` — a deterministic,
+/// non-panicking failure, not byte-identical text). The i64 return value is
+/// garbage (0) when invalid and MUST NOT be consulted in that case.
+extern "C" fn cx_handle_val(handle: i64, out_valid: *mut i8) -> i64 {
+    let bits = handle as u64;
+    let slot = bits as u32;
+    let gen = (bits >> 32) as u32;
+    let h = crate::runtime::handle::Handle { slot, gen };
+    let registry = HANDLES.get_or_init(|| std::sync::Mutex::new(crate::runtime::handle::HandleRegistry::new()));
+    let value = registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(h)
+        .copied();
+    match value {
+        Some(payload) => {
+            // SAFETY: `out_valid` is the address of a caller-allocated i8 stack
+            // slot (an Alloca(1,1)), passed for the duration of this call only.
+            unsafe { *out_valid = 1 };
+            payload
+        }
+        None => {
+            unsafe { *out_valid = 0 };
+            0
+        }
+    }
+}
+
 /// Backend-private symbol name for the F64 remainder host helper.
 ///
 /// Using a mangled name (double-underscore prefix) keeps it out of the user-visible namespace.
@@ -523,6 +565,7 @@ impl HostBoundary {
         jit_builder.symbol(JIT_F64_REM_SYMBOL, host_fmod as *const u8);
         jit_builder.symbol(JIT_TRAP_SYMBOL, cx_trap as *const u8);
         jit_builder.symbol("cx_handle_new", cx_handle_new as *const u8);
+        jit_builder.symbol("cx_handle_val", cx_handle_val as *const u8);
         let mut module = JITModule::new(jit_builder);
 
         // Pass 1: declare every user-defined function AND runtime intrinsics into
@@ -679,6 +722,24 @@ impl HostBoundary {
                     detail: e.to_string(),
                 })?;
             func_id_map.insert("cx_handle_new".to_string(), id);
+        }
+
+        // cx_handle_val(i64, i64) -> i64 (D2.5b): the handle word + the address
+        // of a scratch i8 out-parameter (Ptr always lowers to I64) in, the
+        // payload word out (garbage/0 when the out-parameter reads back 0).
+        {
+            use cranelift_codegen::ir::{types, AbiParam};
+            let call_conv = module.target_config().default_call_conv;
+            let mut sig = cranelift_codegen::ir::Signature::new(call_conv);
+            sig.params.push(AbiParam::new(types::I64));
+            sig.params.push(AbiParam::new(types::I64));
+            sig.returns.push(AbiParam::new(types::I64));
+            let id = module
+                .declare_function("cx_handle_val", Linkage::Import, &sig)
+                .map_err(|e| JitExecutionError::CodegenFailure {
+                    detail: e.to_string(),
+                })?;
+            func_id_map.insert("cx_handle_val".to_string(), id);
         }
 
         for ir_func in &ir.functions {
