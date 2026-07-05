@@ -1,0 +1,1 @@
+D2.5c: h2 (reusing h1's freed slot) must read correctly; h1's now-stale read must reject cleanly on both backends after h2's check succeeds.

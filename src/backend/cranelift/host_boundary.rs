@@ -447,6 +447,33 @@ extern "C" fn cx_handle_val(handle: i64, out_valid: *mut i8) -> i64 {
     }
 }
 
+/// Runtime intrinsic: drop a Handle (D2.5c).
+///
+/// Exported as `cx_handle_drop`. JIT code calls it via
+/// `Call { callee: "cx_handle_drop", args: [handle_i64], return_ty: None }` — a
+/// pure side effect, no return value. Unpacks `handle` the same way
+/// `cx_handle_val` does and calls the shared registry's `remove()` (the SAME
+/// generic `HandleRegistry<i64>` code, inherited unchanged — no new registry
+/// logic here), discarding the `Option<i64>` result exactly as the interpreter's
+/// `HandleDrop` discards `remove()`'s result (always yielding `Value::Num(0)`
+/// regardless of success).
+///
+/// Double-drop safety is a FREE consequence of `remove()`'s own generation
+/// check (handle.rs) — a second `remove()` on an already-dropped handle finds
+/// `slot.gen != handle.gen` and returns early, before touching the free-list
+/// again, so the free-list can never be double-pushed with the same slot (the
+/// actual risk a double-drop could otherwise cause: slot aliasing between two
+/// unrelated later `Handle.new` calls). Nothing new is implemented for this —
+/// it is the same check `cx_handle_val`'s `get()` already relies on.
+extern "C" fn cx_handle_drop(handle: i64) {
+    let bits = handle as u64;
+    let slot = bits as u32;
+    let gen = (bits >> 32) as u32;
+    let h = crate::runtime::handle::Handle { slot, gen };
+    let registry = HANDLES.get_or_init(|| std::sync::Mutex::new(crate::runtime::handle::HandleRegistry::new()));
+    let _ = registry.lock().unwrap_or_else(|e| e.into_inner()).remove(h);
+}
+
 /// Backend-private symbol name for the F64 remainder host helper.
 ///
 /// Using a mangled name (double-underscore prefix) keeps it out of the user-visible namespace.
@@ -566,6 +593,7 @@ impl HostBoundary {
         jit_builder.symbol(JIT_TRAP_SYMBOL, cx_trap as *const u8);
         jit_builder.symbol("cx_handle_new", cx_handle_new as *const u8);
         jit_builder.symbol("cx_handle_val", cx_handle_val as *const u8);
+        jit_builder.symbol("cx_handle_drop", cx_handle_drop as *const u8);
         let mut module = JITModule::new(jit_builder);
 
         // Pass 1: declare every user-defined function AND runtime intrinsics into
@@ -740,6 +768,21 @@ impl HostBoundary {
                     detail: e.to_string(),
                 })?;
             func_id_map.insert("cx_handle_val".to_string(), id);
+        }
+
+        // cx_handle_drop(i64) -> void (D2.5c): the handle word in, no return —
+        // a pure side effect on the shared registry.
+        {
+            use cranelift_codegen::ir::{types, AbiParam};
+            let call_conv = module.target_config().default_call_conv;
+            let mut sig = cranelift_codegen::ir::Signature::new(call_conv);
+            sig.params.push(AbiParam::new(types::I64));
+            let id = module
+                .declare_function("cx_handle_drop", Linkage::Import, &sig)
+                .map_err(|e| JitExecutionError::CodegenFailure {
+                    detail: e.to_string(),
+                })?;
+            func_id_map.insert("cx_handle_drop".to_string(), id);
         }
 
         for ir_func in &ir.functions {

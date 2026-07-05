@@ -2046,7 +2046,7 @@ fn lower_expr(
         }
         SemanticExprKind::HandleNew { value, .. } => lower_handle_new(value, ctx, active),
         SemanticExprKind::HandleVal { binding, name, .. } => lower_handle_val(*binding, name, ctx, active),
-        SemanticExprKind::HandleDrop { .. } => { unsupported!("HandleDrop") },
+        SemanticExprKind::HandleDrop { binding, name, .. } => lower_handle_drop(*binding, name, ctx, active),
         SemanticExprKind::Range { .. } => {
             return Err(LoweringError::UnsupportedSemanticConstruct {
                 construct: "range expression used as a value — ranges are only supported in for-loop bounds, not as standalone expressions".to_string(),
@@ -4918,6 +4918,42 @@ fn lower_handle_val(
         value: payload,
     })?;
     Ok(LoweredValue { value: widened, ty: IrType::I128 })
+}
+
+/// D2.5c: lower `h.drop()`. A pure side effect — no branching, no fallibility to
+/// signal: `cx_handle_drop` calls the shared registry's `remove()`, which
+/// safely no-ops on an already-dropped or invalid handle (the same generation
+/// check `.val` relies on returns early before touching the free-list again —
+/// this is what makes a double-drop non-corrupting, not new logic here).
+///
+/// `HandleDrop`'s semantic type is `Handle(Box<I128>)` — the same outer-Handle
+/// claim `HandleNew` carries, protected the same way (`lower_type(Handle(_))`
+/// collapses to I64 regardless of the inner claim). The interpreter always
+/// returns `Value::Num(0)` here, discarding `remove()`'s result entirely — so
+/// there is no meaningful value to reconstruct. The expression's result is
+/// simply the pre-call packed handle i64, unchanged: satisfies the I64 type
+/// any consumer expects, with zero new computation.
+fn lower_handle_drop(
+    binding: BindingId,
+    name: &str,
+    _ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<LoweredValue, LoweringError> {
+    let handle_val = active.bindings.get(&binding).cloned().ok_or_else(|| {
+        LoweringError::InternalInvariantViolation {
+            detail: format!(
+                "HandleDrop: binding '{name}' ({}) not found in scope",
+                binding.0
+            ),
+        }
+    })?;
+    active.emit(IrInst::Call {
+        dst: None,
+        callee: "cx_handle_drop".to_string(),
+        args: vec![handle_val.value],
+        return_ty: None,
+    })?;
+    Ok(handle_val)
 }
 
 /// D2.4a: pack a Result tag + payload word into the i128 rep via a MEMORY
