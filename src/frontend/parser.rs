@@ -294,7 +294,10 @@ where
                     .clone()
                     .then_ignore(just(Token::PunctDoubleColon))
                     .then(ident.clone())
-                    .map(|(enum_name, variant)| WhenPattern::EnumVariant(enum_name, variant)),
+                    .then(just(Token::KeywordAs).ignore_then(ident).or_not())
+                    .map(|((enum_name, variant), binding)| {
+                        WhenPattern::EnumVariant(enum_name, variant, binding)
+                    }),
                 expr.clone().map(|e| match e {
                     Expr::Val(v) => WhenPattern::Literal(v),
                     _ => WhenPattern::Catchall,
@@ -788,7 +791,10 @@ where
                     .clone()
                     .then_ignore(just(Token::PunctDoubleColon))
                     .then(ident.clone())
-                    .map(|(enum_name, variant)| WhenPattern::EnumVariant(enum_name, variant)),
+                    .then(just(Token::KeywordAs).ignore_then(ident).or_not())
+                    .map(|((enum_name, variant), binding)| {
+                        WhenPattern::EnumVariant(enum_name, variant, binding)
+                    }),
                 ident
                     .clone()
                     .map(|name| WhenPattern::Group(String::new(), name)),

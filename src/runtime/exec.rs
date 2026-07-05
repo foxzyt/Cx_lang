@@ -553,6 +553,10 @@ SemanticStmt::Decl { binding, name, ty, .. } => {
             };
             if matches {
                 self.push_scope();
+                if let SemanticWhenPattern::EnumVariant { binding: Some((binding_id, binding_name)), .. } = &arm.pattern {
+                    self.declare(*binding_id, binding_name.clone(), None, 0)?;
+                    self.set_var_by_id(*binding_id, binding_name, val.clone(), 0)?;
+                }
                 let mut last_val = Value::Num(0);
                 for s in &arm.body {
                     match s {

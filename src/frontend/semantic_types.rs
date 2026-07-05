@@ -233,6 +233,10 @@ pub enum SemanticWhenPattern {
         variant_name: String,
         enum_id: Option<EnumId>,
         variant_id: Option<EnumVariantId>,
+        /// Whole-scrutinee `as v` binding, scoped to this arm's body only —
+        /// the BindingId and the source name (needed by the interpreter's
+        /// by-name index / diagnostics).
+        binding: Option<(BindingId, String)>,
     },
     Catchall,
 }

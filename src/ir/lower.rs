@@ -3146,7 +3146,15 @@ fn lower_when_stmt(
     let mut fallthroughs: Vec<ActiveBlock> = Vec::new();
 
     for arm in arms.iter() {
-        let body_block = ctx.start_block(vec![], incoming.clone());
+        // A whole-scrutinee `as v` binding is a pure SSA-level alias: the
+        // scrutinee's already-lowered tag value is reused under the arm's
+        // BindingId, scoped to this arm's body block only (enums are
+        // tag-only, so there is no separate value to compute).
+        let mut body_incoming = incoming.clone();
+        if let SemanticWhenPattern::EnumVariant { binding: Some((id, _)), .. } = &arm.pattern {
+            body_incoming.insert(*id, scrutinee_val.clone());
+        }
+        let body_block = ctx.start_block(vec![], body_incoming);
         let body_id = body_block.id();
 
         match &arm.pattern {
@@ -3446,7 +3454,13 @@ fn lower_when_expr(
         };
 
     for arm in arms.iter() {
-        let body_block = ctx.start_block(vec![], incoming.clone());
+        // Same whole-scrutinee alias as the statement form — see the comment
+        // in `lower_when_stmt`.
+        let mut body_incoming = incoming.clone();
+        if let SemanticWhenPattern::EnumVariant { binding: Some((id, _)), .. } = &arm.pattern {
+            body_incoming.insert(*id, scrutinee_val.clone());
+        }
+        let body_block = ctx.start_block(vec![], body_incoming);
         let body_id = body_block.id();
 
         match &arm.pattern {

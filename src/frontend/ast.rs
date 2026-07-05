@@ -103,7 +103,8 @@ Unary(Op, Box<Expr>, usize),
 pub enum WhenPattern {
     Literal(AstValue),
     Range(AstValue, AstValue, bool),
-    EnumVariant(String, String),
+    /// (enum_name, variant, optional `as <ident>` binding — whole-scrutinee only)
+    EnumVariant(String, String, Option<String>),
     Group(String, String),
     Catchall,
 }
