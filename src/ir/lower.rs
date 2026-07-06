@@ -3154,53 +3154,150 @@ fn lower_when_stmt(
         if let SemanticWhenPattern::EnumVariant { binding: Some((id, _)), .. } = &arm.pattern {
             body_incoming.insert(*id, scrutinee_val.clone());
         }
-        let body_block = ctx.start_block(vec![], body_incoming);
+        let body_block = ctx.start_block(vec![], body_incoming.clone());
         let body_id = body_block.id();
 
         match &arm.pattern {
             SemanticWhenPattern::Catchall => {
-                current.terminate(IrTerminator::Jump {
-                    target: body_id,
-                    args: vec![],
-                })?;
-                ctx.seal_block(current)?;
-                if let Some(active) = lower_stmt_sequence(
-                    arm.body.iter(),
-                    ctx,
-                    Some(body_block),
-                    spec,
-                    loop_ctx,
-                )? {
-                    fallthroughs.push(active);
+                match &arm.guard {
+                    None => {
+                        current.terminate(IrTerminator::Jump {
+                            target: body_id,
+                            args: vec![],
+                        })?;
+                        ctx.seal_block(current)?;
+                        if let Some(active) = lower_stmt_sequence(
+                            arm.body.iter(),
+                            ctx,
+                            Some(body_block),
+                            spec,
+                            loop_ctx,
+                        )? {
+                            fallthroughs.push(active);
+                        }
+                        // Arms after Catchall are unreachable — we don't allocate
+                        // their body blocks. Merge whatever fallthroughs we have.
+                        return match fallthroughs.len() {
+                            0 => Ok(None),
+                            1 => Ok(Some(fallthroughs.into_iter().next().unwrap())),
+                            _ => Ok(Some(merge_fallthroughs(ctx, fallthroughs, &incoming)?)),
+                        };
+                    }
+                    Some(guard_expr) => {
+                        // A guarded catch-all can fail too — it's the terminal
+                        // arm, so its "keep trying" continuation is exactly the
+                        // same "no arm matched" tail the unguarded exhaustion
+                        // fallthrough below already produces (out of scope to
+                        // improve that tail behavior here).
+                        let mut guard_block = ctx.start_block(vec![], body_incoming);
+                        let guard_block_id = guard_block.id();
+                        current.terminate(IrTerminator::Jump {
+                            target: guard_block_id,
+                            args: vec![],
+                        })?;
+                        ctx.seal_block(current)?;
+
+                        let guard_val = lower_expr(guard_expr, ctx, &mut guard_block)?;
+                        let guard_val = guard_unknown_condition(guard_val, ctx, &mut guard_block)?;
+                        ensure_type_match("when guard", IrType::Bool, guard_val.ty.clone())?;
+
+                        let no_match = ctx.start_block(vec![], incoming.clone());
+                        let no_match_id = no_match.id();
+                        guard_block.terminate(IrTerminator::Branch {
+                            cond: guard_val.value,
+                            then_block: body_id,
+                            then_args: vec![],
+                            else_block: no_match_id,
+                            else_args: vec![],
+                        })?;
+                        ctx.seal_block(guard_block)?;
+
+                        if let Some(active) = lower_stmt_sequence(
+                            arm.body.iter(),
+                            ctx,
+                            Some(body_block),
+                            spec,
+                            loop_ctx,
+                        )? {
+                            fallthroughs.push(active);
+                        }
+                        fallthroughs.push(no_match);
+                        return match fallthroughs.len() {
+                            0 => Ok(None),
+                            1 => Ok(Some(fallthroughs.into_iter().next().unwrap())),
+                            _ => Ok(Some(merge_fallthroughs(ctx, fallthroughs, &incoming)?)),
+                        };
+                    }
                 }
-                // Arms after Catchall are unreachable — we don't allocate
-                // their body blocks. Merge whatever fallthroughs we have.
-                return match fallthroughs.len() {
-                    0 => Ok(None),
-                    1 => Ok(Some(fallthroughs.into_iter().next().unwrap())),
-                    _ => Ok(Some(merge_fallthroughs(ctx, fallthroughs, &incoming)?)),
-                };
             }
             // Literal / Range / EnumVariant share one comparison emitter (D1.2a);
             // the stmt mechanism (fallthrough collection) stays local here.
             _ => {
-                current = emit_when_arm_match(
-                    &arm.pattern,
-                    scrutinee,
-                    &scrutinee_val,
-                    body_id,
-                    &incoming,
-                    current,
-                    ctx,
-                )?;
-                if let Some(active) = lower_stmt_sequence(
-                    arm.body.iter(),
-                    ctx,
-                    Some(body_block),
-                    spec,
-                    loop_ctx,
-                )? {
-                    fallthroughs.push(active);
+                match &arm.guard {
+                    None => {
+                        current = emit_when_arm_match(
+                            &arm.pattern,
+                            scrutinee,
+                            &scrutinee_val,
+                            body_id,
+                            &incoming,
+                            current,
+                            ctx,
+                        )?;
+                        if let Some(active) = lower_stmt_sequence(
+                            arm.body.iter(),
+                            ctx,
+                            Some(body_block),
+                            spec,
+                            loop_ctx,
+                        )? {
+                            fallthroughs.push(active);
+                        }
+                    }
+                    Some(guard_expr) => {
+                        // Redirect the pattern-match's "then" target to an
+                        // intermediate guard block (seeded with the same
+                        // bindings as the body, so `as v` is visible to the
+                        // guard) instead of the real body block. The guard's
+                        // "false" edge reuses `current.id()` — the exact same
+                        // "try the next arm" continuation the pattern-mismatch
+                        // else-edge already produces.
+                        let mut guard_block = ctx.start_block(vec![], body_incoming);
+                        let guard_block_id = guard_block.id();
+                        current = emit_when_arm_match(
+                            &arm.pattern,
+                            scrutinee,
+                            &scrutinee_val,
+                            guard_block_id,
+                            &incoming,
+                            current,
+                            ctx,
+                        )?;
+                        let next_id = current.id();
+
+                        let guard_val = lower_expr(guard_expr, ctx, &mut guard_block)?;
+                        let guard_val = guard_unknown_condition(guard_val, ctx, &mut guard_block)?;
+                        ensure_type_match("when guard", IrType::Bool, guard_val.ty.clone())?;
+
+                        guard_block.terminate(IrTerminator::Branch {
+                            cond: guard_val.value,
+                            then_block: body_id,
+                            then_args: vec![],
+                            else_block: next_id,
+                            else_args: vec![],
+                        })?;
+                        ctx.seal_block(guard_block)?;
+
+                        if let Some(active) = lower_stmt_sequence(
+                            arm.body.iter(),
+                            ctx,
+                            Some(body_block),
+                            spec,
+                            loop_ctx,
+                        )? {
+                            fallthroughs.push(active);
+                        }
+                    }
                 }
             }
         }
@@ -3460,36 +3557,112 @@ fn lower_when_expr(
         if let SemanticWhenPattern::EnumVariant { binding: Some((id, _)), .. } = &arm.pattern {
             body_incoming.insert(*id, scrutinee_val.clone());
         }
-        let body_block = ctx.start_block(vec![], body_incoming);
+        let body_block = ctx.start_block(vec![], body_incoming.clone());
         let body_id = body_block.id();
 
         match &arm.pattern {
             SemanticWhenPattern::Catchall => {
-                current.terminate(IrTerminator::Jump {
-                    target: body_id,
-                    args: vec![],
-                })?;
-                ctx.seal_block(current)?;
-                lower_arm_body(ctx, body_block, arm)?;
-                // Arms after Catchall are unreachable.
-                return Ok(LoweredValue {
-                    value: result_param,
-                    ty: result_ir_ty,
-                });
+                match &arm.guard {
+                    None => {
+                        current.terminate(IrTerminator::Jump {
+                            target: body_id,
+                            args: vec![],
+                        })?;
+                        ctx.seal_block(current)?;
+                        lower_arm_body(ctx, body_block, arm)?;
+                        // Arms after Catchall are unreachable.
+                        return Ok(LoweredValue {
+                            value: result_param,
+                            ty: result_ir_ty,
+                        });
+                    }
+                    Some(guard_expr) => {
+                        // A guarded catch-all can fail too. A value-producing
+                        // `when` must be exhaustive, so its "keep trying"
+                        // path has no value to supply the merge — Trap, the
+                        // exact same tail behavior the unguarded exhaustion
+                        // fallthrough below already produces.
+                        let mut guard_block = ctx.start_block(vec![], body_incoming);
+                        let guard_block_id = guard_block.id();
+                        current.terminate(IrTerminator::Jump {
+                            target: guard_block_id,
+                            args: vec![],
+                        })?;
+                        ctx.seal_block(current)?;
+
+                        let guard_val = lower_expr(guard_expr, ctx, &mut guard_block)?;
+                        let guard_val = guard_unknown_condition(guard_val, ctx, &mut guard_block)?;
+                        ensure_type_match("when guard", IrType::Bool, guard_val.ty.clone())?;
+
+                        let mut no_match = ctx.start_block(vec![], incoming.clone());
+                        let no_match_id = no_match.id();
+                        guard_block.terminate(IrTerminator::Branch {
+                            cond: guard_val.value,
+                            then_block: body_id,
+                            then_args: vec![],
+                            else_block: no_match_id,
+                            else_args: vec![],
+                        })?;
+                        ctx.seal_block(guard_block)?;
+
+                        lower_arm_body(ctx, body_block, arm)?;
+
+                        no_match.terminate(IrTerminator::Trap)?;
+                        ctx.seal_block(no_match)?;
+
+                        return Ok(LoweredValue {
+                            value: result_param,
+                            ty: result_ir_ty,
+                        });
+                    }
+                }
             }
             // Literal / Range / EnumVariant share one comparison emitter (D1.2a);
             // the expr mechanism (value-producing arm body -> merge) stays local.
             _ => {
-                current = emit_when_arm_match(
-                    &arm.pattern,
-                    scrutinee,
-                    &scrutinee_val,
-                    body_id,
-                    &incoming,
-                    current,
-                    ctx,
-                )?;
-                lower_arm_body(ctx, body_block, arm)?;
+                match &arm.guard {
+                    None => {
+                        current = emit_when_arm_match(
+                            &arm.pattern,
+                            scrutinee,
+                            &scrutinee_val,
+                            body_id,
+                            &incoming,
+                            current,
+                            ctx,
+                        )?;
+                        lower_arm_body(ctx, body_block, arm)?;
+                    }
+                    Some(guard_expr) => {
+                        let mut guard_block = ctx.start_block(vec![], body_incoming);
+                        let guard_block_id = guard_block.id();
+                        current = emit_when_arm_match(
+                            &arm.pattern,
+                            scrutinee,
+                            &scrutinee_val,
+                            guard_block_id,
+                            &incoming,
+                            current,
+                            ctx,
+                        )?;
+                        let next_id = current.id();
+
+                        let guard_val = lower_expr(guard_expr, ctx, &mut guard_block)?;
+                        let guard_val = guard_unknown_condition(guard_val, ctx, &mut guard_block)?;
+                        ensure_type_match("when guard", IrType::Bool, guard_val.ty.clone())?;
+
+                        guard_block.terminate(IrTerminator::Branch {
+                            cond: guard_val.value,
+                            then_block: body_id,
+                            then_args: vec![],
+                            else_block: next_id,
+                            else_args: vec![],
+                        })?;
+                        ctx.seal_block(guard_block)?;
+
+                        lower_arm_body(ctx, body_block, arm)?;
+                    }
+                }
             }
         }
     }

@@ -124,6 +124,11 @@ pub enum WhenBody {
 #[derive(Debug, Clone)]
 pub struct WhenArm {
     pub pattern: WhenPattern,
+    /// Optional `if <expr>` guard, evaluated only after the pattern already
+    /// matched. Applies uniformly across every pattern kind (not pattern-
+    /// specific like the `as v` binding), so it lives on the arm, not on
+    /// `WhenPattern`.
+    pub guard: Option<Expr>,
     pub body: WhenBody,
     pub pos: usize,
 }

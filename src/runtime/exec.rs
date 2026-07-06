@@ -557,6 +557,30 @@ SemanticStmt::Decl { binding, name, ty, .. } => {
                     self.declare(*binding_id, binding_name.clone(), None, 0)?;
                     self.set_var_by_id(*binding_id, binding_name, val.clone(), 0)?;
                 }
+                // Guard evaluates only after the pattern already matched, with
+                // the arm's `as v` binding (if any) already in scope above.
+                // Reuses #026's exact if-condition truthiness rule: an unknown
+                // guard is a hard error, never silently coerced to false.
+                let guard_passed = match &arm.guard {
+                    None => true,
+                    Some(guard_expr) => {
+                        let guard_val = self.eval_semantic_expr(guard_expr)?;
+                        match &guard_val {
+                            Value::Bool(b) => *b,
+                            Value::TBool(0) => false,
+                            Value::TBool(1) => true,
+                            Value::TBool(2) | Value::Unknown(_) => {
+                                return Err(RuntimeError::UnknownCondition { pos: arm.pos });
+                            }
+                            Value::Num(n) => *n != 0,
+                            _ => false,
+                        }
+                    }
+                };
+                if !guard_passed {
+                    self.pop_scope();
+                    continue;
+                }
                 let mut last_val = Value::Num(0);
                 for s in &arm.body {
                     match s {

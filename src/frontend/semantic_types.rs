@@ -244,6 +244,11 @@ pub enum SemanticWhenPattern {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SemanticWhenArm {
     pub pattern: SemanticWhenPattern,
+    /// Optional `if <expr>` guard, evaluated (with the arm's `as v` binding,
+    /// if any, in scope) only after the pattern already matched. A `false`
+    /// result falls through to later arms; an `unknown` result is a hard
+    /// error, never coerced to false.
+    pub guard: Option<SemanticExpr>,
     pub body: Vec<SemanticStmt>,
     pub pos: usize,
 }
