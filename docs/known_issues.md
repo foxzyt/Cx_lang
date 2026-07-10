@@ -134,7 +134,8 @@ not separately re-scoped beyond that.
 
 ## 4. `print(enum)` diverges between interpreter and JIT
 
-**Status: OPEN.** Not sized.
+**Status: OPEN — sized, not attempted.** Confirmed real sizing, not a
+dispatch-arm fix.
 
 Printing a bare enum-typed value produces different output on each backend:
 
@@ -156,12 +157,32 @@ enum value in a way that's checked for interp/JIT parity, so this gap has
 not yet surfaced as a `PARITY_FAIL` in `jit_parity_by_feature` — but would,
 if one were added.
 
+**Real sizing, confirmed by reading the lowering path before attempting
+anything:** `EnumDef` lowering (`src/ir/lower.rs:511,1100`) emits **zero
+IR** — no static data, no table, nothing. There is no tag→name lookup
+structure anywhere in the JIT pipeline; by the time a value reaches
+`route_print_arg` it's already erased to a bare `IrType::I8`, structurally
+indistinguishable from a plain `t8`, with no way to know it came from an
+enum at all, let alone which enum or what its variant names are. Fixing
+this is not a dispatch-arm addition — it requires designing and building
+new static infrastructure: a per-enum tag→name string table, emitted at
+`EnumDef`-lowering time (from the semantic layer's `EnumId`/variant-name
+info, which does still exist at that point), referenced at the print call
+site via a new lookup mechanism. This is real design work, not a quick fix.
+
+This is now the **more-precisely-understood** of the two "not attempted"
+fixes from tonight's pass (see #5) — sized correctly and deliberately not
+attempted, rather than attempted and found broken. It remains the more
+dangerous of the two bugs in this file: a silent divergence with matching
+exit codes on both sides, not a clean refusal.
+
 ---
 
 ## 5. Bare `I128` printing not lowered on JIT
 
-**Status: OPEN, fully scoped, ready to build whenever picked up** — no
-further audit needed for this one specifically.
+**Status: OPEN — attempted, built cleanly, JIT reproducer segfaulted.** The
+previous "fully scoped, low risk, ready to build" framing in this entry was
+wrong — removed below.
 
 `route_print_arg` (`src/ir/lower.rs:4646-4667`) dispatches on the print
 argument's `IrType`: `I64` direct, `I8`/`I16`/`I32` via a widening `Cast`,
@@ -174,7 +195,42 @@ purpose.
 Affects any bare `i128`-typed print, including reading a `Handle<T>`'s value
 when `T` is `t128`.
 
-Scope for the fix (not built): one new match arm in `route_print_arg` plus
-one new host-side callback (mirroring the shape of any single existing
-Handle-value print callback already built this session, e.g. the scalar
-`Handle` printing path from D2.5).
+**What was actually tried:** a new `IrType::I128` arm in `route_print_arg`,
+a new `cx_print_i128(n: i128)` host callback mirroring `cx_printn`'s exact
+shape (`extern "C" fn` + JIT symbol registration + Cranelift signature
+declaration), plus the matching IR-validator registration. Built with zero
+compile errors. The JIT reproducer (`x: t128 = 42; print(x)`) then
+**segfaulted (exit 139)** — not value-dependent: reproduced identically with
+a trivial value and with `i128::MAX`. Reverted in full
+(`git checkout --` on all three touched files); confirmed the working tree
+returned to a clean diff and the original behavior (a structured
+`UnsupportedSemanticConstruct` error, exit 127 — not a crash) still holds at
+HEAD.
+
+**Root cause (diagnosed, not fixed):** passing a raw `i128` by value into a
+Rust `extern "C"` host callback from Cranelift-JIT-compiled code is a
+boundary this codebase has never actually exercised before, despite
+appearances. `Result<T>`'s `i128` (D2.4a) is returned *from* Cranelift code
+via the packed representation — it never crosses into a Rust host function
+as an `i128` argument. Every existing Handle callback (`cx_handle_new`,
+`cx_handle_val`, `cx_handle_drop`) passes `i64`. So this fix was the first
+real attempt to pass a native Cranelift `I128` value as an argument to an
+`extern "C" fn(i128)`, and it doesn't work. The existing
+`enable_llvm_abi_extensions` flag (already enabled, `host_boundary.rs:566`)
+is documented as covering the packed-i128 `Result<T>` rep for *internal*
+Cranelift-to-Cranelift value passing — a different boundary from calling
+into an external Rust host symbol. Most likely explanation: a Windows x64
+calling-convention mismatch — the Microsoft x64 ABI conventionally passes
+wide (>8-byte) scalars by reference, not in a register pair, and Cranelift's
+native `I128` type may not marshal to that convention when emitting a call
+to an external symbol.
+
+**Suggested fix direction for whoever picks this up next — untested, a
+direction, not a solution:** pass the `i128` by pointer instead of by value,
+mirroring how `str` descriptors already cross this exact host-boundary
+successfully today (`cx_print_str`, `src/backend/cranelift/host_boundary.rs:301-310`,
+a leaked `&'static` descriptor passed as an address). This would need the
+JIT to spill the `I128` SSA value to a stack slot and pass its address, then
+have the callback dereference it — a materially different (and larger)
+shape than "one new match arm plus one host callback." Not attempted; needs
+its own sizing pass before a second attempt.
