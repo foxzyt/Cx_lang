@@ -2044,9 +2044,9 @@ fn lower_expr(
         SemanticExprKind::DotAccess { binding, container, field, struct_name } => {
             lower_dot_access(binding, container, field, struct_name, &expr.ty, ctx, active)
         }
-        SemanticExprKind::HandleNew { .. } => { unsupported!("HandleNew") },
-        SemanticExprKind::HandleVal { .. } => { unsupported!("HandleVal") },
-        SemanticExprKind::HandleDrop { .. } => { unsupported!("HandleDrop") },
+        SemanticExprKind::HandleNew { value, .. } => lower_handle_new(value, ctx, active),
+        SemanticExprKind::HandleVal { binding, name, .. } => lower_handle_val(*binding, name, ctx, active),
+        SemanticExprKind::HandleDrop { binding, name, .. } => lower_handle_drop(*binding, name, ctx, active),
         SemanticExprKind::Range { .. } => {
             return Err(LoweringError::UnsupportedSemanticConstruct {
                 construct: "range expression used as a value — ranges are only supported in for-loop bounds, not as standalone expressions".to_string(),
@@ -3146,53 +3146,158 @@ fn lower_when_stmt(
     let mut fallthroughs: Vec<ActiveBlock> = Vec::new();
 
     for arm in arms.iter() {
-        let body_block = ctx.start_block(vec![], incoming.clone());
+        // A whole-scrutinee `as v` binding is a pure SSA-level alias: the
+        // scrutinee's already-lowered tag value is reused under the arm's
+        // BindingId, scoped to this arm's body block only (enums are
+        // tag-only, so there is no separate value to compute).
+        let mut body_incoming = incoming.clone();
+        if let SemanticWhenPattern::EnumVariant { binding: Some((id, _)), .. } = &arm.pattern {
+            body_incoming.insert(*id, scrutinee_val.clone());
+        }
+        let body_block = ctx.start_block(vec![], body_incoming.clone());
         let body_id = body_block.id();
 
         match &arm.pattern {
             SemanticWhenPattern::Catchall => {
-                current.terminate(IrTerminator::Jump {
-                    target: body_id,
-                    args: vec![],
-                })?;
-                ctx.seal_block(current)?;
-                if let Some(active) = lower_stmt_sequence(
-                    arm.body.iter(),
-                    ctx,
-                    Some(body_block),
-                    spec,
-                    loop_ctx,
-                )? {
-                    fallthroughs.push(active);
+                match &arm.guard {
+                    None => {
+                        current.terminate(IrTerminator::Jump {
+                            target: body_id,
+                            args: vec![],
+                        })?;
+                        ctx.seal_block(current)?;
+                        if let Some(active) = lower_stmt_sequence(
+                            arm.body.iter(),
+                            ctx,
+                            Some(body_block),
+                            spec,
+                            loop_ctx,
+                        )? {
+                            fallthroughs.push(active);
+                        }
+                        // Arms after Catchall are unreachable — we don't allocate
+                        // their body blocks. Merge whatever fallthroughs we have.
+                        return match fallthroughs.len() {
+                            0 => Ok(None),
+                            1 => Ok(Some(fallthroughs.into_iter().next().unwrap())),
+                            _ => Ok(Some(merge_fallthroughs(ctx, fallthroughs, &incoming)?)),
+                        };
+                    }
+                    Some(guard_expr) => {
+                        // A guarded catch-all can fail too — it's the terminal
+                        // arm, so its "keep trying" continuation is exactly the
+                        // same "no arm matched" tail the unguarded exhaustion
+                        // fallthrough below already produces (out of scope to
+                        // improve that tail behavior here).
+                        let mut guard_block = ctx.start_block(vec![], body_incoming);
+                        let guard_block_id = guard_block.id();
+                        current.terminate(IrTerminator::Jump {
+                            target: guard_block_id,
+                            args: vec![],
+                        })?;
+                        ctx.seal_block(current)?;
+
+                        let guard_val = lower_expr(guard_expr, ctx, &mut guard_block)?;
+                        let guard_val = guard_unknown_condition(guard_val, ctx, &mut guard_block)?;
+                        ensure_type_match("when guard", IrType::Bool, guard_val.ty.clone())?;
+
+                        let no_match = ctx.start_block(vec![], incoming.clone());
+                        let no_match_id = no_match.id();
+                        guard_block.terminate(IrTerminator::Branch {
+                            cond: guard_val.value,
+                            then_block: body_id,
+                            then_args: vec![],
+                            else_block: no_match_id,
+                            else_args: vec![],
+                        })?;
+                        ctx.seal_block(guard_block)?;
+
+                        if let Some(active) = lower_stmt_sequence(
+                            arm.body.iter(),
+                            ctx,
+                            Some(body_block),
+                            spec,
+                            loop_ctx,
+                        )? {
+                            fallthroughs.push(active);
+                        }
+                        fallthroughs.push(no_match);
+                        return match fallthroughs.len() {
+                            0 => Ok(None),
+                            1 => Ok(Some(fallthroughs.into_iter().next().unwrap())),
+                            _ => Ok(Some(merge_fallthroughs(ctx, fallthroughs, &incoming)?)),
+                        };
+                    }
                 }
-                // Arms after Catchall are unreachable — we don't allocate
-                // their body blocks. Merge whatever fallthroughs we have.
-                return match fallthroughs.len() {
-                    0 => Ok(None),
-                    1 => Ok(Some(fallthroughs.into_iter().next().unwrap())),
-                    _ => Ok(Some(merge_fallthroughs(ctx, fallthroughs, &incoming)?)),
-                };
             }
             // Literal / Range / EnumVariant share one comparison emitter (D1.2a);
             // the stmt mechanism (fallthrough collection) stays local here.
             _ => {
-                current = emit_when_arm_match(
-                    &arm.pattern,
-                    scrutinee,
-                    &scrutinee_val,
-                    body_id,
-                    &incoming,
-                    current,
-                    ctx,
-                )?;
-                if let Some(active) = lower_stmt_sequence(
-                    arm.body.iter(),
-                    ctx,
-                    Some(body_block),
-                    spec,
-                    loop_ctx,
-                )? {
-                    fallthroughs.push(active);
+                match &arm.guard {
+                    None => {
+                        current = emit_when_arm_match(
+                            &arm.pattern,
+                            scrutinee,
+                            &scrutinee_val,
+                            body_id,
+                            &incoming,
+                            current,
+                            ctx,
+                        )?;
+                        if let Some(active) = lower_stmt_sequence(
+                            arm.body.iter(),
+                            ctx,
+                            Some(body_block),
+                            spec,
+                            loop_ctx,
+                        )? {
+                            fallthroughs.push(active);
+                        }
+                    }
+                    Some(guard_expr) => {
+                        // Redirect the pattern-match's "then" target to an
+                        // intermediate guard block (seeded with the same
+                        // bindings as the body, so `as v` is visible to the
+                        // guard) instead of the real body block. The guard's
+                        // "false" edge reuses `current.id()` — the exact same
+                        // "try the next arm" continuation the pattern-mismatch
+                        // else-edge already produces.
+                        let mut guard_block = ctx.start_block(vec![], body_incoming);
+                        let guard_block_id = guard_block.id();
+                        current = emit_when_arm_match(
+                            &arm.pattern,
+                            scrutinee,
+                            &scrutinee_val,
+                            guard_block_id,
+                            &incoming,
+                            current,
+                            ctx,
+                        )?;
+                        let next_id = current.id();
+
+                        let guard_val = lower_expr(guard_expr, ctx, &mut guard_block)?;
+                        let guard_val = guard_unknown_condition(guard_val, ctx, &mut guard_block)?;
+                        ensure_type_match("when guard", IrType::Bool, guard_val.ty.clone())?;
+
+                        guard_block.terminate(IrTerminator::Branch {
+                            cond: guard_val.value,
+                            then_block: body_id,
+                            then_args: vec![],
+                            else_block: next_id,
+                            else_args: vec![],
+                        })?;
+                        ctx.seal_block(guard_block)?;
+
+                        if let Some(active) = lower_stmt_sequence(
+                            arm.body.iter(),
+                            ctx,
+                            Some(body_block),
+                            spec,
+                            loop_ctx,
+                        )? {
+                            fallthroughs.push(active);
+                        }
+                    }
                 }
             }
         }
@@ -3446,36 +3551,118 @@ fn lower_when_expr(
         };
 
     for arm in arms.iter() {
-        let body_block = ctx.start_block(vec![], incoming.clone());
+        // Same whole-scrutinee alias as the statement form — see the comment
+        // in `lower_when_stmt`.
+        let mut body_incoming = incoming.clone();
+        if let SemanticWhenPattern::EnumVariant { binding: Some((id, _)), .. } = &arm.pattern {
+            body_incoming.insert(*id, scrutinee_val.clone());
+        }
+        let body_block = ctx.start_block(vec![], body_incoming.clone());
         let body_id = body_block.id();
 
         match &arm.pattern {
             SemanticWhenPattern::Catchall => {
-                current.terminate(IrTerminator::Jump {
-                    target: body_id,
-                    args: vec![],
-                })?;
-                ctx.seal_block(current)?;
-                lower_arm_body(ctx, body_block, arm)?;
-                // Arms after Catchall are unreachable.
-                return Ok(LoweredValue {
-                    value: result_param,
-                    ty: result_ir_ty,
-                });
+                match &arm.guard {
+                    None => {
+                        current.terminate(IrTerminator::Jump {
+                            target: body_id,
+                            args: vec![],
+                        })?;
+                        ctx.seal_block(current)?;
+                        lower_arm_body(ctx, body_block, arm)?;
+                        // Arms after Catchall are unreachable.
+                        return Ok(LoweredValue {
+                            value: result_param,
+                            ty: result_ir_ty,
+                        });
+                    }
+                    Some(guard_expr) => {
+                        // A guarded catch-all can fail too. A value-producing
+                        // `when` must be exhaustive, so its "keep trying"
+                        // path has no value to supply the merge — Trap, the
+                        // exact same tail behavior the unguarded exhaustion
+                        // fallthrough below already produces.
+                        let mut guard_block = ctx.start_block(vec![], body_incoming);
+                        let guard_block_id = guard_block.id();
+                        current.terminate(IrTerminator::Jump {
+                            target: guard_block_id,
+                            args: vec![],
+                        })?;
+                        ctx.seal_block(current)?;
+
+                        let guard_val = lower_expr(guard_expr, ctx, &mut guard_block)?;
+                        let guard_val = guard_unknown_condition(guard_val, ctx, &mut guard_block)?;
+                        ensure_type_match("when guard", IrType::Bool, guard_val.ty.clone())?;
+
+                        let mut no_match = ctx.start_block(vec![], incoming.clone());
+                        let no_match_id = no_match.id();
+                        guard_block.terminate(IrTerminator::Branch {
+                            cond: guard_val.value,
+                            then_block: body_id,
+                            then_args: vec![],
+                            else_block: no_match_id,
+                            else_args: vec![],
+                        })?;
+                        ctx.seal_block(guard_block)?;
+
+                        lower_arm_body(ctx, body_block, arm)?;
+
+                        no_match.terminate(IrTerminator::Trap)?;
+                        ctx.seal_block(no_match)?;
+
+                        return Ok(LoweredValue {
+                            value: result_param,
+                            ty: result_ir_ty,
+                        });
+                    }
+                }
             }
             // Literal / Range / EnumVariant share one comparison emitter (D1.2a);
             // the expr mechanism (value-producing arm body -> merge) stays local.
             _ => {
-                current = emit_when_arm_match(
-                    &arm.pattern,
-                    scrutinee,
-                    &scrutinee_val,
-                    body_id,
-                    &incoming,
-                    current,
-                    ctx,
-                )?;
-                lower_arm_body(ctx, body_block, arm)?;
+                match &arm.guard {
+                    None => {
+                        current = emit_when_arm_match(
+                            &arm.pattern,
+                            scrutinee,
+                            &scrutinee_val,
+                            body_id,
+                            &incoming,
+                            current,
+                            ctx,
+                        )?;
+                        lower_arm_body(ctx, body_block, arm)?;
+                    }
+                    Some(guard_expr) => {
+                        let mut guard_block = ctx.start_block(vec![], body_incoming);
+                        let guard_block_id = guard_block.id();
+                        current = emit_when_arm_match(
+                            &arm.pattern,
+                            scrutinee,
+                            &scrutinee_val,
+                            guard_block_id,
+                            &incoming,
+                            current,
+                            ctx,
+                        )?;
+                        let next_id = current.id();
+
+                        let guard_val = lower_expr(guard_expr, ctx, &mut guard_block)?;
+                        let guard_val = guard_unknown_condition(guard_val, ctx, &mut guard_block)?;
+                        ensure_type_match("when guard", IrType::Bool, guard_val.ty.clone())?;
+
+                        guard_block.terminate(IrTerminator::Branch {
+                            cond: guard_val.value,
+                            then_block: body_id,
+                            then_args: vec![],
+                            else_block: next_id,
+                            else_args: vec![],
+                        })?;
+                        ctx.seal_block(guard_block)?;
+
+                        lower_arm_body(ctx, body_block, arm)?;
+                    }
+                }
             }
         }
     }
@@ -4355,7 +4542,15 @@ fn lower_type(ty: &SemanticType) -> Result<IrType, LoweringError> {
         SemanticType::Bool => Ok(IrType::Bool),
         SemanticType::Numeric => { unsupported_type!("Numeric") },
         SemanticType::Unknown => { unsupported_type!("Unknown") },
-        SemanticType::Handle(_) => { unsupported_type!("Handle") },
+        // D2.5a: Handle{slot,gen} (two u32s, unsigned) packs into a single i64
+        // (`slot | (gen << 32)`, no sign-extension risk — unlike Result's i128,
+        // no enable_llvm_abi_extensions flag is needed for i64 returns/params).
+        // The semantic layer's declared/inferred inner T is hardcoded to I128
+        // regardless of the real construct-site payload (Finding 1, tracked, not
+        // fixed here) — but that's irrelevant to THIS mapping: a Handle is an
+        // opaque reference into the registry, never an inline T, so the OUTER
+        // Handle(_) always lowers to I64 no matter what the ignored inner claims.
+        SemanticType::Handle(_) => Ok(IrType::I64),
         SemanticType::StrRef => { unsupported_type!("StrRef") },
         SemanticType::Container => { unsupported_type!("Container") },
         // D2.3b: a `str` is rep (a) — a Ptr to a static {ptr, len} descriptor.
@@ -4755,6 +4950,197 @@ fn widen_payload_to_i64(
             ),
         }),
     }
+}
+
+/// D2.5a: widen a Handle payload to the i64 word `cx_handle_new` takes. Scope is
+/// DELIBERATELY narrower than Result's `widen_payload_to_i64` — scalars only,
+/// `{I8, I16, I32, I64, Bool}` — with two exclusions that are NOT mere gaps:
+///
+/// - `Ptr` (this includes `str`, whose rep is a descriptor Ptr) is excluded even
+///   though it's mechanically word-fittable: the semantic layer's `Handle<T>`
+///   claim is hardcoded to I128 regardless of the real payload (Finding 1), so a
+///   later `.val` read site has no way to know a returned i64 is "a raw scalar"
+///   vs. "a Ptr to a string descriptor" — accepting Ptr here would silently set
+///   up that landmine for D2.5b to trip over.
+/// - `F64` is excluded because it's actively unsafe with this mechanism, not
+///   just unsupported: `Cast(F64->I64)` lowers to `fcvt_to_sint_sat` (a NUMERIC
+///   float-to-int conversion), which would silently store the integer part of
+///   the float (e.g. `3` for `3.14`) instead of preserving its bits.
+///
+/// `Bool` widens via the same `Cast` the backend already uses for Bool/TBool
+/// widening (`uextend`, zero-extension — no sign-extension risk, confirmed in
+/// the D2.5a investigation even though Result's own helper never exercised it).
+fn widen_handle_payload_to_i64(
+    payload: &LoweredValue,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<ValueId, LoweringError> {
+    match payload.ty {
+        IrType::I64 => Ok(payload.value),
+        IrType::I8 | IrType::I16 | IrType::I32 | IrType::Bool => {
+            let dst = ctx.fresh_value();
+            active.emit(IrInst::Cast {
+                dst,
+                from: payload.ty.clone(),
+                to: IrType::I64,
+                value: payload.value,
+            })?;
+            Ok(dst)
+        }
+        _ => Err(LoweringError::UnsupportedSemanticConstruct {
+            construct: format!(
+                "Handle payload type {:?} is not a scalar D2.5a supports (Ptr/str would recreate Finding 1's landmine; F64 would corrupt via fcvt_to_sint_sat; TBool/Result/nested Handle are separately deferred)",
+                payload.ty
+            ),
+        }),
+    }
+}
+
+/// D2.5a: lower `Handle.new(v)` — CONSTRUCT ONLY (`.val`/`.drop` land in D2.5b,
+/// which have their own open question: a bare-identifier read site has no
+/// data-flow back to the `.new` that produced it, unlike this construct site,
+/// which can inspect its own inner expression's real lowered type directly).
+/// Widens `v`'s real lowered type (never the semantic layer's hardcoded
+/// `Handle<I128>` claim) via `widen_handle_payload_to_i64`, calls the stateful
+/// `cx_handle_new` host callback, and returns the packed `Handle{slot,gen}` i64.
+/// A non-scalar payload rejects cleanly (SKIP) rather than miscompiling.
+fn lower_handle_new(
+    value: &SemanticExpr,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<LoweredValue, LoweringError> {
+    let payload = lower_expr(value, ctx, active)?;
+    let widened = widen_handle_payload_to_i64(&payload, ctx, active)?;
+    let dst = ctx.fresh_value();
+    active.emit(IrInst::Call {
+        dst: Some(dst),
+        callee: "cx_handle_new".to_string(),
+        args: vec![widened],
+        return_ty: Some(IrType::I64),
+    })?;
+    Ok(LoweredValue { value: dst, ty: IrType::I64 })
+}
+
+/// D2.5b: lower `h.val` — READ. Investigation-confirmed finding: the semantic
+/// layer's `HandleVal` claim is hardcoded to `SemanticType::I128` (same landmine
+/// as `HandleNew`'s outer-Handle claim), but UNLIKE the construct site, this
+/// claim is NOT protected by a T-blind `lower_type` collapse — every reachable
+/// consumer (untyped assign, typed-narrowing assign via a semantic-layer-inserted
+/// `Cast{from: I128, ...}`, a direct `I128`-typed assign) strictly requires
+/// `ensure_type_match` to see an ACTUAL `IrType::I128` value here — there is no
+/// cast-insertion anywhere downstream to paper over a bare i64. So this produces
+/// a genuine I128, not a raw i64: read the packed-i64 payload via the stateful
+/// `cx_handle_val` host callback, branch on its out-parameter validity flag
+/// (Trap on invalid — mirrors the interpreter's `RuntimeError::StaleHandle`,
+/// deterministic and non-panicking, not byte-identical text), then widen the
+/// payload to I128 via the same generic `Cast` (sign-extend) D2.5a's
+/// `widen_handle_payload_to_i64` uses in reverse. Sign-extension composes
+/// correctly across the two widening stages (I64 was itself sign/zero-extended
+/// from the original scalar in `HandleNew`) — a Bool's 0/1 value is always
+/// non-negative, so a second-stage sextend is bit-identical to a uextend for it.
+fn lower_handle_val(
+    binding: BindingId,
+    name: &str,
+    ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<LoweredValue, LoweringError> {
+    let handle_val = active.bindings.get(&binding).cloned().ok_or_else(|| {
+        LoweringError::InternalInvariantViolation {
+            detail: format!(
+                "HandleVal: binding '{name}' ({}) not found in scope",
+                binding.0
+            ),
+        }
+    })?;
+
+    // Out-parameter: a scratch i8 slot (Result's proven Alloca/Store/Load
+    // pattern, reused for a 1-byte out-param instead of a 16-byte round-trip).
+    let out_valid_slot = ctx.fresh_value();
+    active.emit(IrInst::Alloca { dst: out_valid_slot, size: 1, align: 1 })?;
+
+    let payload = ctx.fresh_value();
+    active.emit(IrInst::Call {
+        dst: Some(payload),
+        callee: "cx_handle_val".to_string(),
+        args: vec![handle_val.value, out_valid_slot],
+        return_ty: Some(IrType::I64),
+    })?;
+
+    let valid = ctx.fresh_value();
+    active.emit(IrInst::Load { dst: valid, ty: IrType::I8, ptr: out_valid_slot })?;
+    let zero = ctx.fresh_value();
+    active.emit(IrInst::ConstInt { dst: zero, ty: IrType::I8, value: 0 })?;
+    let is_valid = ctx.fresh_value();
+    active.emit(IrInst::Compare { dst: is_valid, op: CompareOp::Ne, lhs: valid, rhs: zero })?;
+
+    let incoming = active.bindings.clone();
+    let cont_block = ctx.start_block(vec![], incoming.clone());
+    let cont_id = cont_block.id();
+    let mut trap_block = ctx.start_block(vec![], incoming);
+    let trap_id = trap_block.id();
+
+    // Seal the decision block first (lower_try's pattern): the continuation
+    // reads `payload`, defined here, dominating both edges.
+    active.terminate(IrTerminator::Branch {
+        cond: is_valid,
+        then_block: cont_id,
+        then_args: vec![],
+        else_block: trap_id,
+        else_args: vec![],
+    })?;
+    let old = std::mem::replace(active, cont_block);
+    ctx.seal_block(old)?;
+
+    // Invalid: the same clean Trap -> cx_trap exit path assert/when-exhaustiveness
+    // use (Gate-1b0) — deterministic non-zero exit, not a panic. No continuation.
+    trap_block.terminate(IrTerminator::Trap)?;
+    ctx.seal_block(trap_block)?;
+
+    // Valid: `active` is now the continuation. Widen the i64 payload to I128.
+    let widened = ctx.fresh_value();
+    active.emit(IrInst::Cast {
+        dst: widened,
+        from: IrType::I64,
+        to: IrType::I128,
+        value: payload,
+    })?;
+    Ok(LoweredValue { value: widened, ty: IrType::I128 })
+}
+
+/// D2.5c: lower `h.drop()`. A pure side effect — no branching, no fallibility to
+/// signal: `cx_handle_drop` calls the shared registry's `remove()`, which
+/// safely no-ops on an already-dropped or invalid handle (the same generation
+/// check `.val` relies on returns early before touching the free-list again —
+/// this is what makes a double-drop non-corrupting, not new logic here).
+///
+/// `HandleDrop`'s semantic type is `Handle(Box<I128>)` — the same outer-Handle
+/// claim `HandleNew` carries, protected the same way (`lower_type(Handle(_))`
+/// collapses to I64 regardless of the inner claim). The interpreter always
+/// returns `Value::Num(0)` here, discarding `remove()`'s result entirely — so
+/// there is no meaningful value to reconstruct. The expression's result is
+/// simply the pre-call packed handle i64, unchanged: satisfies the I64 type
+/// any consumer expects, with zero new computation.
+fn lower_handle_drop(
+    binding: BindingId,
+    name: &str,
+    _ctx: &mut LoweringCtx,
+    active: &mut ActiveBlock,
+) -> Result<LoweredValue, LoweringError> {
+    let handle_val = active.bindings.get(&binding).cloned().ok_or_else(|| {
+        LoweringError::InternalInvariantViolation {
+            detail: format!(
+                "HandleDrop: binding '{name}' ({}) not found in scope",
+                binding.0
+            ),
+        }
+    })?;
+    active.emit(IrInst::Call {
+        dst: None,
+        callee: "cx_handle_drop".to_string(),
+        args: vec![handle_val.value],
+        return_ty: None,
+    })?;
+    Ok(handle_val)
 }
 
 /// D2.4a: pack a Result tag + payload word into the i128 rep via a MEMORY
@@ -5728,7 +6114,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_handle_type() {
+    fn rejects_handle_type_mismatch() {
+        // D2.5a: Handle now lowers (SemanticType::Handle(_) -> IrType::I64), so
+        // this is no longer "Handle types are unsupported" (renamed from
+        // rejects_handle_type) -- it's a genuine type mismatch: a Handle-typed
+        // binding's rep is I64 (the packed slot+gen word from Handle.new /
+        // cx_handle_new), and a raw Bool literal is a different IR type, not a
+        // real Handle value. The rejection reason correctly shifted from
+        // UnsupportedSemanticType to a type-mismatch InternalInvariantViolation.
         let program = SemanticProgram {
             stmts: vec![typed_assign(
                 BindingId(0),
@@ -5740,9 +6133,9 @@ mod tests {
         };
 
         assert_eq!(
-            lower_program(&program).expect_err("lowering should reject unsupported type"),
-            LoweringError::UnsupportedSemanticType {
-                ty: "Handle".to_string()
+            lower_program(&program).expect_err("lowering should reject the type mismatch"),
+            LoweringError::InternalInvariantViolation {
+                detail: "typed assignment type mismatch after semantic analysis: expected I64, got Bool".to_string()
             }
         );
     }

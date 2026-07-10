@@ -106,6 +106,9 @@ pub enum Token {
     #[token("group")]
     KeywordGroup,
 
+    #[token("as")]
+    KeywordAs,
+
     #[token("Handle")]
     KeywordHandle,
 
@@ -336,6 +339,7 @@ impl std::fmt::Display for Token {
             Token::KeywordThen => "then",
             Token::KeywordEnum => "enum",
             Token::KeywordGroup => "group",
+            Token::KeywordAs => "as",
             Token::KeywordHandle => "Handle",
             Token::KeywordStruct => "struct",
             Token::KeywordImpl => "impl",

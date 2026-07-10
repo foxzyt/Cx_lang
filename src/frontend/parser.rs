@@ -294,7 +294,10 @@ where
                     .clone()
                     .then_ignore(just(Token::PunctDoubleColon))
                     .then(ident.clone())
-                    .map(|(enum_name, variant)| WhenPattern::EnumVariant(enum_name, variant)),
+                    .then(just(Token::KeywordAs).ignore_then(ident).or_not())
+                    .map(|((enum_name, variant), binding)| {
+                        WhenPattern::EnumVariant(enum_name, variant, binding)
+                    }),
                 expr.clone().map(|e| match e {
                     Expr::Val(v) => WhenPattern::Literal(v),
                     _ => WhenPattern::Catchall,
@@ -304,11 +307,13 @@ where
 
             pattern
                 .map_with(|pattern, e: &mut ParseExtra<'a, '_, I>| (pattern, e.span().start))
+                .then(just(Token::KeywordIf).ignore_then(expr.clone()).or_not())
                 .then_ignore(just(Token::PunctFatArrow))
                 .then(expr.clone())
                 .then_ignore(just(Token::PunctComma).or_not())
-                .map(|((pattern, pos), value_expr)| WhenArm {
+                .map(|(((pattern, pos), guard), value_expr)| WhenArm {
                     pattern,
+                    guard,
                     body: WhenBody::Stmts(vec![Stmt::ExprStmt { expr: value_expr, _pos: pos }]),
                     pos,
                 })
@@ -788,7 +793,10 @@ where
                     .clone()
                     .then_ignore(just(Token::PunctDoubleColon))
                     .then(ident.clone())
-                    .map(|(enum_name, variant)| WhenPattern::EnumVariant(enum_name, variant)),
+                    .then(just(Token::KeywordAs).ignore_then(ident).or_not())
+                    .map(|((enum_name, variant), binding)| {
+                        WhenPattern::EnumVariant(enum_name, variant, binding)
+                    }),
                 ident
                     .clone()
                     .map(|name| WhenPattern::Group(String::new(), name)),
@@ -864,10 +872,11 @@ Stmt::Break { .. } | Stmt::Continue { .. } => {
 
             pattern
                 .map_with(|pattern, e: &mut ParseExtra<'a, '_, I>| (pattern, e.span().start))
+                .then(just(Token::KeywordIf).ignore_then(expr.clone()).or_not())
                 .then_ignore(just(Token::PunctFatArrow))
                 .then(when_body)
                 .then_ignore(just(Token::PunctComma).or_not())
-                .map(|((pattern, pos), body)| WhenArm { pattern, body, pos })
+                .map(|(((pattern, pos), guard), body)| WhenArm { pattern, guard, body, pos })
         };
 
         let when_stmt = just(Token::KeywordWhen)

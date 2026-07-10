@@ -408,7 +408,10 @@ Stmt::Return { expr, .. } => {
             for arm in arms {
                 match &arm.pattern {
                     WhenPattern::Literal(v) => eprintln!("{}  Arm({:?})", pad, v),
-                    WhenPattern::EnumVariant(e, v) => eprintln!("{}  Arm({}::{})", pad, e, v),
+                    WhenPattern::EnumVariant(e, v, binding) => match binding {
+                        Some(b) => eprintln!("{}  Arm({}::{} as {})", pad, e, v, b),
+                        None => eprintln!("{}  Arm({}::{})", pad, e, v),
+                    },
                     WhenPattern::Group(e, g) => eprintln!("{}  Arm(Group {}::{})", pad, e, g),
                     WhenPattern::Range(_, _, inclusive) => {
                         eprintln!("{}  Arm(Range, inclusive={})", pad, inclusive)

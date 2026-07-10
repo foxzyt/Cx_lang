@@ -659,6 +659,18 @@ Stmt::ExprStmt { expr, _pos } => Ok(SemanticStmt::ExprStmt {
                             }
                         }
 
+                        self.push_scope();
+                        let pattern = self.analyze_when_pattern_scoped(&arm.pattern, arm.pos)?;
+                        let guard = arm
+                            .guard
+                            .as_ref()
+                            .map(|g| self.analyze_expr(g))
+                            .transpose()?;
+                        if let Some(g) = &guard {
+                            if matches!(g.ty, SemanticType::Unknown) {
+                                return Err(sem_err!(arm.pos, "Unknown value cannot be used as a when-arm guard — control-critical context"));
+                            }
+                        }
                         let body = match &arm.body {
                             WhenBody::Stmts(stmts) => stmts
                                 .iter()
@@ -710,8 +722,10 @@ Stmt::ExprStmt { expr, _pos } => Ok(SemanticStmt::ExprStmt {
                                 semantic_stmts
                             }
                         };
+                        self.pop_scope();
                         Ok(SemanticWhenArm {
-                            pattern: self.analyze_when_pattern(&arm.pattern),
+                            pattern,
+                            guard,
                             body,
                             pos: arm.pos,
                         })
@@ -1213,7 +1227,7 @@ Stmt::ExprStmt { expr, _pos } => Ok(SemanticStmt::ExprStmt {
                 semantic_value_from_ast(end, &self.enums),
                 *inclusive,
             ),
-            WhenPattern::EnumVariant(enum_name, variant_name) => {
+            WhenPattern::EnumVariant(enum_name, variant_name, _binding) => {
                 let enum_info = self.enums.get(enum_name);
                 let variant_id =
                     enum_info.and_then(|info| info.variants.get(variant_name).copied());
@@ -1222,11 +1236,47 @@ Stmt::ExprStmt { expr, _pos } => Ok(SemanticStmt::ExprStmt {
                     variant_name: variant_name.clone(),
                     enum_id: enum_info.map(|info| info.id),
                     variant_id,
+                    binding: None,
                 }
             }
             WhenPattern::Group(_, _) => SemanticWhenPattern::Catchall,
             WhenPattern::Catchall => SemanticWhenPattern::Catchall,
 }
+    }
+
+    /// Like `analyze_when_pattern`, but for an `EnumVariant` arm with an `as v`
+    /// binding, also declares `v` in the CURRENT scope (the caller is expected
+    /// to have already pushed an arm-local scope) as the enum's own type —
+    /// enums are tag-only, so binding "the whole value" is the only option;
+    /// there is no field to destructure.
+    fn analyze_when_pattern_scoped(
+        &mut self,
+        pattern: &WhenPattern,
+        pos: usize,
+    ) -> Result<SemanticWhenPattern, SemanticError> {
+        match pattern {
+            WhenPattern::EnumVariant(enum_name, variant_name, Some(binding_name)) => {
+                let enum_info = self.enums.get(enum_name);
+                let variant_id =
+                    enum_info.and_then(|info| info.variants.get(variant_name).copied());
+                let enum_id = enum_info.map(|info| info.id);
+                let binding = self.declare(
+                    binding_name,
+                    Some(Type::Enum(enum_name.clone())),
+                    Some(SemanticType::Enum(enum_name.clone())),
+                    true,
+                    pos,
+                )?;
+                Ok(SemanticWhenPattern::EnumVariant {
+                    enum_name: enum_name.clone(),
+                    variant_name: variant_name.clone(),
+                    enum_id,
+                    variant_id,
+                    binding: Some((binding, binding_name.clone())),
+                })
+            }
+            other => Ok(self.analyze_when_pattern(other)),
+        }
     }
 
     fn analyze_expr(&mut self, expr: &Expr) -> Result<SemanticExpr, SemanticError> {
@@ -1492,13 +1542,25 @@ Expr::Unary(op, inner, pos) => {
                 let mut semantic_arms = Vec::new();
                 let mut result_ty = SemanticType::Unknown;
                 for (i, arm) in arms.iter().enumerate() {
-                    let pattern = self.analyze_when_pattern(&arm.pattern);
+                    self.push_scope();
+                    let pattern = self.analyze_when_pattern_scoped(&arm.pattern, arm.pos)?;
+                    let guard = arm
+                        .guard
+                        .as_ref()
+                        .map(|g| self.analyze_expr(g))
+                        .transpose()?;
+                    if let Some(g) = &guard {
+                        if matches!(g.ty, SemanticType::Unknown) {
+                            return Err(sem_err!(arm.pos, "Unknown value cannot be used as a when-arm guard — control-critical context"));
+                        }
+                    }
                     let body: Vec<SemanticStmt> = match &arm.body {
                         WhenBody::Stmts(stmts) => stmts.iter()
                             .map(|s| self.analyze_stmt(s))
                             .collect::<Result<Vec<_>, _>>()?,
                         WhenBody::SuperGroup(_) => Vec::new(),
                     };
+                    self.pop_scope();
                     if i == 0 {
                         if let Some(last) = body.last() {
                             if let SemanticStmt::ExprStmt { expr, .. } = last {
@@ -1506,7 +1568,7 @@ Expr::Unary(op, inner, pos) => {
                             }
                         }
                     }
-                    semantic_arms.push(SemanticWhenArm { pattern, body, pos: arm.pos });
+                    semantic_arms.push(SemanticWhenArm { pattern, guard, body, pos: arm.pos });
                 }
                 if !when_is_exhaustive(&semantic_arms) {
                     return Err(sem_err!(*pos, "non-exhaustive `when`: add a `_` catch-all arm to handle the remaining cases"));
@@ -2441,6 +2503,7 @@ fn normalize_enum_stmts(stmts: Vec<Stmt>, enums: &std::collections::HashSet<Stri
 fn normalize_enum_when_arm(arm: WhenArm, enums: &std::collections::HashSet<String>) -> WhenArm {
     WhenArm {
         pattern: arm.pattern,
+        guard: arm.guard,
         pos: arm.pos,
         body: match arm.body {
             WhenBody::Stmts(stmts) => WhenBody::Stmts(normalize_enum_stmts(stmts, enums)),
