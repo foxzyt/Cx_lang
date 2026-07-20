@@ -333,6 +333,7 @@ All currently JIT-lowered fixtures match interpreter behavior (0 PARITY_FAIL). A
 ### JIT Parity Baseline
 
 As of `v0.3.1`:
+
 | Status | Count |
 |--------|-------|
 | PASS | 261 |
