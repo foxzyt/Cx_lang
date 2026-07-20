@@ -4,7 +4,7 @@ Cx is a compiled, GC-free systems programming language for game engines, tools, 
 
 The goal of Cx is to give engine-facing code predictable memory behavior, explicit value movement, deterministic teardown, and low-level control without forcing every feature to become allocator plumbing.
 
-**Status: 0.3.0 — released 2026-07-19.** Last tagged release: **v0.3.0**.
+**Status: 0.3.1 — released 2026-07-19.** Last tagged release: **v0.3.1**.
 
 This README describes the current `submain` branch. The reference interpreter is the source of truth for language semantics; every code sample below was compiled and run against it.
 
